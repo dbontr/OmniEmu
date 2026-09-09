@@ -20,6 +20,7 @@ Established:
 - Browser WebGL 2 / Web Audio / Gamepad path.
 - Direct release-WASM smoke tests in the normal build.
 - First playable ROM-less machine: Home Pong/Telstar class.
+- Atari 2600 development graph: shared 6502/6507 addressing, RIOT RAM/I/O/timer, color-clocked TIA graphics/collisions/audio, WSYNC, input, save states, and 2K/4K/F8/F6/F4 cartridges.
 - Reusable official-opcode NMOS 6502 execution substrate.
 - Reusable Z80 execution substrate with indexed/extended families, interrupts, block I/O, and deterministic state support.
 - First ROM machine graph: NES with CPU/PPU buses, controllers, OAM/DMC DMA, NMI/IRQ/rendering, APU audio, deterministic save states, battery persistence, NES 2.0 sizing, and mapper 0/1/2/3/4/7/11/66 support.
@@ -36,7 +37,7 @@ The NES development graph is launchable but remains `foundation`. Finish it befo
 4. Add stable unofficial NMOS 6502 opcodes used by commercial software and strengthen NES 2.0/submapper behavior.
 5. Build an automated legal/homebrew compatibility corpus with visual/audio/state determinism and browser performance gates.
 
-In parallel, reuse the same 6502-family substrate for Atari 2600, Atari 5200 and Atari 7800 rather than creating new emulator runtimes.
+Atari 2600 now has a launchable development graph. Continue its timing/bankswitch/peripheral compatibility while reusing the same 6502-family substrate for Atari 5200 and Atari 7800 rather than creating new emulator runtimes.
 
 ## Stage 2 — generations 2 through 4
 

@@ -1,6 +1,8 @@
 use crate::blueprint::is_targeted;
 use crate::kernel::{AudioBuffer, InputState, VideoBuffer};
-use crate::machines::{ColecoVisionMachine, MasterSystemMachine, NesMachine, PongMachine};
+use crate::machines::{
+    Atari2600Machine, ColecoVisionMachine, MasterSystemMachine, NesMachine, PongMachine,
+};
 use crate::platform::{PlatformId, SupportLevel};
 use crate::resources::{ResourceKind, ResourceStore};
 
@@ -40,6 +42,11 @@ pub fn create_machine(
 ) -> Result<Box<dyn Machine>, String> {
     match platform {
         PlatformId::HomePong => Ok(Box::new(PongMachine::new()) as Box<dyn Machine>),
+        PlatformId::Atari2600 => {
+            let image = resources.primary_game().ok_or_else(|| "Atari 2600 requires a staged cartridge image".to_string())?;
+            let rom = image.materialize(128 * 1024)?;
+            Ok(Box::new(Atari2600Machine::from_rom(&rom)?) as Box<dyn Machine>)
+        }
         PlatformId::Nes => {
             let image = resources.primary_game().ok_or_else(|| "NES requires a staged game image".to_string())?;
             let rom = image.materialize(64 * 1024 * 1024)?;

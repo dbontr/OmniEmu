@@ -209,4 +209,37 @@ assert(core.omni_audio_rate() === 48_000, 'unexpected ColecoVision audio sample 
 assert(core.omni_audio_channels() === 2, 'unexpected ColecoVision audio channel count')
 core.omni_unload()
 
+assert(core.omni_can_launch(10) === 1, 'Atari 2600 foundation should be launchable for development')
+const atari = new Uint8Array(0x1000)
+atari.fill(0xea)
+const atariProgram = [
+  0x78, 0xd8, 0xa2, 0xff, 0x9a,
+  0xa9, 0x00, 0x85, 0x01,
+  0xa9, 0x2e, 0x85, 0x09,
+  0xa9, 0x4e, 0x85, 0x08,
+  0xa9, 0xf0, 0x85, 0x0d,
+  0xa9, 0xff, 0x85, 0x0e, 0x85, 0x0f,
+  0xa9, 0x04, 0x85, 0x15,
+  0xa9, 0x08, 0x85, 0x17,
+  0xa9, 0x0f, 0x85, 0x19,
+  0xa9, 0x00, 0x85, 0x02,
+  0x4c, 0x27, 0xf0,
+]
+atari.set(atariProgram)
+atari.set([0x00, 0xf0, 0x00, 0xf0, 0x00, 0xf0], 0x0ffa)
+core.omni_resources_clear()
+stageBytes(0, atari, 'Atari 2600 cartridge')
+ok(core.omni_load_staged(10), 'load staged Atari 2600 cartridge')
+for (let frame = 0; frame < 2; frame++) ok(core.omni_run_frame(), `run Atari 2600 frame ${frame}`)
+const atariWidth = core.omni_video_width()
+const atariHeight = core.omni_video_height()
+assert(atariWidth === 160 && atariHeight === 192, `unexpected Atari 2600 surface ${atariWidth}x${atariHeight}`)
+const atariVideo = new Uint8Array(core.memory.buffer, core.omni_video_ptr(), core.omni_video_len())
+assert(atariVideo.some((value) => value !== 0), 'Atari 2600 framebuffer is empty')
+assert(core.omni_audio_rate() === 48_000, 'unexpected Atari 2600 audio sample rate')
+assert(core.omni_audio_channels() === 2, 'unexpected Atari 2600 audio channel count')
+const atariStateSize = core.omni_save_state(0, 0)
+assert(atariStateSize > 0, 'Atari 2600 save state is empty')
+core.omni_unload()
+
 console.log(`OmniCore WASM smoke passed: ${bytes.byteLength} bytes, ${width}x${height}, ${audioLen} audio samples.`)

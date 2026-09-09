@@ -80,6 +80,8 @@ Accuracy-sensitive devices remain machine-specific where sharing would be incorr
 
 Home Pong/Telstar-class hardware is fully constructed inside OmniCore and exercises the common frame, input, audio, video, reset and state paths without a ROM.
 
+Atari 2600 is the first shared-6502 reuse outside Nintendo: OmniCore constrains the CPU through a 6507-style 13-bit bus, models RIOT RAM/I/O/timing, advances TIA video at three color clocks per CPU cycle, renders playfield/player/missile/ball objects with collision latches, honors WSYNC stalls, synthesizes the two TIA audio channels, and implements common 2K/4K/F8/F6/F4 cartridge schemes.
+
 The NES development graph is the first ROM-driven proof. It combines the shared 6502 engine with CPU/PPU buses, controller ports, OAM and DMC DMA paths, NMI/IRQ delivery, background/sprite rendering, pulse/triangle/noise/DMC audio, NES 2.0 sizing, deterministic save states, battery persistence, and mapper 0/1/2/3/4/7/11/66 support. It remains `foundation` because precise PPU fetch/sprite timing, MMC3 A12-edge behavior, unofficial CPU opcodes, additional boards, and large compatibility-corpus validation are unfinished.
 
 The Master System development graph is the second ROM-driven proof and the first reuse of the Z80-family substrate. It combines the shared Z80 with Sega ROM/SRAM mapping, Mode 4 tile/sprite rendering, frame and line interrupts, horizontal/vertical scroll locks, controller ports, SN76489 audio, deterministic state, and cartridge persistence. It remains `foundation` while cycle-level VDP behavior, legacy modes, mapper variants, FM audio, and broad compatibility validation are unfinished.

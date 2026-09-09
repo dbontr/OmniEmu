@@ -75,7 +75,7 @@ impl PlatformId {
     pub const fn is_launchable(self) -> bool {
         matches!(
             self,
-            Self::HomePong | Self::ColecoVision | Self::Nes | Self::MasterSystem
+            Self::HomePong | Self::Atari2600 | Self::ColecoVision | Self::Nes | Self::MasterSystem
         )
     }
 
@@ -84,6 +84,7 @@ impl PlatformId {
             Self::HomePong => SupportLevel::Playable,
             Self::Atari2600
             | Self::Atari5200
+            | Self::ColecoVision
             | Self::Atari7800
             | Self::Nes
             | Self::MasterSystem => SupportLevel::Foundation,

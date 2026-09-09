@@ -35,6 +35,7 @@ The unified runtime is already executing real machine graphs and now has substan
 - Reusable NMOS 6502 execution engine covering the official instruction set.
 - Reusable Z80 execution engine with base/CB/ED/indexed instruction families, interrupt modes, block operations, I/O, save-state serialization, and shared use by Sega/Coleco-class machines.
 - Playable built-in Home Pong/Telstar-class hardware simulation with video, audio, input, reset, and save states.
+- Runnable Atari 2600 development machine with a 6507-style 13-bit bus over the shared 6502, RIOT RAM/I/O/timer, color-clocked TIA playfield/players/missiles/ball/collisions, WSYNC stalls, two-channel TIA audio, controllers, deterministic state, and 2K/4K/F8/F6/F4 cartridge banking.
 - Runnable NES development machine with CPU/PPU bus, controllers, OAM DMA, NMI/IRQ, background/sprite rendering, four mirroring modes, pulse/triangle/noise/DMC audio, deterministic save states, battery-backed persistence, and mapper 0/1/2/3/4/7/11/66 switching.
 - Runnable Master System development machine with the shared Z80, Sega ROM/SRAM mapper, Mode 4 VDP background/sprite rendering, 3:2 CPU-to-dot timing, frame/line interrupts, scroll locks and counters, active-low two-player input, SN76489 PSG audio, save states, and persistent cartridge RAM.
 - Runnable ColecoVision development machine reusing the Z80 and SN76489 plus a reusable TMS9918 video device with Graphics I/II tile rendering, sprites, VDP NMI, BIOS/cartridge mapping, controllers, audio and save states.
@@ -57,6 +58,8 @@ Compatibility state and developer launchability are intentionally separate:
 - `foundation` — substantial real OmniCore hardware exists but compatibility is incomplete.
 - `planned` — the platform has a target blueprint, but the machine graph is not complete.
 NES is currently `foundation`: NROM, MMC1, UxROM, CNROM, MMC3, AxROM, Color Dreams, and GxROM execute inside OmniCore; APU channels including DMC, deterministic save states, NES 2.0 sizing, and battery persistence are live. It still needs substantially more mapper coverage, cycle-accurate PPU/MMC3 edge behavior, unofficial CPU-opcode compatibility, and a representative legal compatibility corpus before it can move to `playable`.
+
+Atari 2600 is `foundation` and launchable: 2K/4K and F8/F6/F4 banked cartridges run through the shared 6502 with RIOT and a color-clocked TIA path for playfield, player/missile/ball graphics, collision latches, WSYNC, joystick/fire inputs and audio. It still needs more bankswitch families, undocumented-6502 compatibility, paddle/light-gun peripherals, exact TIA write delays/HMOVE behavior, PAL/SECAM timing, and a broad compatibility corpus.
 
 Master System is also `foundation`: the shared Z80, Sega mapper/SRAM, Mode 4 tile and sprite rendering, corrected 3:2 CPU/VDP-dot timing, frame/line interrupts, scroll locks, controllers, SN76489 audio, save states, and persistence are live. It still needs cycle-level VDP validation, legacy video modes, uncommon cartridge mappers, optional FM audio, region/peripheral edge cases, and a representative compatibility corpus.
 
