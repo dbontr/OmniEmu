@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">OmniEmu mascot</title>
+  <desc id="desc">A geometric emu bird head.</desc>
+  <rect width="256" height="256" rx="46" fill="#101512"/>
+  <path fill="#dfe8e0" d="M82 44c22 0 42 10 56 27 12-8 25-12 40-12 12 0 22 3 30 8-20 2-36 10-48 24 7 15 10 31 8 49-3 30-23 54-51 65l-12 25H65l29-56c-20-18-30-42-27-70 2-23 7-43 15-60z"/>
+  <circle cx="103" cy="89" r="17" fill="#83bf6a"/>
+  <circle cx="105" cy="89" r="9" fill="#101512"/>
+  <path fill="#83bf6a" d="M145 105c19-9 40-9 64 0-22 9-43 13-64 13z"/>
+  <path fill="#101512" opacity=".28" d="M119 125c11 13 23 19 36 20-8 17-22 27-42 30 12-17 14-34 6-50z"/>
+</svg>

@@ -1,0 +1,20 @@
+{
+  "name": "omniemu",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "dev": "vite",
+    "check": "tsc --noEmit",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "verify:branding": "node scripts/verify-branding.mjs",
+    "verify": "npm run verify:branding && npm run build"
+  },
+  "devDependencies": {
+    "coi-serviceworker": "^0.1.7",
+    "typescript": "~5.9.3",
+    "vite": "^7.1.7"
+  }
+}
