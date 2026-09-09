@@ -18,6 +18,7 @@ pub struct Mos6502 {
     pub p: u8,
     pub cycles: u64,
     pub stopped: bool,
+    decimal_supported: bool,
 }
 
 impl Default for Mos6502 {
@@ -31,6 +32,7 @@ impl Default for Mos6502 {
             p: FLAG_INTERRUPT | FLAG_UNUSED,
             cycles: 0,
             stopped: false,
+            decimal_supported: true,
         }
     }
 }
@@ -41,6 +43,13 @@ impl Mos6502 {
         self.pc = bus.read16(0xfffc);
         self.stopped = false;
         self.cycles = 7;
+    }
+
+    pub fn set_decimal_supported(&mut self, supported: bool) {
+        self.decimal_supported = supported;
+        if !supported {
+            self.p &= !FLAG_DECIMAL;
+        }
     }
 
     pub fn irq<B: Bus8>(&mut self, bus: &mut B) {
@@ -149,16 +158,50 @@ impl Mos6502 {
     fn adc(&mut self, value: u8) {
         let carry = u16::from(self.p & FLAG_CARRY != 0);
         let sum = self.a as u16 + value as u16 + carry;
-        let result = sum as u8;
+        let binary_result = sum as u8;
+        let overflow = (!(self.a ^ value) & (self.a ^ binary_result) & 0x80) != 0;
+        if self.decimal_supported && self.p & FLAG_DECIMAL != 0 {
+            let mut low = u16::from(self.a & 0x0f) + u16::from(value & 0x0f) + carry;
+            if low > 9 {
+                low += 6;
+            }
+            let mut high = u16::from(self.a >> 4) + u16::from(value >> 4) + u16::from(low > 0x0f);
+            if high > 9 {
+                high += 6;
+            }
+            self.a = (((high << 4) | (low & 0x0f)) & 0xff) as u8;
+            self.set_flag(FLAG_CARRY, high > 0x0f);
+            self.set_flag(FLAG_OVERFLOW, overflow);
+            self.set_zn(self.a);
+            return;
+        }
         self.set_flag(FLAG_CARRY, sum > 0xff);
-        self.set_flag(
-            FLAG_OVERFLOW,
-            (!(self.a ^ value) & (self.a ^ result) & 0x80) != 0,
-        );
-        self.a = result;
+        self.set_flag(FLAG_OVERFLOW, overflow);
+        self.a = binary_result;
         self.set_zn(self.a);
     }
+
     fn sbc(&mut self, value: u8) {
+        if self.decimal_supported && self.p & FLAG_DECIMAL != 0 {
+            let borrow = i16::from(self.p & FLAG_CARRY == 0);
+            let binary = self.a as i16 - value as i16 - borrow;
+            let binary_result = binary as u8;
+            let overflow = ((self.a ^ binary_result) & (self.a ^ value) & 0x80) != 0;
+            let mut low = i16::from(self.a & 0x0f) - i16::from(value & 0x0f) - borrow;
+            let mut high = i16::from(self.a >> 4) - i16::from(value >> 4);
+            if low < 0 {
+                low -= 6;
+                high -= 1;
+            }
+            if high < 0 {
+                high -= 6;
+            }
+            self.a = (((high << 4) & 0xf0) | (low & 0x0f)) as u8;
+            self.set_flag(FLAG_CARRY, binary >= 0);
+            self.set_flag(FLAG_OVERFLOW, overflow);
+            self.set_zn(self.a);
+            return;
+        }
         self.adc(value ^ 0xff);
     }
     fn branch<B: Bus8>(&mut self, bus: &mut B, condition: bool) -> u32 {
@@ -239,6 +282,65 @@ impl Mos6502 {
         (bus.read8(a), crossed)
     }
 
+    fn unofficial_rmw_address<B: Bus8>(&mut self, bus: &mut B, opcode: u8) -> (u16, u32) {
+        match opcode & 0x1f {
+            0x03 => (self.indx(bus), 8),
+            0x07 => (self.zp(bus), 5),
+            0x0f => (self.abs(bus), 6),
+            0x13 => (self.indy(bus).0, 8),
+            0x17 => (self.zpx(bus), 6),
+            0x1b => (self.absy(bus).0, 7),
+            0x1f => (self.absx(bus).0, 7),
+            _ => unreachable!("not an unofficial read-modify-write opcode"),
+        }
+    }
+
+    fn lax(&mut self, value: u8) {
+        self.a = value;
+        self.x = value;
+        self.set_zn(value);
+    }
+
+    fn execute_unofficial_rmw<B: Bus8>(&mut self, bus: &mut B, opcode: u8) -> u32 {
+        let (address, cycles) = self.unofficial_rmw_address(bus, opcode);
+        let value = bus.read8(address);
+        let group = opcode & 0xe0;
+        let result = match group {
+            0x00 => self.asl(value),
+            0x20 => self.rol(value),
+            0x40 => self.lsr(value),
+            0x60 => self.ror(value),
+            0xc0 => value.wrapping_sub(1),
+            0xe0 => value.wrapping_add(1),
+            _ => unreachable!("not an unofficial read-modify-write group"),
+        };
+        bus.write8(address, result);
+        match group {
+            0x00 => {
+                self.a |= result;
+                self.set_zn(self.a);
+            }
+            0x20 => {
+                self.a &= result;
+                self.set_zn(self.a);
+            }
+            0x40 => {
+                self.a ^= result;
+                self.set_zn(self.a);
+            }
+            0x60 => self.adc(result),
+            0xc0 => self.compare(self.a, result),
+            0xe0 => self.sbc(result),
+            _ => unreachable!(),
+        }
+        cycles
+    }
+
+    fn nop_absx<B: Bus8>(&mut self, bus: &mut B) -> u32 {
+        let (_, crossed) = self.read_absx(bus);
+        4 + u32::from(crossed)
+    }
+
     fn execute<B: Bus8>(&mut self, bus: &mut B, opcode: u8) -> u32 {
         match opcode {
             0x00 => {
@@ -250,6 +352,135 @@ impl Mos6502 {
                 7
             }
             0xea => 2,
+            // Stable NMOS 6502 undocumented NOPs used by commercial software.
+            0x1a | 0x3a | 0x5a | 0x7a | 0xda | 0xfa => 2,
+            0x80 | 0x82 | 0x89 | 0xc2 | 0xe2 => {
+                self.fetch8(bus);
+                2
+            }
+            0x04 | 0x44 | 0x64 => {
+                self.read_zp(bus);
+                3
+            }
+            0x14 | 0x34 | 0x54 | 0x74 | 0xd4 | 0xf4 => {
+                self.read_zpx(bus);
+                4
+            }
+            0x0c => {
+                self.read_abs(bus);
+                4
+            }
+            0x1c | 0x3c | 0x5c | 0x7c | 0xdc | 0xfc => self.nop_absx(bus),
+
+            // LAX: load A and X together.
+            0xab => {
+                let value = self.fetch8(bus);
+                self.lax(value);
+                2
+            }
+            0xa7 => {
+                let value = self.read_zp(bus);
+                self.lax(value);
+                3
+            }
+            0xb7 => {
+                let value = self.read_zpy(bus);
+                self.lax(value);
+                4
+            }
+            0xaf => {
+                let value = self.read_abs(bus);
+                self.lax(value);
+                4
+            }
+            0xbf => {
+                let (value, crossed) = self.read_absy(bus);
+                self.lax(value);
+                4 + u32::from(crossed)
+            }
+            0xa3 => {
+                let value = self.read_indx(bus);
+                self.lax(value);
+                6
+            }
+            0xb3 => {
+                let (value, crossed) = self.read_indy(bus);
+                self.lax(value);
+                5 + u32::from(crossed)
+            }
+
+            // SAX: store A & X.
+            0x87 => {
+                let address = self.zp(bus);
+                bus.write8(address, self.a & self.x);
+                3
+            }
+            0x97 => {
+                let address = self.zpy(bus);
+                bus.write8(address, self.a & self.x);
+                4
+            }
+            0x8f => {
+                let address = self.abs(bus);
+                bus.write8(address, self.a & self.x);
+                4
+            }
+            0x83 => {
+                let address = self.indx(bus);
+                bus.write8(address, self.a & self.x);
+                6
+            }
+
+            // SLO/RLA/SRE/RRA/DCP/ISC read-modify-write families.
+            0x03 | 0x07 | 0x0f | 0x13 | 0x17 | 0x1b | 0x1f | 0x23 | 0x27 | 0x2f | 0x33 | 0x37
+            | 0x3b | 0x3f | 0x43 | 0x47 | 0x4f | 0x53 | 0x57 | 0x5b | 0x5f | 0x63 | 0x67 | 0x6f
+            | 0x73 | 0x77 | 0x7b | 0x7f | 0xc3 | 0xc7 | 0xcf | 0xd3 | 0xd7 | 0xdb | 0xdf | 0xe3
+            | 0xe7 | 0xef | 0xf3 | 0xf7 | 0xfb | 0xff => self.execute_unofficial_rmw(bus, opcode),
+
+            // Immediate undocumented ALU forms with stable behavior.
+            0x0b | 0x2b => {
+                self.a &= self.fetch8(bus);
+                self.set_zn(self.a);
+                self.set_flag(FLAG_CARRY, self.a & 0x80 != 0);
+                2
+            }
+            0x4b => {
+                self.a &= self.fetch8(bus);
+                self.a = self.lsr(self.a);
+                2
+            }
+            0x6b => {
+                let value = self.a & self.fetch8(bus);
+                let carry_in = if self.p & FLAG_CARRY != 0 { 0x80 } else { 0 };
+                self.a = (value >> 1) | carry_in;
+                self.set_zn(self.a);
+                self.set_flag(FLAG_CARRY, self.a & 0x40 != 0);
+                self.set_flag(FLAG_OVERFLOW, ((self.a >> 6) ^ (self.a >> 5)) & 1 != 0);
+                2
+            }
+            0xcb => {
+                let value = self.fetch8(bus);
+                let lhs = self.a & self.x;
+                self.x = lhs.wrapping_sub(value);
+                self.set_flag(FLAG_CARRY, lhs >= value);
+                self.set_zn(self.x);
+                2
+            }
+            0xeb => {
+                let value = self.fetch8(bus);
+                self.sbc(value);
+                2
+            }
+            0xbb => {
+                let (value, crossed) = self.read_absy(bus);
+                let result = value & self.sp;
+                self.a = result;
+                self.x = result;
+                self.sp = result;
+                self.set_zn(result);
+                4 + u32::from(crossed)
+            }
+
             // Loads
             0xa9 => {
                 self.a = self.fetch8(bus);
@@ -1073,5 +1304,84 @@ mod tests {
         cpu.step(&mut bus);
         assert_eq!(cpu.a, 0x2a);
         assert_eq!(cpu.pc, 0x8005);
+    }
+    #[test]
+    fn stable_undocumented_lax_sax_dcp_and_isc_execute() {
+        let mut bus = Ram64k::new();
+        bus.load(
+            0x8000,
+            &[
+                0xa9, 0x3c, 0xa2, 0x0f, 0x87, 0x10, 0xa7, 0x10, 0xc7, 0x10, 0xe7, 0x10,
+            ],
+        );
+        bus.bytes_mut()[0xfffc] = 0x00;
+        bus.bytes_mut()[0xfffd] = 0x80;
+        let mut cpu = Mos6502::default();
+        cpu.reset(&mut bus);
+        for _ in 0..6 {
+            assert_ne!(cpu.step(&mut bus), 0);
+        }
+        assert_eq!(bus.bytes()[0x0010], 0x0c);
+        assert_eq!(cpu.a, 0);
+        assert_eq!(cpu.x, 0x0c);
+        assert_ne!(cpu.p & FLAG_ZERO, 0);
+        assert_ne!(cpu.p & FLAG_CARRY, 0);
+    }
+
+    #[test]
+    fn stable_undocumented_rmw_and_nops_preserve_execution() {
+        let mut bus = Ram64k::new();
+        bus.load(
+            0x8000,
+            &[
+                0xa9, 0x01, 0x07, 0x20, 0x47, 0x20, 0x67, 0x20, 0x80, 0xaa, 0x1a,
+            ],
+        );
+        bus.bytes_mut()[0x0020] = 0x81;
+        bus.bytes_mut()[0xfffc] = 0x00;
+        bus.bytes_mut()[0xfffd] = 0x80;
+        let mut cpu = Mos6502::default();
+        cpu.reset(&mut bus);
+        for _ in 0..6 {
+            assert_ne!(cpu.step(&mut bus), 0);
+        }
+        assert_eq!(bus.bytes()[0x0020], 0x00);
+        assert_eq!(cpu.a, 0x03);
+        assert_eq!(cpu.pc, 0x800b);
+        assert!(!cpu.stopped);
+    }
+    #[test]
+    fn nmos_decimal_adc_and_sbc_are_available_but_can_be_disabled() {
+        let mut bus = Ram64k::new();
+        bus.load(
+            0x8000,
+            &[
+                0xf8, 0x18, 0xa9, 0x45, 0x69, 0x55, 0x38, 0xa9, 0x50, 0xe9, 0x01,
+            ],
+        );
+        bus.bytes_mut()[0xfffc] = 0x00;
+        bus.bytes_mut()[0xfffd] = 0x80;
+        let mut cpu = Mos6502::default();
+        cpu.reset(&mut bus);
+        for _ in 0..4 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.a, 0x00);
+        assert_ne!(cpu.p & FLAG_CARRY, 0);
+        for _ in 0..3 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(cpu.a, 0x49);
+        assert_ne!(cpu.p & FLAG_CARRY, 0);
+
+        let mut binary = Mos6502::default();
+        binary.set_decimal_supported(false);
+        binary.reset(&mut bus);
+        for _ in 0..4 {
+            binary.step(&mut bus);
+        }
+        assert_eq!(binary.a, 0x9a);
+        assert_eq!(binary.p & FLAG_CARRY, 0);
+        assert_ne!(binary.p & FLAG_DECIMAL, 0);
     }
 }

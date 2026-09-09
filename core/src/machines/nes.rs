@@ -1068,6 +1068,7 @@ impl NesMachine {
         let (cartridge, ppu) = Cartridge::parse(rom)?;
         let mut bus = NesBus::new(cartridge, ppu);
         let mut cpu = Mos6502::default();
+        cpu.set_decimal_supported(false);
         cpu.reset(&mut bus);
         Ok(Self {
             cpu,

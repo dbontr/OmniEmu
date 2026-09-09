@@ -21,7 +21,7 @@ Established:
 - Direct release-WASM smoke tests in the normal build.
 - First playable ROM-less machine: Home Pong/Telstar class.
 - Atari 2600 development graph: shared 6502/6507 addressing, RIOT RAM/I/O/timer, color-clocked TIA graphics/collisions/audio, WSYNC, input, save states, and 2K/4K/F8/F6/F4 cartridges.
-- Reusable official-opcode NMOS 6502 execution substrate.
+- Reusable NMOS 6502 execution substrate with the official set, common stable undocumented families, and selectable decimal arithmetic for NMOS versus NES-class behavior.
 - Reusable Z80 execution substrate with indexed/extended families, interrupts, block I/O, and deterministic state support.
 - First ROM machine graph: NES with CPU/PPU buses, controllers, OAM/DMC DMA, NMI/IRQ/rendering, APU audio, deterministic save states, battery persistence, NES 2.0 sizing, and mapper 0/1/2/3/4/7/11/66 support.
 - Second ROM machine graph: Master System with Z80, Sega banked ROM/SRAM, Mode 4 VDP rendering, corrected 3:2 CPU/dot timing, frame/line interrupts, V/H counters, scroll locks, two-player controls, SN76489 audio, save states, and persistent SRAM.
