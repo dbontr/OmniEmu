@@ -5,6 +5,7 @@ pub mod bus;
 pub mod clock;
 pub mod cluster;
 pub mod cpu6502;
+pub mod cpu_z80;
 pub mod dma;
 pub mod execution;
 pub mod graphics;
