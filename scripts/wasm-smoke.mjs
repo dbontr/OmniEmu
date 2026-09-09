@@ -242,4 +242,53 @@ const atariStateSize = core.omni_save_state(0, 0)
 assert(atariStateSize > 0, 'Atari 2600 save state is empty')
 core.omni_unload()
 
+assert(core.omni_can_launch(11) === 1, 'Atari 5200 foundation should be launchable for development')
+const atari5200Bios = new Uint8Array(0x800)
+atari5200Bios.fill(0xea)
+const atari5200Boot = [
+  0x78, 0xd8, 0xa9, 0x3a, 0x8d, 0x18, 0xc0,
+  0xa9, 0x84, 0x8d, 0x1a, 0xc0,
+  0xa9, 0x20, 0x8d, 0x00, 0xd4,
+  0xa9, 0x00, 0x8d, 0x02, 0xd4,
+  0xa9, 0x20, 0x8d, 0x03, 0xd4,
+  0xa9, 0x40, 0x8d, 0x0e, 0xd4,
+  0x4c, 0x00, 0x40,
+]
+atari5200Bios.set(atari5200Boot)
+atari5200Bios.set([0x00, 0xf8, 0x00, 0xf8, 0x00, 0xf8], 0x7fa)
+const atari5200 = new Uint8Array(0x8000)
+atari5200.fill(0xea)
+atari5200.set([
+  0xa9, 0x08, 0x8d, 0x00, 0xe8,
+  0xa9, 0xaf, 0x8d, 0x01, 0xe8,
+  0x4c, 0x0a, 0x40,
+])
+core.omni_resources_clear()
+stageBytes(0, atari5200, 'Atari 5200 cartridge')
+stageBytes(1, atari5200Bios, 'Atari 5200 BIOS')
+ok(core.omni_load_staged(11), 'load staged Atari 5200 cartridge')
+for (let frame = 0; frame < 2; frame++) ok(core.omni_run_frame(), `run Atari 5200 frame ${frame}`)
+const atari5200Width = core.omni_video_width()
+const atari5200Height = core.omni_video_height()
+assert(
+  atari5200Width === 320 && atari5200Height === 192,
+  `unexpected Atari 5200 surface ${atari5200Width}x${atari5200Height}`,
+)
+const atari5200Video = new Uint8Array(
+  core.memory.buffer,
+  core.omni_video_ptr(),
+  core.omni_video_len(),
+)
+assert(atari5200Video.some((value) => value !== 0), 'Atari 5200 framebuffer is empty')
+assert(core.omni_audio_rate() === 48_000, 'unexpected Atari 5200 audio sample rate')
+assert(core.omni_audio_channels() === 2, 'unexpected Atari 5200 audio channel count')
+const atari5200Audio = new Float32Array(
+  core.memory.buffer,
+  core.omni_audio_ptr(),
+  core.omni_audio_len(),
+)
+assert(atari5200Audio.some((value) => value > 0), 'Atari 5200 POKEY audio is silent')
+assert(core.omni_save_state(0, 0) > 0, 'Atari 5200 save state is empty')
+core.omni_unload()
+
 console.log(`OmniCore WASM smoke passed: ${bytes.byteLength} bytes, ${width}x${height}, ${audioLen} audio samples.`)
