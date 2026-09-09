@@ -47,8 +47,6 @@ export const PLATFORMS: Platform[] = [
   p({ id: 'wii', omniCode: 62, name: 'Nintendo Wii', generation: 7, vendor: 'Nintendo', years: '2006–2017', extensions: ['iso', 'wbfs', 'rvz'], tier: 'planned' }),
   p({ id: 'wiiu', omniCode: 70, name: 'Wii U', generation: 8, vendor: 'Nintendo', years: '2012–2017', extensions: ['wux', 'wud', 'rpx'], tier: 'planned' }),
   p({ id: 'switch', omniCode: 71, name: 'Nintendo Switch', generation: 8, vendor: 'Nintendo', years: '2017–', extensions: ['nsp', 'xci', 'nro'], tier: 'planned', note: 'User-owned keys and firmware only; OmniEmu will never distribute console keys or firmware.' }),
-  p({ id: 'ps4', omniCode: 72, name: 'PlayStation 4', generation: 8, vendor: 'Sony', years: '2013–', extensions: ['pkg'], tier: 'planned' }),
-  p({ id: 'xboxone', omniCode: 73, name: 'Xbox One', generation: 8, vendor: 'Microsoft', years: '2013–', extensions: ['xvc', 'iso'], tier: 'planned' }),
 ]
 
 export const READY_PLATFORMS = PLATFORMS.filter((platform) => platform.tier === 'playable')

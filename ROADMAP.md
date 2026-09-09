@@ -9,7 +9,12 @@ Established:
 - One Rust/WebAssembly emulator binary and one browser bridge.
 - Permanent platform-id namespace for generations 1–8.
 - Deterministic event scheduler and exact rational clock-domain conversion.
-- 64-bit shared address-space abstraction with explicit endianness for later 32/64-bit machines.
+- 64-bit physical interconnect plus a 16–64-bit paged MMU with permissions and mapping generations.
+- 256-source interrupt controller and generic DMA engine.
+- JIT-neutral IR, per-ISA code cache, MMU-generation validation and invalidation primitives.
+- 29 active hardware blueprints spanning generations 1–8; PS4/Xbox One are reserved but out of scope.
+- Typed chunked resources for game/disc/BIOS/firmware/keys/NAND/storage plus sparse block media.
+- Bounded GPU command queue and translated-shader cache foundation.
 - Unified video, audio, input, error, reset and machine lifecycle ABI.
 - Versioned platform-tagged save-state codec.
 - Browser WebGL 2 / Web Audio / Gamepad path.
@@ -53,11 +58,11 @@ This is where OmniCore needs a reusable dynamic-translation layer, reference int
 
 Bring Dreamcast, PlayStation 2, GameCube and original Xbox into OmniCore using shared JIT, MMU, shader-translation, optical-media and asynchronous-I/O infrastructure instead of four independent applications.
 
-Large media must become host-backed/streamed rather than copied wholesale into WebAssembly memory.
+The 64-bit chunked resource/block-media layer is now in place; machine implementations must consume it directly so large media never requires whole-image materialization.
 
 ## Stage 5 — seventh and eighth generations
 
-Target Wii, Xbox 360, PlayStation 3, Wii U, Switch, PlayStation 4 and Xbox One only after the shared high-end architecture is proven. PS4 and Xbox One remain lowest priority, but their ids are reserved now so they do not require a runtime redesign.
+Target Wii, Xbox 360, PlayStation 3, Wii U and Switch after the shared high-end architecture is proven. PlayStation 4 and Xbox One are explicitly outside the current scope; their numeric ids remain reserved only to avoid future data-format collisions.
 
 High-end work requires:
 

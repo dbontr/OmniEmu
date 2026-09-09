@@ -6,12 +6,17 @@ interface OmniExports extends WebAssembly.Exports {
   omni_core_version(): number
   omni_support_level(platform: number): number
   omni_can_launch(platform: number): number
+  omni_resources_clear(): void
+  omni_resource_create(kind: number, slot: number, len: bigint): number
+  omni_resource_write(kind: number, slot: number, offset: bigint, ptr: number, len: number): number
+  omni_load_staged(platform: number): number
   omni_alloc(len: number): number
   omni_free(ptr: number, len: number): void
   omni_load(platform: number, romPtr: number, romLen: number, biosPtr: number, biosLen: number): number
   omni_unload(): void
   omni_reset(): number
   omni_set_input(player: number, buttons: bigint): number
+  omni_set_axis(player: number, axis: number, value: number): number
   omni_run_frame(): number
   omni_frame_rate(): number
   omni_video_ptr(): number
@@ -197,25 +202,49 @@ class InputScanner {
     window.addEventListener('blur', this.blur)
   }
 
-  read(player: number): bigint {
+  readButtons(player: number): bigint {
     let mask = 0n
     const pad = navigator.getGamepads?.()[player] ?? null
     for (const binding of this.profile.players[player] ?? []) {
       if (binding.index > 15) continue
-      if (this.keyboard(binding.keyboard) || this.gamepad(pad, binding.gamepad)) mask |= 1n << BigInt(binding.index)
+      const strength = Math.max(this.keyboard(binding.keyboard) ? 1 : 0, this.gamepadStrength(pad, binding.gamepad))
+      if (strength > 0.5) mask |= 1n << BigInt(binding.index)
     }
     return mask
   }
-  private keyboard(key: string) { return !!key && this.pressed.has(key.toLowerCase()) }
-  private gamepad(pad: Gamepad | null, token: string) {
-    if (!pad || !token) return false
-    const button = PAD_BUTTONS[token]
-    if (button !== undefined) return pad.buttons[button]?.pressed ?? false
-    const axis = PAD_AXES[token]
-    if (!axis) return false
-    const value = pad.axes[axis[0]] ?? 0
-    return axis[1] > 0 ? value > 0.5 : value < -0.5
+
+  readAxes(player: number): Int16Array {
+    const pad = navigator.getGamepads?.()[player] ?? null
+    const bindings = this.profile.players[player] ?? []
+    const strength = (index: number) => {
+      const binding = bindings.find((candidate) => candidate.index === index)
+      if (!binding) return 0
+      return Math.max(this.keyboard(binding.keyboard) ? 1 : 0, this.gamepadStrength(pad, binding.gamepad))
+    }
+    const axes = new Int16Array(8)
+    axes[0] = signedAxis(strength(16) - strength(17))
+    axes[1] = signedAxis(strength(18) - strength(19))
+    axes[2] = signedAxis(strength(20) - strength(21))
+    axes[3] = signedAxis(strength(22) - strength(23))
+    axes[4] = triggerAxis(strength(12))
+    axes[5] = triggerAxis(strength(13))
+    return axes
   }
+
+  private keyboard(key: string) { return !!key && this.pressed.has(key.toLowerCase()) }
+
+  private gamepadStrength(pad: Gamepad | null, token: string) {
+    if (!pad || !token) return 0
+    const button = PAD_BUTTONS[token]
+    if (button !== undefined) return pad.buttons[button]?.value ?? 0
+    const axis = PAD_AXES[token]
+    if (!axis) return 0
+    const directed = (pad.axes[axis[0]] ?? 0) * axis[1]
+    const deadzone = 0.15
+    if (directed <= deadzone) return 0
+    return Math.min(1, (directed - deadzone) / (1 - deadzone))
+  }
+
   private keyDown = (event: KeyboardEvent) => {
     const key = event.key.toLowerCase()
     if (this.isMappedKey(key)) { event.preventDefault(); this.pressed.add(key) }
@@ -226,7 +255,8 @@ class InputScanner {
   }
   private blur = () => this.pressed.clear()
   private isMappedKey(key: string) {
-    return Object.values(this.profile.players).some((bindings) => bindings.some((binding) => binding.keyboard.toLowerCase() === key))
+    return Object.values(this.profile.players).some((bindings) =>
+      bindings.some((binding) => binding.keyboard.toLowerCase() === key))
   }
   dispose() {
     window.removeEventListener('keydown', this.keyDown)
@@ -235,6 +265,12 @@ class InputScanner {
     this.pressed.clear()
   }
 }
+
+const signedAxis = (value: number) =>
+  Math.round(Math.max(-1, Math.min(1, value)) * 32767)
+
+const triggerAxis = (value: number) =>
+  Math.round(Math.max(0, Math.min(1, value)) * 32767)
 function lastError(exports: OmniExports) {
   const ptr = exports.omni_last_error_ptr()
   const len = exports.omni_last_error_len()
@@ -242,19 +278,29 @@ function lastError(exports: OmniExports) {
   return new TextDecoder().decode(new Uint8Array(exports.memory.buffer, ptr, len))
 }
 
-async function copyFile(exports: OmniExports, file?: File | null) {
-  if (!file) return { ptr: 0, len: 0, free: () => undefined }
-  const source = new Uint8Array(await file.arrayBuffer())
-  const ptr = exports.omni_alloc(source.byteLength)
-  if (!ptr) throw new Error(`OmniCore could not allocate ${source.byteLength} bytes.`)
-  new Uint8Array(exports.memory.buffer, ptr, source.byteLength).set(source)
-  return {
-    ptr,
-    len: source.byteLength,
-    free: () => exports.omni_free(ptr, source.byteLength),
+const STAGE_CHUNK_BYTES = 1024 * 1024
+
+async function stageFile(
+  exports: OmniExports,
+  kind: number,
+  slot: number,
+  file?: File | null,
+) {
+  if (!file) return
+  requireOk(exports, exports.omni_resource_create(kind, slot, BigInt(file.size)))
+  for (let offset = 0; offset < file.size; offset += STAGE_CHUNK_BYTES) {
+    const end = Math.min(file.size, offset + STAGE_CHUNK_BYTES)
+    const bytes = new Uint8Array(await file.slice(offset, end).arrayBuffer())
+    const ptr = exports.omni_alloc(bytes.byteLength)
+    if (!ptr) throw new Error(`OmniCore could not allocate ${bytes.byteLength} staging bytes.`)
+    try {
+      new Uint8Array(exports.memory.buffer, ptr, bytes.byteLength).set(bytes)
+      requireOk(exports, exports.omni_resource_write(kind, slot, BigInt(offset), ptr, bytes.byteLength))
+    } finally {
+      exports.omni_free(ptr, bytes.byteLength)
+    }
   }
 }
-
 function requireOk(exports: OmniExports, result: number) {
   if (result !== 0) throw new Error(lastError(exports))
 }
@@ -265,12 +311,14 @@ export async function launchOmniCore(host: HTMLElement, request: OmniLaunchReque
   if (!exports.omni_can_launch(request.platform.omniCode)) {
     throw new Error(`${request.platform.name} does not have a runnable machine graph in OmniCore yet.`)
   }
-  const rom = await copyFile(exports, request.game)
-  const bios = await copyFile(exports, request.bios)
+  exports.omni_resources_clear()
   try {
-    requireOk(exports, exports.omni_load(request.platform.omniCode, rom.ptr, rom.len, bios.ptr, bios.len))
-  } finally {
-    rom.free(); bios.free()
+    await stageFile(exports, 0, 0, request.game)
+    await stageFile(exports, 1, 0, request.bios)
+    requireOk(exports, exports.omni_load_staged(request.platform.omniCode))
+  } catch (error) {
+    exports.omni_resources_clear()
+    throw error
   }
 
   const video = new VideoRenderer()
@@ -285,7 +333,13 @@ export async function launchOmniCore(host: HTMLElement, request: OmniLaunchReque
   const frameMs = 1000 / Math.max(1, exports.omni_frame_rate())
   let nextFrame = performance.now()
   const drawFrame = () => {
-    for (let player = 0; player < 4; player++) requireOk(exports, exports.omni_set_input(player, input.read(player)))
+    for (let player = 0; player < 4; player++) {
+      requireOk(exports, exports.omni_set_input(player, input.readButtons(player)))
+      const axes = input.readAxes(player)
+      for (let axis = 0; axis < axes.length; axis++) {
+        requireOk(exports, exports.omni_set_axis(player, axis, axes[axis] ?? 0))
+      }
+    }
     requireOk(exports, exports.omni_run_frame())
     const width = exports.omni_video_width()
     const height = exports.omni_video_height()

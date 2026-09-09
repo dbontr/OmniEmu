@@ -13,11 +13,14 @@ Source code is split into files for maintainability, but console implementations
 1. **Browser shell** — local game/system files, console selection, global controller editor and presentation.
 2. **OmniCore browser bridge** — one WASM load, frame pacing, memory transfer, WebGL 2, Web Audio and Gamepad translation.
 3. **Stable C ABI** — console-independent entry points used by every machine.
-4. **Kernel** — deterministic scheduling, exact clock domains, logical input, video/audio buffers and machine lifecycle.
-5. **Universal interconnect** — 64-bit address-space contract with 8/16/32/64-bit accesses and explicit endianness, alongside specialized fast buses for small CPUs.
-6. **Reusable hardware engines** — CPUs, memory, cartridge/media logic, later DSP/GPU/vector blocks.
-7. **Machine graphs** — the actual devices and address maps of each console, compiled into OmniCore.
-8. **State codec** — versioned deterministic binary state tagged with its platform id to prevent cross-console restores.
+4. **Hardware blueprint registry** — 29 active target systems describe guest ISA domains, address width/endian requirements, media, firmware/keys, graphics class and persistence needs.
+5. **Kernel** — deterministic scheduling, exact clock domains, logical input, video/audio buffers and machine lifecycle.
+6. **Memory/interrupt fabric** — 64-bit physical interconnect, 16–64-bit virtual MMU, permissions, DMA, and 256-source interrupt controller.
+7. **Execution layer** — reference interpreters plus JIT-neutral guest IR, per-ISA block caches, MMU-generation checks and invalidation.
+8. **Media/storage layer** — typed chunked resources, random-access block media and sparse writable storage.
+9. **Graphics layer** — bounded GPU command queue and generation-sensitive translated-shader cache feeding the future WebGPU backend.
+10. **Machine graphs** — actual devices and address maps for each console, all compiled into OmniCore.
+11. **State codec** — versioned deterministic binary state tagged with its platform id to prevent cross-console restores.
 
 ## Stable ABI
 
@@ -26,19 +29,22 @@ The current ABI exposes:
 ```text
 omni_core_version
 omni_support_level
-omni_can_launch
+omni_can_launch / omni_is_targeted / omni_target_count / omni_target_at
+omni_resources_clear
+omni_resource_create / omni_resource_write
+omni_load_staged
 omni_load / omni_unload / omni_reset
-omni_set_input / omni_run_frame
+omni_set_input / omni_set_axis / omni_run_frame
 omni_video_* / omni_audio_*
 omni_save_state / omni_load_state
 omni_last_error_*
 ```
 
-`omni_load(platform_id, rom, bios)` is the sole machine-selection entry point. `omni_can_launch` is distinct from the compatibility tier so partially implemented machines can be exercised during development without being advertised as fully playable.
+`omni_load_staged(platform_id)` is the general machine-selection path after typed resources have been staged. The older `omni_load(platform_id, rom, bios)` remains as a compact compatibility wrapper. `omni_can_launch` is distinct from `omni_is_targeted`: a console may have a complete core blueprint long before its machine graph is runnable.
 
 Platform ids are permanent once published. That lets save states, compatibility data, regression fixtures and browser storage refer to a machine without relying on source filenames.
 
-Later systems will need multiple firmware files, optical-disc streaming, keys, writable storage and larger media. Those resources will be added to the generic OmniCore host/resource ABI rather than by introducing separate emulator runtimes.
+The generic resource ABI already supports multiple games/discs, BIOS, firmware, keys, NAND, storage and memory-card slots. Resources are declared with 64-bit lengths and staged in bounded chunks. Machine implementations can use random-access block views instead of materializing multi-gigabyte media.
 
 ## Deterministic time
 
@@ -53,7 +59,7 @@ This separation is required for reproducible regression tests, rewind, save stat
 
 ## Address spaces
 
-Early CPUs use specialized narrow buses when that is the fastest and clearest implementation. OmniCore also has a shared 64-bit `AddressSpace` contract for later machines. It provides checked 8/16/32/64-bit accesses and explicit little/big-endian conversion, so 32-bit and 64-bit consoles do not require a new top-level runtime model.
+Early CPUs use specialized narrow buses when that is the fastest and clearest implementation. OmniCore also has a shared 64-bit `AddressSpace` contract plus a 16–64-bit paged MMU for later machines. It provides checked 8/16/32/64-bit accesses, explicit little/big-endian conversion, read/write/execute permissions, mapping generations, and fail-closed translation faults.
 
 Memory-mapped devices, DMA engines, GPU register files and high-address physical maps can all sit behind this interconnect while machine-specific fast paths remain possible where accuracy or performance requires them.
 
@@ -78,9 +84,9 @@ The NES development graph is the first ROM-driven proof: it combines the shared 
 
 ## Browser acceleration path
 
-Today, OmniCore emits one RGBA framebuffer and interleaved `f32` audio buffer. The browser bridge uploads video through WebGL 2 and schedules audio through Web Audio. The global logical controller ABI is a 64-bit mask per player.
+Today, OmniCore emits one RGBA framebuffer and interleaved `f32` audio buffer. The browser bridge uploads video through WebGL 2 and schedules audio through Web Audio. The global logical controller ABI provides a 64-bit digital mask plus eight signed 16-bit analog axes per player, including sticks, analog triggers and auxiliary axes.
 
-The high-end path keeps the same one-core rule while moving expensive work toward WebAssembly SIMD/threads, workers, shared memory, AudioWorklet and WebGPU. Large optical/package media will use a generic host-backed streaming resource interface rather than forcing multi-gigabyte files to become console-specific JavaScript backends.
+The high-end path keeps the same one-core rule while moving expensive work toward WebAssembly SIMD/threads, workers, shared memory, AudioWorklet and WebGPU. OmniCore now has the JIT-neutral block cache/invalidation layer, bounded GPU command/shader caches, and sparse 64-bit media/storage primitives needed to build those paths without introducing console-specific JavaScript runtimes.
 
 ## Playable gate
 

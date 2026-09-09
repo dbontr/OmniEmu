@@ -1,13 +1,23 @@
 mod api;
+pub mod audio;
+pub mod blueprint;
 pub mod bus;
 pub mod clock;
+pub mod cluster;
 pub mod cpu6502;
+pub mod dma;
+pub mod execution;
+pub mod graphics;
 pub mod input;
 pub mod interconnect;
+pub mod interrupt;
 pub mod kernel;
 pub mod machine;
 pub mod machines;
+pub mod media;
+pub mod mmu;
 pub mod platform;
+pub mod resources;
 pub mod state;
 
 #[cfg(test)]

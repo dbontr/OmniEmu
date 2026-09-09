@@ -1,6 +1,8 @@
+use crate::blueprint::is_targeted;
 use crate::kernel::{AudioBuffer, InputState, VideoBuffer};
 use crate::machines::{NesMachine, PongMachine};
 use crate::platform::{PlatformId, SupportLevel};
+use crate::resources::ResourceStore;
 
 pub trait Machine: Send {
     fn platform(&self) -> PlatformId;
@@ -15,16 +17,20 @@ pub trait Machine: Send {
 
 pub fn create_machine(
     platform: PlatformId,
-    rom: &[u8],
-    _bios: &[u8],
+    resources: &ResourceStore,
 ) -> Result<Box<dyn Machine>, String> {
     match platform {
         PlatformId::HomePong => Ok(Box::new(PongMachine::new()) as Box<dyn Machine>),
-        PlatformId::Nes => Ok(Box::new(NesMachine::from_rom(rom)?) as Box<dyn Machine>),
+        PlatformId::Nes => {
+            let image = resources.primary_game().ok_or_else(|| "NES requires a staged game image".to_string())?;
+            let rom = image.materialize(64 * 1024 * 1024)?;
+            Ok(Box::new(NesMachine::from_rom(&rom)?) as Box<dyn Machine>)
+        }
+        other if !is_targeted(other) => Err(format!("platform {} is reserved but outside the current OmniEmu target set", other as u32)),
         other if other.support_level() == SupportLevel::Foundation => Err(format!(
             "platform {} has shared hardware foundation in OmniCore but its complete machine graph is not runnable yet",
             other as u32,
         )),
-        other => Err(format!("platform {} is not implemented in OmniCore yet", other as u32)),
+        other => Err(format!("platform {} has an OmniCore hardware blueprint but its machine implementation is not complete yet", other as u32)),
     }
 }

@@ -1,17 +1,21 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
+use crate::input::AXIS_COUNT;
+
 pub const MAX_PLAYERS: usize = 4;
 
 #[derive(Clone)]
 pub struct InputState {
     pub buttons: [u64; MAX_PLAYERS],
+    pub axes: [[i16; AXIS_COUNT]; MAX_PLAYERS],
 }
 
 impl Default for InputState {
     fn default() -> Self {
         Self {
             buttons: [0; MAX_PLAYERS],
+            axes: [[0; AXIS_COUNT]; MAX_PLAYERS],
         }
     }
 }
