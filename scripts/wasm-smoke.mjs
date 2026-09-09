@@ -114,4 +114,99 @@ assert(core.omni_audio_rate() === 48_000, 'unexpected NES audio sample rate')
 assert(core.omni_audio_channels() === 2, 'unexpected NES audio channel count')
 core.omni_unload()
 
+assert(core.omni_can_launch(21) === 1, 'Master System foundation should be launchable for development')
+const sms = new Uint8Array(0x8000)
+const smsProgram = [
+  0xf3, 0x31, 0xf0, 0xdf,
+  0x3e, 0x04, 0xd3, 0xbf, 0x3e, 0x80, 0xd3, 0xbf,
+  0x3e, 0xc0, 0xd3, 0xbf, 0x3e, 0x81, 0xd3, 0xbf,
+  0x3e, 0xff, 0xd3, 0xbf, 0x3e, 0x82, 0xd3, 0xbf,
+  0x3e, 0xff, 0xd3, 0xbf, 0x3e, 0x85, 0xd3, 0xbf,
+  0x3e, 0xfb, 0xd3, 0xbf, 0x3e, 0x86, 0xd3, 0xbf,
+  0x3e, 0x01, 0xd3, 0xbf, 0x3e, 0xc0, 0xd3, 0xbf,
+  0x3e, 0x03, 0xd3, 0xbe,
+  0x3e, 0x00, 0xd3, 0xbf, 0x3e, 0x40, 0xd3, 0xbf,
+  0x21, 0x00, 0x01, 0x06, 0x20,
+  0x7e, 0xd3, 0xbe, 0x23, 0x10, 0xfa,
+  0xc3, 0x4b, 0x00,
+]
+sms.set(smsProgram)
+for (let row = 0; row < 8; row++) sms[0x100 + row * 4] = 0xff
+core.omni_resources_clear()
+ok(core.omni_resource_create(0, 0, BigInt(sms.byteLength)), 'create staged Master System resource')
+const smsPtr = core.omni_alloc(sms.byteLength)
+assert(smsPtr > 0, 'Master System staging allocation failed')
+new Uint8Array(core.memory.buffer, smsPtr, sms.byteLength).set(sms)
+ok(core.omni_resource_write(0, 0, 0n, smsPtr, sms.byteLength), 'stage Master System resource')
+core.omni_free(smsPtr, sms.byteLength)
+ok(core.omni_load_staged(21), 'load staged Master System cartridge')
+for (let frame = 0; frame < 2; frame++) ok(core.omni_run_frame(), `run Master System frame ${frame}`)
+const smsWidth = core.omni_video_width()
+const smsHeight = core.omni_video_height()
+const smsVideoLen = core.omni_video_len()
+assert(smsWidth === 256 && smsHeight === 192, `unexpected Master System surface ${smsWidth}x${smsHeight}`)
+assert(smsVideoLen === smsWidth * smsHeight * 4, 'invalid Master System framebuffer')
+const smsVideo = new Uint8Array(core.memory.buffer, core.omni_video_ptr(), smsVideoLen)
+let smsHasRed = false
+for (let i = 0; i < smsVideo.length; i += 4) {
+  if (smsVideo[i] > smsVideo[i + 1] && smsVideo[i] > smsVideo[i + 2]) { smsHasRed = true; break }
+}
+assert(smsHasRed, 'Master System Mode 4 framebuffer did not render expected palette output')
+assert(core.omni_audio_rate() === 48_000, 'unexpected Master System audio sample rate')
+assert(core.omni_audio_channels() === 2, 'unexpected Master System audio channel count')
+core.omni_unload()
+
+assert(core.omni_can_launch(12) === 1, 'ColecoVision foundation should be launchable for development')
+const colecoBios = new Uint8Array(0x2000)
+colecoBios.set([0xc3, 0x00, 0x80], 0)
+colecoBios.set([0xed, 0x45], 0x66)
+const coleco = new Uint8Array(0x2000)
+const colecoProgram = [
+  0xf3, 0x31, 0xff, 0x7f,
+  0x3e, 0x02, 0xd3, 0xbf, 0x3e, 0x80, 0xd3, 0xbf,
+  0x3e, 0x40, 0xd3, 0xbf, 0x3e, 0x81, 0xd3, 0xbf,
+  0x3e, 0x06, 0xd3, 0xbf, 0x3e, 0x82, 0xd3, 0xbf,
+  0x3e, 0x80, 0xd3, 0xbf, 0x3e, 0x83, 0xd3, 0xbf,
+  0x3e, 0x00, 0xd3, 0xbf, 0x3e, 0x84, 0xd3, 0xbf,
+  0x3e, 0x36, 0xd3, 0xbf, 0x3e, 0x85, 0xd3, 0xbf,
+  0x3e, 0x07, 0xd3, 0xbf, 0x3e, 0x86, 0xd3, 0xbf,
+  0x3e, 0x01, 0xd3, 0xbf, 0x3e, 0x87, 0xd3, 0xbf,
+]
+coleco.set(colecoProgram)
+const colecoTail = [
+  0x3e, 0x00, 0xd3, 0xbf, 0x3e, 0x40, 0xd3, 0xbf,
+  0x21, 0x00, 0x81, 0x06, 0x08, 0x7e, 0xd3, 0xbe, 0x23, 0x10, 0xfa,
+  0x3e, 0x00, 0xd3, 0xbf, 0x3e, 0x60, 0xd3, 0xbf,
+  0x21, 0x10, 0x81, 0x06, 0x08, 0x7e, 0xd3, 0xbe, 0x23, 0x10, 0xfa,
+  0x3e, 0x00, 0xd3, 0xbf, 0x3e, 0x58, 0xd3, 0xbf, 0xaf, 0xd3, 0xbe,
+  0x3e, 0x84, 0xd3, 0xff, 0x3e, 0x10, 0xd3, 0xff, 0x3e, 0x90, 0xd3, 0xff,
+]
+const colecoTailStart = colecoProgram.length
+coleco.set(colecoTail, colecoTailStart)
+const colecoLoop = 0x8000 + colecoTailStart + colecoTail.length
+coleco.set([0xc3, colecoLoop & 0xff, colecoLoop >> 8], colecoTailStart + colecoTail.length)
+coleco.fill(0xff, 0x100, 0x108)
+coleco.fill(0xf1, 0x110, 0x118)
+core.omni_resources_clear()
+const stageBytes = (kind, data, label) => {
+  ok(core.omni_resource_create(kind, 0, BigInt(data.byteLength)), `create staged ${label}`)
+  const ptr = core.omni_alloc(data.byteLength)
+  assert(ptr > 0, `${label} staging allocation failed`)
+  new Uint8Array(core.memory.buffer, ptr, data.byteLength).set(data)
+  ok(core.omni_resource_write(kind, 0, 0n, ptr, data.byteLength), `stage ${label}`)
+  core.omni_free(ptr, data.byteLength)
+}
+stageBytes(0, coleco, 'ColecoVision cartridge')
+stageBytes(1, colecoBios, 'ColecoVision BIOS')
+ok(core.omni_load_staged(12), 'load staged ColecoVision cartridge')
+for (let frame = 0; frame < 2; frame++) ok(core.omni_run_frame(), `run ColecoVision frame ${frame}`)
+const colecoWidth = core.omni_video_width()
+const colecoHeight = core.omni_video_height()
+assert(colecoWidth === 256 && colecoHeight === 192, `unexpected ColecoVision surface ${colecoWidth}x${colecoHeight}`)
+const colecoVideo = new Uint8Array(core.memory.buffer, core.omni_video_ptr(), core.omni_video_len())
+assert(colecoVideo.some((value) => value > 180), 'ColecoVision framebuffer did not render pattern output')
+assert(core.omni_audio_rate() === 48_000, 'unexpected ColecoVision audio sample rate')
+assert(core.omni_audio_channels() === 2, 'unexpected ColecoVision audio channel count')
+core.omni_unload()
+
 console.log(`OmniCore WASM smoke passed: ${bytes.byteLength} bytes, ${width}x${height}, ${audioLen} audio samples.`)

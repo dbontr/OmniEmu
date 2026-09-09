@@ -33,10 +33,13 @@ The unified runtime is already executing real machine graphs and now has substan
 - One RGBA video path rendered with WebGL 2 and one interleaved `f32` audio path through Web Audio.
 - One global four-player controller ABI with 64 digital bits and 8 signed 16-bit analog axes per player; keyboard and Gamepad mappings feed the same logical controls.
 - Reusable NMOS 6502 execution engine covering the official instruction set.
+- Reusable Z80 execution engine with base/CB/ED/indexed instruction families, interrupt modes, block operations, I/O, save-state serialization, and shared use by Sega/Coleco-class machines.
 - Playable built-in Home Pong/Telstar-class hardware simulation with video, audio, input, reset, and save states.
 - Runnable NES development machine with CPU/PPU bus, controllers, OAM DMA, NMI/IRQ, background/sprite rendering, four mirroring modes, pulse/triangle/noise/DMC audio, deterministic save states, battery-backed persistence, and mapper 0/1/2/3/4/7/11/66 switching.
+- Runnable Master System development machine with the shared Z80, Sega ROM/SRAM mapper, Mode 4 VDP background/sprite rendering, 3:2 CPU-to-dot timing, frame/line interrupts, scroll locks and counters, active-low two-player input, SN76489 PSG audio, save states, and persistent cartridge RAM.
+- Runnable ColecoVision development machine reusing the Z80 and SN76489 plus a reusable TMS9918 video device with Graphics I/II tile rendering, sprites, VDP NMI, BIOS/cartridge mapping, controllers, audio and save states.
 
-The browser stages local files into OmniCore in bounded chunks rather than first duplicating them into one temporary WASM allocation. The same resource ABI supports multiple firmware, key, disc, and storage slots for later machines. Machine-owned persistent resources have a generic ABI; NES battery RAM is automatically restored and checkpointed in IndexedDB using a content-derived game fingerprint. The current launch path still stages the complete selected file; true host-backed demand paging for very large disc/package media is a later implementation step.
+The browser stages local files into OmniCore in bounded chunks rather than first duplicating them into one temporary WASM allocation. The same resource ABI supports multiple firmware, key, disc, and storage slots for later machines. Machine-owned persistent resources have a generic ABI; cartridge RAM, including NES and Master System persistence, is automatically restored and checkpointed in IndexedDB using a content-derived game fingerprint. The current launch path still stages the complete selected file; true host-backed demand paging for very large disc/package media is a later implementation step.
 
 ## What "one core" means
 
@@ -54,6 +57,10 @@ Compatibility state and developer launchability are intentionally separate:
 - `foundation` — substantial real OmniCore hardware exists but compatibility is incomplete.
 - `planned` — the platform has a target blueprint, but the machine graph is not complete.
 NES is currently `foundation`: NROM, MMC1, UxROM, CNROM, MMC3, AxROM, Color Dreams, and GxROM execute inside OmniCore; APU channels including DMC, deterministic save states, NES 2.0 sizing, and battery persistence are live. It still needs substantially more mapper coverage, cycle-accurate PPU/MMC3 edge behavior, unofficial CPU-opcode compatibility, and a representative legal compatibility corpus before it can move to `playable`.
+
+Master System is also `foundation`: the shared Z80, Sega mapper/SRAM, Mode 4 tile and sprite rendering, corrected 3:2 CPU/VDP-dot timing, frame/line interrupts, scroll locks, controllers, SN76489 audio, save states, and persistence are live. It still needs cycle-level VDP validation, legacy video modes, uncommon cartridge mappers, optional FM audio, region/peripheral edge cases, and a representative compatibility corpus.
+
+ColecoVision is now `foundation` and launchable with a user-provided 8 KiB BIOS: its shared Z80/SN76489 path, TMS9918 Graphics I/II rendering, sprites, VDP NMI, cartridge/RAM map, controller path and deterministic state are live. It still needs full keypad/peripheral behavior, tighter TMS9918 timing/status accuracy, cartridge edge cases and compatibility-corpus validation.
 
 The project target is broad compatibility for the 29 active systems, not a claim that all of those commercial libraries work today.
 

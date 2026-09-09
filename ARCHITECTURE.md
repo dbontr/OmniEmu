@@ -82,6 +82,10 @@ Home Pong/Telstar-class hardware is fully constructed inside OmniCore and exerci
 
 The NES development graph is the first ROM-driven proof. It combines the shared 6502 engine with CPU/PPU buses, controller ports, OAM and DMC DMA paths, NMI/IRQ delivery, background/sprite rendering, pulse/triangle/noise/DMC audio, NES 2.0 sizing, deterministic save states, battery persistence, and mapper 0/1/2/3/4/7/11/66 support. It remains `foundation` because precise PPU fetch/sprite timing, MMC3 A12-edge behavior, unofficial CPU opcodes, additional boards, and large compatibility-corpus validation are unfinished.
 
+The Master System development graph is the second ROM-driven proof and the first reuse of the Z80-family substrate. It combines the shared Z80 with Sega ROM/SRAM mapping, Mode 4 tile/sprite rendering, frame and line interrupts, horizontal/vertical scroll locks, controller ports, SN76489 audio, deterministic state, and cartridge persistence. It remains `foundation` while cycle-level VDP behavior, legacy modes, mapper variants, FM audio, and broad compatibility validation are unfinished.
+
+ColecoVision is the third ROM-driven machine and demonstrates reuse across vendors: the same Z80 and SN76489 execute alongside a reusable TMS9918 device, an 8 KiB user BIOS, the Coleco memory/I/O map, controller multiplexing, Graphics I/II rendering, sprites, VDP NMI and deterministic state.
+
 ## Browser acceleration path
 
 Today, OmniCore emits one RGBA framebuffer and interleaved `f32` audio buffer. The browser bridge uploads video through WebGL 2 and schedules audio through Web Audio. The global logical controller ABI provides a 64-bit digital mask plus eight signed 16-bit analog axes per player, including sticks, analog triggers and auxiliary axes.

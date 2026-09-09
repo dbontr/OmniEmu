@@ -1323,6 +1323,62 @@ impl Z80 {
             | if sum > 0xffff { C } else { 0 };
         self.set_index_value(mode, result);
     }
+    pub fn save(&self, out: &mut crate::state::StateWriter) {
+        for value in [
+            self.a, self.f, self.b, self.c, self.d, self.e, self.h, self.l,
+        ] {
+            out.u8(value);
+        }
+        for value in [
+            self.a2, self.f2, self.b2, self.c2, self.d2, self.e2, self.h2, self.l2,
+        ] {
+            out.u8(value);
+        }
+        out.u16(self.ix);
+        out.u16(self.iy);
+        out.u16(self.sp);
+        out.u16(self.pc);
+        out.u8(self.i);
+        out.u8(self.r);
+        out.u8(self.iff1 as u8);
+        out.u8(self.iff2 as u8);
+        out.u8(self.interrupt_mode);
+        out.u8(self.halted as u8);
+        out.u64(self.cycles);
+        out.u8(self.ei_delay);
+    }
+
+    pub fn load(&mut self, input: &mut crate::state::StateReader<'_>) -> Result<(), String> {
+        self.a = input.u8()?;
+        self.f = input.u8()?;
+        self.b = input.u8()?;
+        self.c = input.u8()?;
+        self.d = input.u8()?;
+        self.e = input.u8()?;
+        self.h = input.u8()?;
+        self.l = input.u8()?;
+        self.a2 = input.u8()?;
+        self.f2 = input.u8()?;
+        self.b2 = input.u8()?;
+        self.c2 = input.u8()?;
+        self.d2 = input.u8()?;
+        self.e2 = input.u8()?;
+        self.h2 = input.u8()?;
+        self.l2 = input.u8()?;
+        self.ix = input.u16()?;
+        self.iy = input.u16()?;
+        self.sp = input.u16()?;
+        self.pc = input.u16()?;
+        self.i = input.u8()?;
+        self.r = input.u8()?;
+        self.iff1 = input.u8()? != 0;
+        self.iff2 = input.u8()? != 0;
+        self.interrupt_mode = input.u8()?;
+        self.halted = input.u8()? != 0;
+        self.cycles = input.u64()?;
+        self.ei_delay = input.u8()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

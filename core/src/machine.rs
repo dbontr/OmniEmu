@@ -1,6 +1,6 @@
 use crate::blueprint::is_targeted;
 use crate::kernel::{AudioBuffer, InputState, VideoBuffer};
-use crate::machines::{NesMachine, PongMachine};
+use crate::machines::{ColecoVisionMachine, MasterSystemMachine, NesMachine, PongMachine};
 use crate::platform::{PlatformId, SupportLevel};
 use crate::resources::{ResourceKind, ResourceStore};
 
@@ -45,6 +45,19 @@ pub fn create_machine(
             let rom = image.materialize(64 * 1024 * 1024)?;
             Ok(Box::new(NesMachine::from_rom(&rom)?) as Box<dyn Machine>)
         }
+        PlatformId::MasterSystem => {
+            let image = resources.primary_game().ok_or_else(|| "Master System requires a staged cartridge image".to_string())?;
+            let rom = image.materialize(16 * 1024 * 1024)?;
+            Ok(Box::new(MasterSystemMachine::from_rom(&rom)?) as Box<dyn Machine>)
+        }
+        PlatformId::ColecoVision => {
+            let image = resources.primary_game().ok_or_else(|| "ColecoVision requires a staged cartridge image".to_string())?;
+            let rom = image.materialize(512 * 1024)?;
+            let bios = resources.get(ResourceKind::Bios, 0).ok_or_else(|| "ColecoVision requires a staged BIOS".to_string())?;
+            let bios = bios.materialize(0x2000)?;
+            Ok(Box::new(ColecoVisionMachine::from_images(&bios, &rom)?) as Box<dyn Machine>)
+        }
+
         other if !is_targeted(other) => Err(format!("platform {} is reserved but outside the current OmniEmu target set", other as u32)),
         other if other.support_level() == SupportLevel::Foundation => Err(format!(
             "platform {} has shared hardware foundation in OmniCore but its complete machine graph is not runnable yet",

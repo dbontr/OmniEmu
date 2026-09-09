@@ -21,7 +21,10 @@ Established:
 - Direct release-WASM smoke tests in the normal build.
 - First playable ROM-less machine: Home Pong/Telstar class.
 - Reusable official-opcode NMOS 6502 execution substrate.
+- Reusable Z80 execution substrate with indexed/extended families, interrupts, block I/O, and deterministic state support.
 - First ROM machine graph: NES with CPU/PPU buses, controllers, OAM/DMC DMA, NMI/IRQ/rendering, APU audio, deterministic save states, battery persistence, NES 2.0 sizing, and mapper 0/1/2/3/4/7/11/66 support.
+- Second ROM machine graph: Master System with Z80, Sega banked ROM/SRAM, Mode 4 VDP rendering, corrected 3:2 CPU/dot timing, frame/line interrupts, V/H counters, scroll locks, two-player controls, SN76489 audio, save states, and persistent SRAM.
+- Third ROM machine graph: ColecoVision reusing the Z80/SN76489 with TMS9918 Graphics I/II rendering, sprites, VDP NMI, BIOS/cartridge mapping, controllers and save states.
 
 ## Stage 1 — finish the first cartridge families
 
@@ -37,9 +40,9 @@ In parallel, reuse the same 6502-family substrate for Atari 2600, Atari 5200 and
 
 ## Stage 2 — generations 2 through 4
 
-Add reusable Z80, 65C816 and 68000-family CPU engines plus VDP, PSG/FM, cartridge and optical-media primitives, then complete:
+The reusable Z80 and first Sega VDP/PSG machine graph are now established. Continue with 65C816 and 68000-family CPU engines plus broader VDP, PSG/FM, cartridge and optical-media primitives, then complete:
 
-- ColecoVision and Intellivision.
+- Finish ColecoVision keypad/peripheral/timing compatibility, then Intellivision.
 - Master System.
 - SNES / Super Famicom.
 - Genesis / Mega Drive, Sega CD and 32X.
