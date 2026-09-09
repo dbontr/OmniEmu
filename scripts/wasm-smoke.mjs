@@ -291,4 +291,47 @@ assert(atari5200Audio.some((value) => value > 0), 'Atari 5200 POKEY audio is sil
 assert(core.omni_save_state(0, 0) > 0, 'Atari 5200 save state is empty')
 core.omni_unload()
 
+assert(core.omni_can_launch(22) === 1, 'Atari 7800 foundation should be launchable for development')
+const atari7800 = new Uint8Array(0xc000)
+atari7800.fill(0xea)
+const atari7800Program = [
+  0x78, 0xd8,
+  0xa9, 0x22, 0x85, 0x20,
+  0xa9, 0x2e, 0x85, 0x21,
+  0xa9, 0x4e, 0x85, 0x22,
+  0xa9, 0x6e, 0x85, 0x23,
+  0xa9, 0x00, 0x85, 0x30,
+  0xa9, 0x18, 0x85, 0x2c,
+  0xa9, 0x40, 0x85, 0x3c,
+  0xa9, 0x04, 0x85, 0x15,
+  0xa9, 0x08, 0x85, 0x17,
+  0xa9, 0x0f, 0x85, 0x19,
+  0x4c, 0x2a, 0x40,
+]
+atari7800.set(atari7800Program)
+atari7800.set([0x00, 0x40, 0x00, 0x40, 0x00, 0x40], 0xbffa)
+core.omni_resources_clear()
+stageBytes(0, atari7800, 'Atari 7800 cartridge')
+ok(core.omni_load_staged(22), 'load staged Atari 7800 cartridge')
+for (let frame = 0; frame < 2; frame++) ok(core.omni_run_frame(), `run Atari 7800 frame ${frame}`)
+const atari7800Width = core.omni_video_width()
+const atari7800Height = core.omni_video_height()
+assert(
+  atari7800Width === 320 && atari7800Height === 240,
+  `unexpected Atari 7800 surface ${atari7800Width}x${atari7800Height}`,
+)
+const atari7800Video = new Uint8Array(core.memory.buffer, core.omni_video_ptr(), core.omni_video_len())
+assert(
+  atari7800Video.some((value, index) => index % 4 !== 3 && value !== 0),
+  'Atari 7800 framebuffer has no RGB output',
+)
+const atari7800Audio = new Float32Array(
+  core.memory.buffer,
+  core.omni_audio_ptr(),
+  core.omni_audio_len(),
+)
+assert(atari7800Audio.some((value) => value > 0), 'Atari 7800 TIA audio is silent')
+assert(core.omni_save_state(0, 0) > 0, 'Atari 7800 save state is empty')
+core.omni_unload()
+
 console.log(`OmniCore WASM smoke passed: ${bytes.byteLength} bytes, ${width}x${height}, ${audioLen} audio samples.`)

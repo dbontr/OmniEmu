@@ -1,5 +1,6 @@
 mod atari2600;
 mod atari5200;
+mod atari7800;
 mod colecovision;
 mod master_system;
 mod nes;
@@ -11,6 +12,7 @@ mod tms9918;
 
 pub use atari2600::Atari2600Machine;
 pub use atari5200::Atari5200Machine;
+pub use atari7800::Atari7800Machine;
 pub use colecovision::ColecoVisionMachine;
 pub use master_system::MasterSystemMachine;
 pub use nes::NesMachine;

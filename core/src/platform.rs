@@ -78,6 +78,7 @@ impl PlatformId {
             Self::HomePong
                 | Self::Atari2600
                 | Self::Atari5200
+                | Self::Atari7800
                 | Self::ColecoVision
                 | Self::Nes
                 | Self::MasterSystem

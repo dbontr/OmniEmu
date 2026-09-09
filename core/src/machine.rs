@@ -1,8 +1,8 @@
 use crate::blueprint::is_targeted;
 use crate::kernel::{AudioBuffer, InputState, VideoBuffer};
 use crate::machines::{
-    Atari2600Machine, Atari5200Machine, ColecoVisionMachine, MasterSystemMachine, NesMachine,
-    PongMachine,
+    Atari2600Machine, Atari5200Machine, Atari7800Machine, ColecoVisionMachine, MasterSystemMachine,
+    NesMachine, PongMachine,
 };
 use crate::platform::{PlatformId, SupportLevel};
 use crate::resources::{ResourceKind, ResourceStore};
@@ -54,6 +54,11 @@ pub fn create_machine(
             let bios = resources.get(ResourceKind::Bios, 0).ok_or_else(|| "Atari 5200 requires a staged BIOS".to_string())?;
             let bios = bios.materialize(0x0800)?;
             Ok(Box::new(Atari5200Machine::new(&rom, &bios)?) as Box<dyn Machine>)
+        }
+        PlatformId::Atari7800 => {
+            let image = resources.primary_game().ok_or_else(|| "Atari 7800 requires a staged cartridge image".to_string())?;
+            let rom = image.materialize(2 * 1024 * 1024 + 128)?;
+            Ok(Box::new(Atari7800Machine::from_image(&rom)?) as Box<dyn Machine>)
         }
         PlatformId::Nes => {
             let image = resources.primary_game().ok_or_else(|| "NES requires a staged game image".to_string())?;
