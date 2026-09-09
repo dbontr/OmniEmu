@@ -22,3 +22,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local browser/runtime state and generated core artifacts
+.edge-live/
+core/target/
+public/omnicore.wasm
+.edge-*/

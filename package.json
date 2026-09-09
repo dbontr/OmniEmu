@@ -1,16 +1,21 @@
 {
   "name": "omniemu",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "engines": { "node": ">=24" },
   "scripts": {
-    "dev": "vite",
+    "dev": "npm run core:build && vite",
     "check": "tsc --noEmit",
-    "build": "tsc && vite build",
+    "core:fmt": "node scripts/core-task.mjs fmt",
+    "core:clippy": "node scripts/core-task.mjs clippy",
+    "core:test": "node scripts/core-task.mjs test",
+    "core:build": "node scripts/core-task.mjs build",
+    "core:smoke": "node scripts/wasm-smoke.mjs",
+    "build": "npm run core:build && npm run core:smoke && tsc && vite build",
     "preview": "vite preview",
     "verify:branding": "node scripts/verify-branding.mjs",
-    "verify": "npm run verify:branding && npm run build"
+    "verify": "npm run verify:branding && npm run core:fmt && npm run core:clippy && npm run core:test && npm run build"
   },
   "devDependencies": {
     "coi-serviceworker": "^0.1.7",

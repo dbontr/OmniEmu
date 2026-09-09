@@ -1,0 +1,16 @@
+[package]
+name = "omnicore"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Single-binary universal emulation core for OmniEmu"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

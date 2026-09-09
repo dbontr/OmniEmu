@@ -1,0 +1,30 @@
+mod api;
+pub mod bus;
+pub mod clock;
+pub mod cpu6502;
+pub mod input;
+pub mod interconnect;
+pub mod kernel;
+pub mod machine;
+pub mod machines;
+pub mod platform;
+pub mod state;
+
+#[cfg(test)]
+mod tests {
+    use crate::kernel::Scheduler;
+
+    #[test]
+    fn scheduler_is_deterministic_for_equal_timestamps() {
+        let mut scheduler = Scheduler::new();
+        scheduler.schedule_at(12, 3, 9);
+        scheduler.schedule_at(12, 2, 7);
+        scheduler.schedule_at(8, 1, 4);
+        let events = scheduler.advance_to(12);
+        assert_eq!(
+            events.iter().map(|event| event.device).collect::<Vec<_>>(),
+            vec![1, 3, 2]
+        );
+        assert_eq!(scheduler.now(), 12);
+    }
+}

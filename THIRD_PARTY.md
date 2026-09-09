@@ -1,13 +1,17 @@
-# Third-party components
+# Third-party software
 
-## coi-serviceworker 0.1.7
+OmniEmu's emulation runtime is built from this repository's `core/` source. It does not fetch third-party console emulator cores at runtime.
 
-`public/coi-serviceworker.js` is the minified distribution of `coi-serviceworker` 0.1.7 by Gert-Jan Zwiers and contributors, used under the MIT License.
+## coi-serviceworker
 
-Source: https://github.com/gzuidhof/coi-serviceworker
+The static site uses `coi-serviceworker` to provide cross-origin isolation on hosts such as GitHub Pages where application code cannot configure HTTP response headers directly.
 
-## EmulatorJS 4.2.3
+License: MIT. The installed package license and source attribution remain available under `node_modules/coi-serviceworker` during development.
 
-OmniEmu does not vendor EmulatorJS core packages in this repository. Compatible sessions load the pinned 4.2.3 browser runtime/core assets on demand from the EmulatorJS CDN. EmulatorJS is GPL-3.0 and individual libretro cores retain their own upstream licenses.
+## Build tooling
 
-Source: https://github.com/EmulatorJS/EmulatorJS
+TypeScript and Vite are development/build dependencies. Rust's standard toolchain compiles OmniCore to `wasm32-unknown-unknown`.
+
+## User content
+
+Games, BIOS/firmware, console keys, and other proprietary system content are not bundled with OmniEmu. Users must supply their own lawful local copies where a machine requires them.

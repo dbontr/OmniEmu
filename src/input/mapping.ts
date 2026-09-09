@@ -82,16 +82,5 @@ export function saveInputProfile(profile: InputProfile) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(profile))
 }
 
-export function toEmulatorJsControls(profile: InputProfile) {
-  const output: Record<number, Record<number, { value: string; value2: string }>> = {}
-  for (const player of [0, 1, 2, 3]) {
-    output[player] = {}
-    for (const binding of profile.players[player] ?? []) {
-      output[player][binding.index] = { value: binding.keyboard, value2: binding.gamepad }
-    }
-  }
-  return output
-}
-
 export const primaryBindings = (profile: InputProfile, player = 0) =>
   (profile.players[player] ?? []).filter((binding) => binding.index <= 15)

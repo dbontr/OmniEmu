@@ -1,7 +1,6 @@
 import './styles.css'
 import { PLATFORMS, candidatesForFile, platformById, type Platform } from './catalog'
-import { launchRuntime, runtimeAvailable } from './runtime/adapter'
-import type { EmulatorSession } from './runtime/emulatorjs'
+import { launchOmniCore, runtimeAvailable, type OmniSession } from './runtime/omnicore'
 import { defaultProfile, loadInputProfile, primaryBindings, saveInputProfile, type InputProfile } from './input/mapping'
 
 type MessageKind = 'idle' | 'loading' | 'ready' | 'running' | 'error'
@@ -10,7 +9,7 @@ interface AppState {
   platform: Platform
   game: File | null
   bios: File | null
-  session: EmulatorSession | null
+  session: OmniSession | null
   input: InputProfile
   message: string
   messageKind: MessageKind
@@ -43,15 +42,20 @@ renderPlatformSidebar()
 renderPlatformSelect()
 refreshUi()
 
-window.addEventListener('message', handleEmulatorMessage)
 window.addEventListener('gamepadconnected', refreshCapabilities)
 window.addEventListener('gamepaddisconnected', refreshCapabilities)
+window.addEventListener('omnicore:error', (event) => {
+  const detail = (event as CustomEvent<{ message?: string }>).detail
+  state.messageKind = 'error'
+  state.message = detail?.message || 'OmniCore stopped because of an emulation error.'
+  refreshPlayerBar()
+})
 function shellMarkup() {
   const mascot = `${import.meta.env.BASE_URL}emu.svg`
   return `
   <div class="app-shell">
     <header class="topbar">
-      <div class="brand"><img src="${mascot}" alt=""><div><strong>OmniEmu</strong><small>one browser · many consoles</small></div></div>
+      <div class="brand"><img src="${mascot}" alt=""><div><strong>OmniEmu</strong><small>one core · every console</small></div></div>
       <label class="button file-button">Open game<input id="game-input" type="file"></label>
       <button class="button" id="details-button" type="button"><span class="long">Game &amp; system </span>details</button>
       <div class="topbar-actions">
@@ -62,7 +66,7 @@ function shellMarkup() {
     <div class="workspace">
       <aside class="sidebar" aria-label="Console generations">
         <div class="sidebar-title">Console generations</div>
-        <div class="support-legend"><span class="r"><i></i>Browser core</span><span class="e"><i></i>Experimental</span><span><i></i>Roadmap</span></div>
+        <div class="support-legend"><span class="r"><i></i>Playable</span><span class="e"><i></i>Core foundation</span><span><i></i>Planned</span></div>
         <div id="generation-list"></div>
       </aside>
       <main class="player-column">
@@ -71,7 +75,7 @@ function shellMarkup() {
           <div class="player-empty" id="player-idle">
             <img src="${mascot}" alt="OmniEmu's emu mascot">
             <h1>Load a game.</h1>
-            <p>Games stay on this device. OmniEmu detects the system, loads only the core it needs, and keeps one global keyboard/controller profile across consoles.</p>
+            <p>Games stay on this device. One OmniCore WebAssembly engine owns the machine, timing, video, audio, saves, and global controller model across every console.</p>
             <label class="drop-zone" id="drop-zone"><strong>Drop a ROM, disc image, or archive here</strong><span>or click to choose a local game</span><input class="sr-only" id="drop-input" type="file"></label>
           </div>
         </section>
@@ -90,7 +94,7 @@ function shellMarkup() {
           <div id="detection-note"></div>
         </section>
         <section><h2>Acceleration</h2><div class="status-grid" id="capabilities"></div></section>
-        <section><h2>Privacy</h2><p>Game and BIOS files are opened locally as browser object URLs. OmniEmu does not upload them. Emulator runtime assets are fetched on demand.</p></section>
+        <section><h2>Privacy</h2><p>Game and BIOS files stay local. OmniEmu copies them directly into the single OmniCore WebAssembly memory and never uploads them.</p></section>
       </aside>
     </div>
     <div id="modal-root"></div>
@@ -100,8 +104,8 @@ function renderPlatformSidebar() {
   const root = el<HTMLElement>('#generation-list')
   root.innerHTML = Array.from({ length: 8 }, (_, index) => index + 1).map((generation) => {
     const platforms = PLATFORMS.filter((platform) => platform.generation === generation)
-    const live = platforms.filter((platform) => platform.tier !== 'planned').length
-    return `<section class="generation"><button type="button"><span>Generation ${generation}</span><small>${live}/${platforms.length} browser</small></button><div class="platform-list">${platforms.map((platform) => platformButton(platform)).join('')}</div></section>`
+    const playable = platforms.filter((platform) => platform.tier === 'playable').length
+    return `<section class="generation"><button type="button"><span>Generation ${generation}</span><small>${playable}/${platforms.length} playable</small></button><div class="platform-list">${platforms.map((platform) => platformButton(platform)).join('')}</div></section>`
   }).join('')
   root.querySelectorAll<HTMLButtonElement>('[data-platform]').forEach((button) => button.addEventListener('click', () => selectPlatform(button.dataset.platform ?? '')))
 }
@@ -110,7 +114,7 @@ function platformButton(platform: Platform) {
 }
 
 function renderPlatformSelect() {
-  platformSelect.innerHTML = PLATFORMS.map((platform) => `<option value="${platform.id}">Gen ${platform.generation} · ${escapeHtml(platform.name)}${platform.tier === 'planned' ? ' — roadmap' : ''}</option>`).join('')
+  platformSelect.innerHTML = PLATFORMS.map((platform) => `<option value="${platform.id}">Gen ${platform.generation} · ${escapeHtml(platform.name)}${platform.tier === 'playable' ? '' : ' — ' + platform.tier}</option>`).join('')
   platformSelect.addEventListener('change', () => selectPlatform(platformSelect.value))
 }
 function selectPlatform(id: string) {
@@ -145,8 +149,7 @@ function chooseGame(file: File) {
   stopSession(false)
   state.game = file
   const candidates = candidatesForFile(file.name)
-  const runnable = candidates.find((platform) => runtimeAvailable(platform) && platform.tier === 'ready')
-    ?? candidates.find((platform) => runtimeAvailable(platform))
+  const runnable = candidates.find((platform) => runtimeAvailable(platform))
   if (runnable) state.platform = runnable
   state.bios = null
   biosInput.value = ''
@@ -167,7 +170,7 @@ function refreshUi() {
   el<HTMLElement>('#bios-label').textContent = state.bios ? state.bios.name : 'Choose local BIOS file'
 
   const chipRoot = el<HTMLElement>('#system-chips')
-  chipRoot.innerHTML = `<span class="chip ${state.platform.tier}">${state.platform.tier === 'planned' ? 'roadmap' : state.platform.tier}</span>${state.platform.extensions.slice(0, 5).map((ext) => `<span class="chip">.${ext}</span>`).join('')}`
+  chipRoot.innerHTML = `<span class="chip ${state.platform.tier}">${state.platform.tier}</span>${state.platform.extensions.slice(0, 5).map((ext) => `<span class="chip">.${ext}</span>`).join('')}`
 
   const biosField = el<HTMLElement>('#bios-field')
   biosField.classList.toggle('hidden', !state.platform.bios)
@@ -179,8 +182,8 @@ function refreshUi() {
 }
 function platformNotice(platform: Platform) {
   const parts: string[] = []
-  if (platform.tier === 'planned') parts.push('No production browser core is connected for this console yet. It is represented in the unified runtime contract and roadmap, but launch is disabled.')
-  if (platform.tier === 'experimental') parts.push('This core is available in-browser but is marked experimental; compatibility and performance can vary by game and browser.')
+  if (platform.tier === 'planned') parts.push('This machine is assigned a permanent OmniCore platform id, but its hardware graph is not implemented yet. Launch remains disabled until it runs inside the same OmniCore binary.')
+  if (platform.tier === 'foundation') parts.push('The shared OmniCore CPU/kernel substrate for this machine family exists, but the complete console hardware graph is not playable yet.')
   if (platform.bios === 'required') parts.push('This console requires a local BIOS/firmware file supplied by the user.')
   if (platform.note) parts.push(platform.note)
   return parts.length ? `<div class="notice ${platform.tier === 'planned' ? 'warning' : ''}">${parts.map(escapeHtml).join(' ')}</div>` : ''
@@ -200,19 +203,20 @@ function refreshCapabilities() {
   const webgl2 = !!document.createElement('canvas').getContext('webgl2')
   const gamepads = navigator.getGamepads?.().filter(Boolean).length ?? 0
   const checks: Array<[string, boolean, string]> = [
-    ['WebAssembly', typeof WebAssembly !== 'undefined', 'required'],
+    ['OmniCore WASM', typeof WebAssembly !== 'undefined', 'single binary'],
     ['WebGL 2', webgl2, webgl2 ? 'hardware rendering' : 'legacy fallback'],
     ['WASM threads', crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined', crossOriginIsolated ? 'available' : 'single-thread fallback'],
-    ['WebGPU API', 'gpu' in navigator, 'future high-end adapters'],
+    ['WebGPU API', 'gpu' in navigator, 'future unified GPU path'],
     ['Gamepads', gamepads > 0, gamepads ? `${gamepads} connected` : 'none connected'],
   ]
   root.innerHTML = checks.map(([label, ok, detail]) => `<span>${label}</span><strong class="${ok ? 'good' : 'warn'}">${escapeHtml(detail)}</strong>`).join('')
 }
 
 function refreshPlayerBar() {
-  el<HTMLElement>('#player-title').textContent = state.game ? state.game.name.replace(/\.[^.]+$/, '') : 'No game loaded'
+  el<HTMLElement>('#player-title').textContent = state.game ? state.game.name.replace(/\.[^.]+$/, '') : state.platform.romless ? state.platform.name : 'No game loaded'
   el<HTMLElement>('#player-status').textContent = state.message
-  const canLaunch = !!state.game && runtimeAvailable(state.platform) && (state.platform.bios !== 'required' || !!state.bios)
+  const hasGame = !!state.game || state.platform.romless === true
+  const canLaunch = hasGame && runtimeAvailable(state.platform) && (state.platform.bios !== 'required' || !!state.bios)
   el<HTMLButtonElement>('#launch-button').disabled = !canLaunch || state.messageKind === 'loading'
   el<HTMLButtonElement>('#stop-button').disabled = !state.session
 }
@@ -229,8 +233,8 @@ el<HTMLButtonElement>('#fullscreen-button').addEventListener('click', async () =
     refreshPlayerBar()
   }
 })
-function launchSelectedGame() {
-  if (!state.game || !runtimeAvailable(state.platform)) return
+async function launchSelectedGame() {
+  if ((!state.game && !state.platform.romless) || !runtimeAvailable(state.platform)) return
   if (state.platform.bios === 'required' && !state.bios) {
     state.messageKind = 'error'
     state.message = `${state.platform.name} requires a local BIOS/firmware file before launch.`
@@ -240,11 +244,13 @@ function launchSelectedGame() {
 
   stopSession(false)
   state.messageKind = 'loading'
-  state.message = `Loading ${state.platform.name} core…`
+  state.message = `Starting ${state.platform.name} in OmniCore…`
   idle.classList.add('hidden')
   host.classList.remove('hidden')
   try {
-    state.session = launchRuntime(host, { platform: state.platform, game: state.game, bios: state.bios, inputProfile: state.input })
+    state.session = await launchOmniCore(host, { platform: state.platform, game: state.game, bios: state.bios, inputProfile: state.input })
+    state.messageKind = 'running'
+    state.message = `${state.platform.name} running inside the single OmniCore WebAssembly engine.`
   } catch (error) {
     host.classList.add('hidden')
     idle.classList.remove('hidden')
@@ -264,24 +270,6 @@ function stopSession(showMessage: boolean) {
     state.messageKind = 'idle'
     state.message = state.game ? `${state.game.name} is ready to launch again.` : 'Waiting for a local game file.'
   }
-  refreshPlayerBar()
-}
-function handleEmulatorMessage(event: MessageEvent) {
-  if (!state.session || event.source !== state.session.iframe.contentWindow || !event.data || typeof event.data !== 'object') return
-  const message = event.data as { type?: string; message?: string }
-  if (message.type === 'omniemu:ready') {
-    state.messageKind = 'ready'
-    state.message = `${state.platform.name} core ready.`
-  } else if (message.type === 'omniemu:started') {
-    state.messageKind = 'running'
-    state.message = `${state.platform.name} running · ${crossOriginIsolated ? 'thread acceleration available' : 'single-thread mode'}.`
-  } else if (message.type === 'omniemu:error') {
-    state.messageKind = 'error'
-    state.message = message.message || 'The emulator reported an error.'
-  } else if (message.type === 'omniemu:exit') {
-    state.messageKind = 'idle'
-    state.message = 'Emulation exited.'
-  } else return
   refreshPlayerBar()
 }
 const GAMEPAD_OPTIONS = [
@@ -355,7 +343,7 @@ function controllerModalMarkup(player: number, profile: InputProfile) {
     return `<div class="mapping-row"><strong>${escapeHtml(binding.label)}</strong><input data-key-index="${binding.index}" value="${escapeAttr(binding.keyboard || '—')}" readonly title="Press a key; Backspace clears"><select data-pad-index="${binding.index}">${options}</select></div>`
   }).join('')
   return `<div class="modal-backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="mapping-title">
-    <header><div><h2 id="mapping-title">Global controller mapping</h2><p>One mapping profile is used across every compatible console core.</p></div><button class="button close" type="button" data-close>Close</button></header>
+    <header><div><h2 id="mapping-title">Global controller mapping</h2><p>One logical controller profile is translated by OmniCore across every console machine.</p></div><button class="button close" type="button" data-close>Close</button></header>
     <div class="mapping-table">
       <div class="field"><label for="mapping-player">Player</label><select id="mapping-player">${[0,1,2,3].map((index) => `<option value="${index}"${index === player ? ' selected' : ''}>Player ${index + 1}</option>`).join('')}</select></div>
       <div class="mapping-head"><span>Logical control</span><span>Keyboard</span><span>Gamepad</span></div>${rows}
