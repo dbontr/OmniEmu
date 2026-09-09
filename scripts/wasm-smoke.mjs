@@ -68,6 +68,7 @@ assert(!targetIds.includes(72) && !targetIds.includes(73), 'excluded generation-
 
 const nes = new Uint8Array(16 + 16 * 1024 + 8 * 1024)
 nes.set([0x4e, 0x45, 0x53, 0x1a, 1, 1], 0)
+nes[6] = 0x02 // battery-backed PRG RAM
 const program = [
   0x78, 0xd8, 0xa2, 0xff, 0x9a,
   0xa9, 0x80, 0x8d, 0x00, 0x20,
@@ -90,6 +91,17 @@ new Uint8Array(core.memory.buffer, nesPtr, nes.byteLength).set(nes)
 ok(core.omni_resource_write(0, 0, 0n, nesPtr, nes.byteLength), 'stage NES resource')
 core.omni_free(nesPtr, nes.byteLength)
 ok(core.omni_load_staged(20), 'load staged NES NROM')
+const persistentLen = core.omni_persistent_len(5, 0)
+assert(persistentLen === 8192, `unexpected NES persistent length ${persistentLen}`)
+const persistentPtr = core.omni_alloc(persistentLen)
+assert(persistentPtr > 0, 'persistent allocation failed')
+const persistentInput = new Uint8Array(core.memory.buffer, persistentPtr, persistentLen)
+persistentInput.fill(0x5a)
+ok(core.omni_write_persistent(5, 0, persistentPtr, persistentLen), 'write NES persistent RAM')
+persistentInput.fill(0)
+ok(core.omni_read_persistent(5, 0, persistentPtr, persistentLen), 'read NES persistent RAM')
+assert(persistentInput.every((value) => value === 0x5a), 'NES persistent RAM did not round trip')
+core.omni_free(persistentPtr, persistentLen)
 for (let frame = 0; frame < 2; frame++) ok(core.omni_run_frame(), `run NES frame ${frame}`)
 const nesWidth = core.omni_video_width()
 const nesHeight = core.omni_video_height()

@@ -305,6 +305,85 @@ pub extern "C" fn omni_audio_channels() -> u32 {
 }
 
 #[no_mangle]
+pub extern "C" fn omni_persistent_len(kind: u32, slot: u32) -> usize {
+    let Some(kind) = ResourceKind::from_u32(kind) else {
+        return 0;
+    };
+    core()
+        .lock()
+        .unwrap()
+        .machine
+        .as_ref()
+        .map(|machine| machine.persistent_len(kind, slot))
+        .unwrap_or(0)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn omni_read_persistent(
+    kind: u32,
+    slot: u32,
+    out_ptr: *mut u8,
+    capacity: usize,
+) -> i32 {
+    let mut state = core().lock().unwrap();
+    let Some(kind) = ResourceKind::from_u32(kind) else {
+        return fail(&mut state, "unknown persistent resource kind");
+    };
+    let Some(machine) = state.machine.as_ref() else {
+        return fail(&mut state, "no machine is loaded");
+    };
+    let expected = machine.persistent_len(kind, slot);
+    if expected == 0 {
+        return fail(
+            &mut state,
+            "machine has no persistent resource at that slot",
+        );
+    }
+    if out_ptr.is_null() || capacity != expected {
+        return fail(
+            &mut state,
+            format!("persistent output buffer must be exactly {expected} bytes"),
+        );
+    }
+    let output = slice::from_raw_parts_mut(out_ptr, capacity);
+    match machine.read_persistent(kind, slot, output) {
+        Ok(()) => 0,
+        Err(error) => fail(&mut state, error),
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn omni_write_persistent(
+    kind: u32,
+    slot: u32,
+    ptr: *const u8,
+    len: usize,
+) -> i32 {
+    let mut state = core().lock().unwrap();
+    let Some(kind) = ResourceKind::from_u32(kind) else {
+        return fail(&mut state, "unknown persistent resource kind");
+    };
+    if ptr.is_null() || len == 0 {
+        return fail(&mut state, "persistent input is empty");
+    }
+    let Some(machine) = state.machine.as_mut() else {
+        return fail(&mut state, "no machine is loaded");
+    };
+    let expected = machine.persistent_len(kind, slot);
+    if len != expected || expected == 0 {
+        return fail(
+            &mut state,
+            format!("persistent input must be exactly {expected} bytes"),
+        );
+    }
+    let data = slice::from_raw_parts(ptr, len);
+    match machine.write_persistent(kind, slot, data) {
+        Ok(()) => 0,
+        Err(error) => fail(&mut state, error),
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn omni_last_error_ptr() -> *const u8 {
     core().lock().unwrap().last_error.as_ptr()
 }

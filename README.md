@@ -34,9 +34,9 @@ The unified runtime is already executing real machine graphs and now has substan
 - One global four-player controller ABI with 64 digital bits and 8 signed 16-bit analog axes per player; keyboard and Gamepad mappings feed the same logical controls.
 - Reusable NMOS 6502 execution engine covering the official instruction set.
 - Playable built-in Home Pong/Telstar-class hardware simulation with video, audio, input, reset, and save states.
-- Runnable NES development machine: CPU bus, controllers, OAM DMA, PPU registers/timing, background/sprite rendering, NMI, CHR RAM, PRG RAM, and mapper 0/2/3 switching.
+- Runnable NES development machine with CPU/PPU bus, controllers, OAM DMA, NMI/IRQ, background/sprite rendering, four mirroring modes, pulse/triangle/noise/DMC audio, deterministic save states, battery-backed persistence, and mapper 0/1/2/3/4/7/11/66 switching.
 
-The browser now stages local files into OmniCore in bounded chunks rather than first duplicating the entire file into one temporary WASM allocation. The same resource ABI supports multiple firmware, key, disc, and storage slots for later machines. The current launch path still stages the complete selected file; true host-backed demand paging for very large disc/package media is a later implementation step.
+The browser stages local files into OmniCore in bounded chunks rather than first duplicating them into one temporary WASM allocation. The same resource ABI supports multiple firmware, key, disc, and storage slots for later machines. Machine-owned persistent resources have a generic ABI; NES battery RAM is automatically restored and checkpointed in IndexedDB using a content-derived game fingerprint. The current launch path still stages the complete selected file; true host-backed demand paging for very large disc/package media is a later implementation step.
 
 ## What "one core" means
 
@@ -53,7 +53,7 @@ Compatibility state and developer launchability are intentionally separate:
 - `playable` — a machine is exposed as a normal supported system.
 - `foundation` — substantial real OmniCore hardware exists but compatibility is incomplete.
 - `planned` — the platform has a target blueprint, but the machine graph is not complete.
-NES is currently `foundation`: NROM, UxROM, and CNROM paths execute inside OmniCore, while APU accuracy, more mappers, PPU edge cases, save states, and a representative compatibility corpus remain before it can move to `playable`.
+NES is currently `foundation`: NROM, MMC1, UxROM, CNROM, MMC3, AxROM, Color Dreams, and GxROM execute inside OmniCore; APU channels including DMC, deterministic save states, NES 2.0 sizing, and battery persistence are live. It still needs substantially more mapper coverage, cycle-accurate PPU/MMC3 edge behavior, unofficial CPU-opcode compatibility, and a representative legal compatibility corpus before it can move to `playable`.
 
 The project target is broad compatibility for the 29 active systems, not a claim that all of those commercial libraries work today.
 

@@ -44,7 +44,7 @@ omni_last_error_*
 
 Platform ids are permanent once published. That lets save states, compatibility data, regression fixtures and browser storage refer to a machine without relying on source filenames.
 
-The generic resource ABI already supports multiple games/discs, BIOS, firmware, keys, NAND, storage and memory-card slots. Resources are declared with 64-bit lengths and staged in bounded chunks. Machine implementations can use random-access block views instead of materializing multi-gigabyte media.
+The generic resource ABI supports multiple games/discs, BIOS, firmware, keys, NAND, storage and memory-card slots. Resources use 64-bit declared sizes and bounded chunk staging. A machine-owned persistent-resource ABI lets running machines expose writable storage independently of save states; NES battery RAM is the first end-to-end consumer and is checkpointed to IndexedDB. Random-access/sparse block views remain the path for future multi-gigabyte host-backed media.
 
 ## Deterministic time
 
@@ -80,7 +80,7 @@ Accuracy-sensitive devices remain machine-specific where sharing would be incorr
 
 Home Pong/Telstar-class hardware is fully constructed inside OmniCore and exercises the common frame, input, audio, video, reset and state paths without a ROM.
 
-The NES development graph is the first ROM-driven proof: it combines the shared 6502 engine with an NES CPU bus, controller ports, OAM DMA, PPU register state/timing, NMI, background and sprite rendering, CHR/PRG memory and mapper 0/2/3 switching. It is intentionally still marked `foundation` while APU, additional mappers, PPU edge behavior and compatibility validation are unfinished.
+The NES development graph is the first ROM-driven proof. It combines the shared 6502 engine with CPU/PPU buses, controller ports, OAM and DMC DMA paths, NMI/IRQ delivery, background/sprite rendering, pulse/triangle/noise/DMC audio, NES 2.0 sizing, deterministic save states, battery persistence, and mapper 0/1/2/3/4/7/11/66 support. It remains `foundation` because precise PPU fetch/sprite timing, MMC3 A12-edge behavior, unofficial CPU opcodes, additional boards, and large compatibility-corpus validation are unfinished.
 
 ## Browser acceleration path
 

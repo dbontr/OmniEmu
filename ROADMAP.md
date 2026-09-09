@@ -21,17 +21,17 @@ Established:
 - Direct release-WASM smoke tests in the normal build.
 - First playable ROM-less machine: Home Pong/Telstar class.
 - Reusable official-opcode NMOS 6502 execution substrate.
-- First ROM machine graph: NES with CPU bus, controllers, DMA, PPU/NMI/rendering and mapper 0/2/3 support.
+- First ROM machine graph: NES with CPU/PPU buses, controllers, OAM/DMC DMA, NMI/IRQ/rendering, APU audio, deterministic save states, battery persistence, NES 2.0 sizing, and mapper 0/1/2/3/4/7/11/66 support.
 
 ## Stage 1 — finish the first cartridge families
 
 The NES development graph is launchable but remains `foundation`. Finish it before claiming broad compatibility:
 
-1. NES APU pulse/triangle/noise/DMC channels and frame counter.
-2. Cycle-sensitive PPU behavior, sprite evaluation, scrolling edge cases and timing validation.
-3. Mapper framework expansion: MMC1, MMC3/MMC6, AxROM, MMC5 and other high-coverage boards, then less common mappers.
-4. NES deterministic save states and persistent cartridge RAM.
-5. Automated legal/homebrew compatibility corpus and browser performance gates.
+1. Refine APU/DMC timing: frame-counter write delay, DMA alignment, analog filtering, and IRQ edge cases.
+2. Rework PPU execution toward fetch/cycle accuracy: sprite evaluation, scroll transfers, odd-frame timing, and mapper-visible address activity.
+3. Replace coarse MMC3 scanline IRQ timing with PPU A12-edge observation and expand board coverage beyond mapper 0/1/2/3/4/7/11/66.
+4. Add stable unofficial NMOS 6502 opcodes used by commercial software and strengthen NES 2.0/submapper behavior.
+5. Build an automated legal/homebrew compatibility corpus with visual/audio/state determinism and browser performance gates.
 
 In parallel, reuse the same 6502-family substrate for Atari 2600, Atari 5200 and Atari 7800 rather than creating new emulator runtimes.
 

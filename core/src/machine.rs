@@ -2,7 +2,7 @@ use crate::blueprint::is_targeted;
 use crate::kernel::{AudioBuffer, InputState, VideoBuffer};
 use crate::machines::{NesMachine, PongMachine};
 use crate::platform::{PlatformId, SupportLevel};
-use crate::resources::ResourceStore;
+use crate::resources::{ResourceKind, ResourceStore};
 
 pub trait Machine: Send {
     fn platform(&self) -> PlatformId;
@@ -13,6 +13,25 @@ pub trait Machine: Send {
     fn audio(&self) -> &AudioBuffer;
     fn save_state(&self) -> Result<Vec<u8>, String>;
     fn load_state(&mut self, bytes: &[u8]) -> Result<(), String>;
+    fn persistent_len(&self, _kind: ResourceKind, _slot: u32) -> usize {
+        0
+    }
+    fn read_persistent(
+        &self,
+        _kind: ResourceKind,
+        _slot: u32,
+        _out: &mut [u8],
+    ) -> Result<(), String> {
+        Err("machine has no persistent resource at that slot".into())
+    }
+    fn write_persistent(
+        &mut self,
+        _kind: ResourceKind,
+        _slot: u32,
+        _data: &[u8],
+    ) -> Result<(), String> {
+        Err("machine has no persistent resource at that slot".into())
+    }
 }
 
 pub fn create_machine(

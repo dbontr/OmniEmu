@@ -1,5 +1,6 @@
 import type { Platform } from '../catalog'
 import type { InputProfile } from '../input/mapping'
+import { fingerprintFile, loadPersistentResource, savePersistentResource } from './persistence'
 
 interface OmniExports extends WebAssembly.Exports {
   memory: WebAssembly.Memory
@@ -31,6 +32,9 @@ interface OmniExports extends WebAssembly.Exports {
   omni_last_error_len(): number
   omni_save_state(ptr: number, capacity: number): number
   omni_load_state(ptr: number, len: number): number
+  omni_persistent_len(kind: number, slot: number): number
+  omni_read_persistent(kind: number, slot: number, ptr: number, capacity: number): number
+  omni_write_persistent(kind: number, slot: number, ptr: number, len: number): number
 }
 export interface OmniLaunchRequest {
   platform: Platform
@@ -304,6 +308,43 @@ async function stageFile(
 function requireOk(exports: OmniExports, result: number) {
   if (result !== 0) throw new Error(lastError(exports))
 }
+const STORAGE_RESOURCE = 5
+const PERSISTENCE_SLOT = 0
+
+function readPersistent(exports: OmniExports, kind: number, slot: number): Uint8Array | null {
+  const length = exports.omni_persistent_len(kind, slot)
+  if (!length) return null
+  const ptr = exports.omni_alloc(length)
+  if (!ptr) throw new Error(`OmniCore could not allocate ${length} persistent bytes.`)
+  try {
+    requireOk(exports, exports.omni_read_persistent(kind, slot, ptr, length))
+    return new Uint8Array(exports.memory.buffer, ptr, length).slice()
+  } finally {
+    exports.omni_free(ptr, length)
+  }
+}
+
+function writePersistent(exports: OmniExports, kind: number, slot: number, bytes: Uint8Array) {
+  const expected = exports.omni_persistent_len(kind, slot)
+  if (!expected || bytes.byteLength !== expected) return false
+  const ptr = exports.omni_alloc(bytes.byteLength)
+  if (!ptr) throw new Error(`OmniCore could not allocate ${bytes.byteLength} persistent bytes.`)
+  try {
+    new Uint8Array(exports.memory.buffer, ptr, bytes.byteLength).set(bytes)
+    requireOk(exports, exports.omni_write_persistent(kind, slot, ptr, bytes.byteLength))
+    return true
+  } finally {
+    exports.omni_free(ptr, bytes.byteLength)
+  }
+}
+function sameBytes(left: Uint8Array | null, right: Uint8Array) {
+  if (!left || left.byteLength !== right.byteLength) return false
+  for (let index = 0; index < right.byteLength; index++) {
+    if (left[index] !== right[index]) return false
+  }
+  return true
+}
+
 export const runtimeAvailable = (platform: Platform) => platform.launchable === true
 
 export async function launchOmniCore(host: HTMLElement, request: OmniLaunchRequest): Promise<OmniSession> {
@@ -321,6 +362,32 @@ export async function launchOmniCore(host: HTMLElement, request: OmniLaunchReque
     throw error
   }
 
+  let persistenceKey: string | null = null
+  let lastPersistent: Uint8Array | null = null
+  if (exports.omni_persistent_len(STORAGE_RESOURCE, PERSISTENCE_SLOT) && request.game) {
+    try {
+      const fingerprint = await fingerprintFile(request.game)
+      persistenceKey = `v1:${request.platform.omniCode}:${STORAGE_RESOURCE}:${PERSISTENCE_SLOT}:${fingerprint}`
+      const stored = await loadPersistentResource(persistenceKey)
+      if (stored) writePersistent(exports, STORAGE_RESOURCE, PERSISTENCE_SLOT, stored)
+      lastPersistent = readPersistent(exports, STORAGE_RESOURCE, PERSISTENCE_SLOT)
+    } catch {
+      persistenceKey = null
+      lastPersistent = null
+    }
+  }
+
+  let persistenceWrite: Promise<void> | null = null
+  const flushPersistence = () => {
+    if (!persistenceKey || persistenceWrite) return
+    const bytes = readPersistent(exports, STORAGE_RESOURCE, PERSISTENCE_SLOT)
+    if (!bytes || sameBytes(lastPersistent, bytes)) return
+    lastPersistent = bytes
+    persistenceWrite = savePersistentResource(persistenceKey, bytes)
+      .catch(() => undefined)
+      .finally(() => { persistenceWrite = null })
+  }
+
   const video = new VideoRenderer()
   const audio = new AudioScheduler()
   const input = new InputScanner(request.inputProfile)
@@ -330,6 +397,9 @@ export async function launchOmniCore(host: HTMLElement, request: OmniLaunchReque
   let alive = true
   let disposed = false
   let frameHandle = 0
+  let persistenceFrames = 0
+  const visibilityHandler = () => { if (document.visibilityState === 'hidden') flushPersistence() }
+  document.addEventListener('visibilitychange', visibilityHandler)
   const frameMs = 1000 / Math.max(1, exports.omni_frame_rate())
   let nextFrame = performance.now()
   const drawFrame = () => {
@@ -341,6 +411,8 @@ export async function launchOmniCore(host: HTMLElement, request: OmniLaunchReque
       }
     }
     requireOk(exports, exports.omni_run_frame())
+    persistenceFrames++
+    if (persistenceFrames >= 300) { persistenceFrames = 0; flushPersistence() }
     const width = exports.omni_video_width()
     const height = exports.omni_video_height()
     const videoPtr = exports.omni_video_ptr()
@@ -395,6 +467,8 @@ export async function launchOmniCore(host: HTMLElement, request: OmniLaunchReque
     dispose() {
       if (disposed) return
       disposed = true; alive = false; cancelAnimationFrame(frameHandle)
+      document.removeEventListener('visibilitychange', visibilityHandler)
+      flushPersistence()
       input.dispose(); audio.dispose(); exports.omni_unload(); video.canvas.remove()
     },
   }

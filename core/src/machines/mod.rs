@@ -1,4 +1,5 @@
 mod nes;
+mod nes_apu;
 mod pong;
 
 pub use nes::NesMachine;
