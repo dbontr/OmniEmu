@@ -25,6 +25,7 @@ Established:
 - Atari 7800 development graph: shared NMOS 6502/SALLY execution, documented RAM/register mirrors, PIA/TIA foundation, MARIA DLL/display-list rendering and DLI/WSYNC, A78 parsing, linear/SuperGame cartridges, optional POKEY, and save states.
 - Reusable NMOS 6502 execution substrate with the official set, common stable undocumented families, and selectable decimal arithmetic for NMOS versus NES-class behavior.
 - Reusable Z80 execution substrate with indexed/extended families, interrupts, block I/O, and deterministic state support.
+- Reusable W65C816 execution substrate with all 256 opcode paths, native/emulation modes, 8/16-bit widths, 24-bit addressing, decimal arithmetic, interrupts, and block moves.
 - First ROM machine graph: NES with CPU/PPU buses, controllers, OAM/DMC DMA, NMI/IRQ/rendering, APU audio, deterministic save states, battery persistence, NES 2.0 sizing, and mapper 0/1/2/3/4/7/11/66 support.
 - Second ROM machine graph: Master System with Z80, Sega banked ROM/SRAM, Mode 4 VDP rendering, corrected 3:2 CPU/dot timing, frame/line interrupts, V/H counters, scroll locks, two-player controls, SN76489 audio, save states, and persistent SRAM.
 - Third ROM machine graph: ColecoVision reusing the Z80/SN76489 with TMS9918 Graphics I/II rendering, sprites, VDP NMI, BIOS/cartridge mapping, controllers and save states.
@@ -43,7 +44,7 @@ Atari 2600, Atari 5200 and Atari 7800 now have launchable development graphs. Co
 
 ## Stage 2 — generations 2 through 4
 
-The reusable Z80 and first Sega VDP/PSG machine graph are now established. Continue with 65C816 and 68000-family CPU engines plus broader VDP, PSG/FM, cartridge and optical-media primitives, then complete:
+The reusable Z80 and W65C816 engines plus the first Sega VDP/PSG machine graph are now established. Next build the SNES machine devices/SPC700 path and the reusable 68000-family engine, then broaden VDP, PSG/FM, cartridge and optical-media primitives before completing:
 
 - Finish ColecoVision keypad/peripheral/timing compatibility, then Intellivision.
 - Master System.

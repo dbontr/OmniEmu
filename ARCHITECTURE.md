@@ -69,7 +69,7 @@ Reusable hardware is shared only when the real consoles share it:
 
 - NMOS 6502/6507 family: Atari and NES-family work.
 - Z80 family: Master System, ColecoVision and related machines.
-- 65816: SNES-family work.
+- 65C816: a reusable 24-bit W65C816 engine is now implemented with all opcode decode paths; SNES timing and machine devices are the next layer.
 - 68000 family: Genesis, Neo Geo and related components.
 - MIPS family: PlayStation-class machines.
 - PowerPC, ARM, x86, SH, DSP, vector and GPU engines are added under the same kernel as later generations are reached.
