@@ -7,6 +7,7 @@ pub mod cluster;
 pub mod cpu6502;
 pub mod cpu65816;
 pub mod cpu68000;
+pub mod cpu_spc700;
 pub mod cpu_z80;
 pub mod dma;
 pub mod execution;

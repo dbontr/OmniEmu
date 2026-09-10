@@ -26,6 +26,7 @@ Established:
 - Reusable NMOS 6502 execution substrate with the official set, common stable undocumented families, and selectable decimal arithmetic for NMOS versus NES-class behavior.
 - Reusable Z80 execution substrate with indexed/extended families, interrupts, block I/O, and deterministic state support.
 - Reusable W65C816 execution substrate with all 256 opcode paths, native/emulation modes, 8/16-bit widths, 24-bit addressing, decimal arithmetic, interrupts, and block moves.
+- Reusable SPC700 execution substrate with all 256 opcode decode paths, direct-page/bit operations, 16-bit YA arithmetic, multiply/divide, branches/calls, and save-state serialization.
 - Reusable Motorola 68000 execution substrate with big-endian 24-bit addressing, effective-address decoding, exceptions/interrupts, arithmetic/control/shift families, and deterministic state support.
 - First ROM machine graph: NES with CPU/PPU buses, controllers, OAM/DMC DMA, NMI/IRQ/rendering, APU audio, deterministic save states, battery persistence, NES 2.0 sizing, and mapper 0/1/2/3/4/7/11/66 support.
 - Second ROM machine graph: Master System with Z80, Sega banked ROM/SRAM, Mode 4 VDP rendering, corrected 3:2 CPU/dot timing, frame/line interrupts, V/H counters, scroll locks, two-player controls, SN76489 audio, save states, and persistent SRAM.
@@ -47,7 +48,7 @@ Atari 2600, Atari 5200 and Atari 7800 now have launchable development graphs. Co
 
 ## Stage 2 — generations 2 through 4
 
-The reusable Z80, W65C816 and Motorola 68000 engines plus launchable Sega and SNES machine graphs are now established. General SNES DMA and direct/indirect HDMA table execution are now implemented. Next implement SPC700/S-DSP, cycle-faithful HDMA scheduling and deeper PPU timing/modes, deepen Genesis VDP/YM2612 timing, and broaden cartridge/optical-media primitives before completing:
+The reusable Z80, W65C816 and Motorola 68000 engines plus launchable Sega and SNES machine graphs are now established. General SNES DMA and direct/indirect HDMA table execution are now implemented. The SPC700 CPU engine is established; next integrate S-SMP RAM/ports/timers and S-DSP, then cycle-faithful HDMA scheduling and deeper PPU timing/modes, deepen Genesis VDP/YM2612 timing, and broaden cartridge/optical-media primitives before completing:
 
 - Finish ColecoVision keypad/peripheral/timing compatibility, then Intellivision.
 - Master System.
