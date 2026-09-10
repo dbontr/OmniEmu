@@ -83,6 +83,7 @@ impl PlatformId {
                 | Self::Nes
                 | Self::MasterSystem
                 | Self::Genesis
+                | Self::Snes
         )
     }
 
@@ -95,7 +96,8 @@ impl PlatformId {
             | Self::Atari7800
             | Self::Nes
             | Self::MasterSystem
-            | Self::Genesis => SupportLevel::Foundation,
+            | Self::Genesis
+            | Self::Snes => SupportLevel::Foundation,
             _ => SupportLevel::Planned,
         }
     }

@@ -31,6 +31,7 @@ Established:
 - Second ROM machine graph: Master System with Z80, Sega banked ROM/SRAM, Mode 4 VDP rendering, corrected 3:2 CPU/dot timing, frame/line interrupts, V/H counters, scroll locks, two-player controls, SN76489 audio, save states, and persistent SRAM.
 - Third ROM machine graph: ColecoVision reusing the Z80/SN76489 with TMS9918 Graphics I/II rendering, sprites, VDP NMI, BIOS/cartridge mapping, controllers and save states.
 - Fourth ROM machine graph: Genesis / Mega Drive combining 68000 + Z80, VDP, YM2612, SN76489, controllers, SMD decoding, SRAM persistence, interrupts, and deterministic state.
+- Fifth ROM machine graph: SNES / Super Famicom using W65C816 with LoROM/HiROM, WRAM/I/O/controllers, PPU VRAM/CGRAM/OAM and Mode 0/1 BG1 rendering, vblank/NMI, SRAM persistence, and deterministic state.
 
 ## Stage 1 — finish the first cartridge families
 
@@ -46,7 +47,7 @@ Atari 2600, Atari 5200 and Atari 7800 now have launchable development graphs. Co
 
 ## Stage 2 — generations 2 through 4
 
-The reusable Z80, W65C816 and Motorola 68000 engines plus launchable Sega 8-bit and 16-bit machine graphs are now established. Next build the SNES machine devices/SPC700 path, deepen Genesis VDP/YM2612 timing, and broaden cartridge/optical-media primitives before completing:
+The reusable Z80, W65C816 and Motorola 68000 engines plus launchable Sega and SNES machine graphs are now established. Next implement the SPC700/S-DSP and full SNES DMA/HDMA/PPU path, deepen Genesis VDP/YM2612 timing, and broaden cartridge/optical-media primitives before completing:
 
 - Finish ColecoVision keypad/peripheral/timing compatibility, then Intellivision.
 - Master System.

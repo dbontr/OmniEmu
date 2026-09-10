@@ -56,7 +56,7 @@ core.omni_unload()
 
 assert(core.omni_can_launch(2) === 1, 'Pong should be launchable')
 assert(core.omni_can_launch(20) === 1, 'NES foundation should be launchable for development')
-assert(core.omni_can_launch(30) === 0, 'unimplemented SNES should not be launchable')
+assert(core.omni_can_launch(30) === 1, 'SNES foundation should be launchable for development')
 assert(core.omni_is_targeted(30) === 1, 'SNES should remain an OmniCore target')
 assert(core.omni_is_targeted(71) === 1, 'Switch should remain an OmniCore target')
 assert(core.omni_is_targeted(72) === 0, 'PS4 should be outside the current target set')
@@ -358,6 +358,24 @@ assert(genesisWidth === 320 && genesisHeight === 224, `unexpected Genesis surfac
 const genesisAudio = new Float32Array(core.memory.buffer, core.omni_audio_ptr(), core.omni_audio_len())
 assert(genesisAudio.some((value) => Math.abs(value) > 0.001), 'Genesis PSG audio is silent')
 assert(core.omni_save_state(0, 0) > 0, 'Genesis save state is empty')
+core.omni_unload()
+
+const snes = new Uint8Array(0x8000)
+snes.fill(0xea)
+const snesProgram = [0x78,0xa9,0x0f,0x8d,0x00,0x21,0xa9,0x00,0x8d,0x21,0x21,0xa9,0x1f,0x8d,0x22,0x21,0xa9,0x00,0x8d,0x22,0x21,0x80,0xfe]
+snes.set(snesProgram)
+snes[0x7fd5] = 0x20
+snes[0x7fd8] = 0x01
+snes.set([0xff,0xff,0x00,0x00], 0x7fdc)
+snes.set([0x00,0x80,0x00,0x80], 0x7ffc)
+core.omni_resources_clear()
+stageBytes(0, snes, 'SNES cartridge')
+ok(core.omni_load_staged(30), 'load staged SNES cartridge')
+for (let frame = 0; frame < 2; frame++) ok(core.omni_run_frame(), 'run SNES frame ' + frame)
+assert(core.omni_video_width() === 256 && core.omni_video_height() === 224, 'unexpected SNES surface')
+const snesVideo = new Uint8Array(core.memory.buffer, core.omni_video_ptr(), core.omni_video_len())
+assert(snesVideo[0] > 180, 'SNES PPU backdrop did not render')
+assert(core.omni_save_state(0, 0) > 0, 'SNES save state is empty')
 core.omni_unload()
 
 console.log(`OmniCore WASM smoke passed: ${bytes.byteLength} bytes, ${width}x${height}, ${audioLen} audio samples.`)

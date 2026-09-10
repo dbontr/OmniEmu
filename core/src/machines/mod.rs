@@ -10,6 +10,8 @@ mod nes_apu;
 mod pokey;
 mod pong;
 mod sn76489;
+mod snes;
+mod snes_ppu;
 mod tms9918;
 mod ym2612;
 
@@ -21,3 +23,4 @@ pub use genesis::GenesisMachine;
 pub use master_system::MasterSystemMachine;
 pub use nes::NesMachine;
 pub use pong::PongMachine;
+pub use snes::SnesMachine;

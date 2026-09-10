@@ -94,6 +94,8 @@ ColecoVision is the third ROM-driven machine and demonstrates reuse across vendo
 
 Genesis / Mega Drive is the first 16-bit machine graph. It combines the reusable Motorola 68000 and Z80 engines with the console bus map, bus-request/reset behavior, controller ports, VDP VRAM/CRAM/VSRAM and plane/sprite rendering foundation, YM2612 FM/DAC/timers, SN76489 audio, SMD decoding, cartridge SRAM persistence and deterministic state. VDP DMA/cycle timing, full YM2612 fidelity, mapper breadth and compatibility validation remain foundation work.
 
+SNES / Super Famicom now provides the first W65C816 machine graph. OmniCore maps LoROM/HiROM cartridges and SRAM across the 24-bit bus, models 128 KiB WRAM and CPU/PPU I/O, serial controllers, vblank/NMI, VRAM/CGRAM/OAM register paths and Mode 0/1 BG1 tile rendering. SPC700/S-DSP, DMA/HDMA, the remaining PPU modes/sprites/windows/color math and enhancement chips are intentionally still foundation work.
+
 ## Browser acceleration path
 
 Today, OmniCore emits one RGBA framebuffer and interleaved `f32` audio buffer. The browser bridge uploads video through WebGL 2 and schedules audio through Web Audio. The global logical controller ABI provides a 64-bit digital mask plus eight signed 16-bit analog axes per player, including sticks, analog triggers and auxiliary axes.
