@@ -48,7 +48,7 @@ Atari 2600, Atari 5200 and Atari 7800 now have launchable development graphs. Co
 
 ## Stage 2 — generations 2 through 4
 
-The reusable Z80, W65C816 and Motorola 68000 engines plus launchable Sega and SNES machine graphs are now established. General SNES DMA and direct/indirect HDMA table execution are now implemented. The SPC700 CPU engine is established; next integrate S-SMP RAM/ports/timers and S-DSP, then cycle-faithful HDMA scheduling and deeper PPU timing/modes, deepen Genesis VDP/YM2612 timing, and broaden cartridge/optical-media primitives before completing:
+The reusable Z80, W65C816 and Motorola 68000 engines plus launchable Sega and SNES machine graphs are now established. General SNES DMA and direct/indirect HDMA table execution are now implemented. SPC700 plus S-SMP RAM/ports/timers and firmware-free IPL transfer HLE are established; next implement S-DSP sample synthesis, then cycle-faithful HDMA scheduling and deeper PPU timing/modes, deepen Genesis VDP/YM2612 timing, and broaden cartridge/optical-media primitives before completing:
 
 - Finish ColecoVision keypad/peripheral/timing compatibility, then Intellivision.
 - Master System.

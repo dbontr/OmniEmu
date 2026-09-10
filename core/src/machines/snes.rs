@@ -8,10 +8,11 @@ use crate::platform::PlatformId;
 use crate::resources::ResourceKind;
 use crate::state::{StateReader, StateWriter};
 
+use super::snes_apu::SnesApu;
 use super::snes_ppu::SnesPpu;
 
 const FRAME_RATE: f64 = 60.098_813_897;
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 const WRAM_SIZE: usize = 128 * 1024;
 const SAMPLE_RATE: u32 = 48_000;
 
@@ -149,7 +150,7 @@ struct SnesBus {
     cartridge: SnesCartridge,
     wram: Vec<u8>,
     ppu: SnesPpu,
-    apu_ports: [u8; 4],
+    apu: SnesApu,
     dma: [[u8; 16]; 8],
     hdma_enable: u8,
     hdma_active: u8,
@@ -172,7 +173,7 @@ impl SnesBus {
             cartridge,
             wram: vec![0; WRAM_SIZE],
             ppu: SnesPpu::new(),
-            apu_ports: [0; 4],
+            apu: SnesApu::new(),
             dma: [[0; 16]; 8],
             hdma_enable: 0,
             hdma_active: 0,
@@ -192,7 +193,7 @@ impl SnesBus {
 
     fn reset(&mut self) {
         self.ppu.reset();
-        self.apu_ports = [0; 4];
+        self.apu.reset();
         self.dma = [[0; 16]; 8];
         self.hdma_enable = 0;
         self.hdma_active = 0;
@@ -234,6 +235,7 @@ impl SnesBus {
         value
     }
     fn tick_cpu(&mut self, cycles: u32) {
+        self.apu.tick_main_cycles(cycles);
         self.dot_phase = self.dot_phase.saturating_add(cycles.saturating_mul(3));
         let dots = self.dot_phase / 2;
         self.dot_phase %= 2;
@@ -281,7 +283,7 @@ impl SnesBus {
     fn read_low_io(&mut self, offset: u16) -> Option<u8> {
         Some(match offset {
             0x2100..=0x213f => self.ppu.read(offset),
-            0x2140..=0x2143 => self.apu_ports[usize::from(offset - 0x2140)],
+            0x2140..=0x2143 => self.apu.read_cpu_port(usize::from(offset - 0x2140)),
             0x2180 => {
                 let value = self.wram[self.wram_addr as usize & (WRAM_SIZE - 1)];
                 self.wram_addr = (self.wram_addr + 1) & 0x1ffff;
@@ -317,7 +319,7 @@ impl SnesBus {
     fn write_low_io(&mut self, offset: u16, value: u8) -> bool {
         match offset {
             0x2100..=0x213f => self.ppu.write(offset, value),
-            0x2140..=0x2143 => self.apu_ports[usize::from(offset - 0x2140)] = value,
+            0x2140..=0x2143 => self.apu.write_cpu_port(usize::from(offset - 0x2140), value),
             0x2180 => {
                 let index = self.wram_addr as usize & (WRAM_SIZE - 1);
                 self.wram[index] = value;
@@ -538,7 +540,7 @@ impl SnesBus {
         out.blob(&self.wram);
         out.blob(&self.cartridge.sram);
         self.ppu.save(out);
-        out.blob(&self.apu_ports);
+        self.apu.save(out);
         for channel in self.dma {
             out.blob(&channel);
         }
@@ -575,11 +577,7 @@ impl SnesBus {
         }
         self.cartridge.sram.copy_from_slice(sram);
         self.ppu.load(input)?;
-        let ports = input.blob()?;
-        if ports.len() != self.apu_ports.len() {
-            return Err("invalid SNES APU port state length".into());
-        }
-        self.apu_ports.copy_from_slice(ports);
+        self.apu.load(input)?;
         for channel in &mut self.dma {
             let bytes = input.blob()?;
             if bytes.len() != channel.len() {
