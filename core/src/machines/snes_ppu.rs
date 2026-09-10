@@ -65,6 +65,10 @@ impl SnesPpu {
         self.frame
     }
 
+    pub fn scanline(&self) -> u16 {
+        self.scanline
+    }
+
     pub fn in_vblank(&self) -> bool {
         self.vblank
     }

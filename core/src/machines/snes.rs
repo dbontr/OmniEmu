@@ -151,6 +151,11 @@ struct SnesBus {
     ppu: SnesPpu,
     apu_ports: [u8; 4],
     dma: [[u8; 16]; 8],
+    hdma_enable: u8,
+    hdma_active: u8,
+    hdma_lines: [u8; 8],
+    hdma_repeat: [bool; 8],
+    hdma_transfer: [bool; 8],
     nmitimen: u8,
     rdnmi: bool,
     nmi_pending: bool,
@@ -169,6 +174,11 @@ impl SnesBus {
             ppu: SnesPpu::new(),
             apu_ports: [0; 4],
             dma: [[0; 16]; 8],
+            hdma_enable: 0,
+            hdma_active: 0,
+            hdma_lines: [0; 8],
+            hdma_repeat: [false; 8],
+            hdma_transfer: [false; 8],
             nmitimen: 0,
             rdnmi: false,
             nmi_pending: false,
@@ -184,6 +194,11 @@ impl SnesBus {
         self.ppu.reset();
         self.apu_ports = [0; 4];
         self.dma = [[0; 16]; 8];
+        self.hdma_enable = 0;
+        self.hdma_active = 0;
+        self.hdma_lines = [0; 8];
+        self.hdma_repeat = [false; 8];
+        self.hdma_transfer = [false; 8];
         self.nmitimen = 0;
         self.rdnmi = false;
         self.nmi_pending = false;
@@ -223,7 +238,17 @@ impl SnesBus {
         let dots = self.dot_phase / 2;
         self.dot_phase %= 2;
         if dots != 0 {
+            let before = self.ppu.scanline();
             self.ppu.tick_dots(dots);
+            let after = self.ppu.scanline();
+            if after != before {
+                if after == 0 {
+                    self.init_hdma();
+                }
+                if before < 225 {
+                    self.run_hdma_line();
+                }
+            }
         }
         if self.ppu.take_nmi() {
             self.rdnmi = true;
@@ -304,6 +329,12 @@ impl SnesBus {
             0x4016 => self.set_strobe(value & 1 != 0),
             0x4200 => self.nmitimen = value,
             0x420b => self.run_dma(value),
+            0x420c => {
+                self.hdma_enable = value;
+                if self.ppu.scanline() == 0 {
+                    self.init_hdma();
+                }
+            }
             0x4300..=0x437f => {
                 let channel = usize::from((offset - 0x4300) >> 4);
                 let reg = usize::from(offset & 0x0f);
@@ -381,6 +412,128 @@ impl SnesBus {
         }
     }
 
+    fn init_hdma(&mut self) {
+        self.hdma_active = self.hdma_enable;
+        self.hdma_lines = [0; 8];
+        self.hdma_repeat = [false; 8];
+        self.hdma_transfer = [false; 8];
+        for channel in 0..8 {
+            if self.hdma_active & (1 << channel) == 0 {
+                continue;
+            }
+            self.dma[channel][8] = self.dma[channel][2];
+            self.dma[channel][9] = self.dma[channel][3];
+            self.dma[channel][10] = 0;
+        }
+    }
+
+    fn hdma_table_read(&mut self, channel: usize) -> u8 {
+        let bank = u32::from(self.dma[channel][4]) << 16;
+        let address = u16::from_le_bytes([self.dma[channel][8], self.dma[channel][9]]);
+        let value = self.read8(bank | u32::from(address));
+        let next = address.wrapping_add(1).to_le_bytes();
+        self.dma[channel][8] = next[0];
+        self.dma[channel][9] = next[1];
+        value
+    }
+
+    fn reload_hdma_entry(&mut self, channel: usize) -> bool {
+        let descriptor = self.hdma_table_read(channel);
+        if descriptor == 0 {
+            self.hdma_active &= !(1 << channel);
+            self.dma[channel][10] = 0;
+            return false;
+        }
+        self.hdma_repeat[channel] = descriptor > 0x80;
+        self.hdma_lines[channel] = if descriptor == 0x80 {
+            128
+        } else {
+            descriptor & 0x7f
+        };
+        self.hdma_transfer[channel] = true;
+        self.dma[channel][10] = descriptor;
+        if self.dma[channel][0] & 0x40 != 0 {
+            let lo = self.hdma_table_read(channel);
+            let hi = self.hdma_table_read(channel);
+            self.dma[channel][5] = lo;
+            self.dma[channel][6] = hi;
+        }
+        true
+    }
+
+    fn hdma_source_read(&mut self, channel: usize, indirect: bool) -> u8 {
+        if !indirect {
+            return self.hdma_table_read(channel);
+        }
+        let address = u16::from_le_bytes([self.dma[channel][5], self.dma[channel][6]]);
+        let full = (u32::from(self.dma[channel][7]) << 16) | u32::from(address);
+        let value = self.read8(full);
+        let next = address.wrapping_add(1).to_le_bytes();
+        self.dma[channel][5] = next[0];
+        self.dma[channel][6] = next[1];
+        value
+    }
+
+    fn update_hdma_counter_register(&mut self, channel: usize) {
+        let remaining = self.hdma_lines[channel];
+        self.dma[channel][10] = if remaining == 128 {
+            0x80
+        } else if self.hdma_repeat[channel] {
+            0x80 | remaining
+        } else {
+            remaining
+        };
+    }
+
+    fn run_hdma_line(&mut self) {
+        for channel in 0..8 {
+            if self.hdma_active & (1 << channel) == 0 {
+                continue;
+            }
+            if self.hdma_lines[channel] == 0 && !self.reload_hdma_entry(channel) {
+                continue;
+            }
+            if self.hdma_transfer[channel] {
+                self.transfer_hdma_pattern(channel);
+            }
+            self.hdma_lines[channel] = self.hdma_lines[channel].saturating_sub(1);
+            self.hdma_transfer[channel] = self.hdma_repeat[channel];
+            self.update_hdma_counter_register(channel);
+        }
+    }
+
+    fn transfer_hdma_pattern(&mut self, channel: usize) {
+        let control = self.dma[channel][0];
+        let bbase = 0x2100u16.wrapping_add(u16::from(self.dma[channel][1]));
+        let indirect = control & 0x40 != 0;
+        let reverse = control & 0x80 != 0;
+        let count = Self::dma_pattern_len(control);
+        for index in 0..count {
+            let b = bbase.wrapping_add(u16::from(Self::dma_b_offset(control, index)));
+            if reverse {
+                let value = self.read8(u32::from(b));
+                if indirect {
+                    let address = u16::from_le_bytes([self.dma[channel][5], self.dma[channel][6]]);
+                    let full = (u32::from(self.dma[channel][7]) << 16) | u32::from(address);
+                    self.write8(full, value);
+                    let next = address.wrapping_add(1).to_le_bytes();
+                    self.dma[channel][5] = next[0];
+                    self.dma[channel][6] = next[1];
+                } else {
+                    let bank = u32::from(self.dma[channel][4]) << 16;
+                    let address = u16::from_le_bytes([self.dma[channel][8], self.dma[channel][9]]);
+                    self.write8(bank | u32::from(address), value);
+                    let next = address.wrapping_add(1).to_le_bytes();
+                    self.dma[channel][8] = next[0];
+                    self.dma[channel][9] = next[1];
+                }
+            } else {
+                let value = self.hdma_source_read(channel, indirect);
+                self.write8(u32::from(b), value);
+            }
+        }
+    }
+
     fn save(&self, out: &mut StateWriter) {
         out.blob(&self.wram);
         out.blob(&self.cartridge.sram);
@@ -388,6 +541,15 @@ impl SnesBus {
         out.blob(&self.apu_ports);
         for channel in self.dma {
             out.blob(&channel);
+        }
+        out.u8(self.hdma_enable);
+        out.u8(self.hdma_active);
+        out.blob(&self.hdma_lines);
+        for value in self.hdma_repeat {
+            out.u8(value as u8);
+        }
+        for value in self.hdma_transfer {
+            out.u8(value as u8);
         }
         out.u8(self.nmitimen);
         out.u8(self.rdnmi as u8);
@@ -424,6 +586,19 @@ impl SnesBus {
                 return Err("invalid SNES DMA state length".into());
             }
             channel.copy_from_slice(bytes);
+        }
+        self.hdma_enable = input.u8()?;
+        self.hdma_active = input.u8()?;
+        let lines = input.blob()?;
+        if lines.len() != 8 {
+            return Err("invalid SNES HDMA line state length".into());
+        }
+        self.hdma_lines.copy_from_slice(lines);
+        for value in &mut self.hdma_repeat {
+            *value = input.u8()? != 0;
+        }
+        for value in &mut self.hdma_transfer {
+            *value = input.u8()? != 0;
         }
         self.nmitimen = input.u8()?;
         self.rdnmi = input.u8()? != 0;
@@ -746,6 +921,31 @@ mod tests {
         machine.bus.ppu.force_render();
         assert!(machine.bus.ppu.video().pixels()[0] > 200);
         assert_eq!(&machine.bus.dma[0][5..7], &[0, 0]);
+    }
+
+    #[test]
+    fn hdma_repeat_table_updates_cgram_each_line() {
+        let rom = synthetic_lorom();
+        let mut machine = SnesMachine::from_rom(&rom).unwrap();
+        machine.bus.ppu.write(0x2121, 0);
+        machine.bus.ppu.write(0x2122, 0x1f);
+        machine.bus.ppu.write(0x2122, 0x00);
+        let table = [0x82, 0x0f, 0x80, 0x00];
+        machine.bus.wram[0x1000..0x1000 + table.len()].copy_from_slice(&table);
+        machine.bus.dma[0][0] = 0x00;
+        machine.bus.dma[0][1] = 0x00;
+        machine.bus.dma[0][2] = 0x00;
+        machine.bus.dma[0][3] = 0x10;
+        machine.bus.dma[0][4] = 0x7e;
+        machine.bus.hdma_enable = 1;
+        machine.bus.init_hdma();
+        machine.bus.run_hdma_line();
+        machine.bus.ppu.force_render();
+        assert!(machine.bus.ppu.video().pixels()[0] > 200);
+        machine.bus.run_hdma_line();
+        machine.bus.ppu.force_render();
+        assert_eq!(&machine.bus.ppu.video().pixels()[..3], &[0, 0, 0]);
+        assert_eq!(machine.bus.hdma_lines[0], 0);
     }
 
     #[test]
