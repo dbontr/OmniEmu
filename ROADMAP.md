@@ -28,6 +28,7 @@ Established:
 - Reusable W65C816 execution substrate with all 256 opcode paths, native/emulation modes, 8/16-bit widths, 24-bit addressing, decimal arithmetic, interrupts, and block moves.
 - Reusable SPC700 execution substrate with all 256 opcode decode paths, direct-page/bit operations, 16-bit YA arithmetic, multiply/divide, branches/calls, and save-state serialization.
 - Reusable Motorola 68000 execution substrate with big-endian 24-bit addressing, effective-address decoding, exceptions/interrupts, arithmetic/control/shift families, and deterministic state support.
+- Reusable MIPS R3000A-class execution substrate with branch/load delay slots, COP0 exception/interrupt state, HI/LO arithmetic, unaligned merge loads/stores, and deterministic pipeline serialization for the PlayStation path.
 - First ROM machine graph: NES with CPU/PPU buses, controllers, OAM/DMC DMA, NMI/IRQ/rendering, APU audio, deterministic save states, battery persistence, NES 2.0 sizing, and mapper 0/1/2/3/4/7/11/66 support.
 - Second ROM machine graph: Master System with Z80, Sega banked ROM/SRAM, Mode 4 VDP rendering, corrected 3:2 CPU/dot timing, frame/line interrupts, V/H counters, scroll locks, two-player controls, SN76489 audio, save states, and persistent SRAM.
 - Third ROM machine graph: ColecoVision reusing the Z80/SN76489 with TMS9918 Graphics I/II rendering, sprites, VDP NMI, BIOS/cartridge mapping, controllers and save states.
@@ -61,7 +62,7 @@ Expansion chips are devices inside the loaded machine graph. They never select a
 
 ## Stage 3 — fifth generation
 
-Build the shared MIPS/geometry/DSP/GPU/media substrate needed for PlayStation, Nintendo 64, Saturn, Jaguar and 3DO.
+The MIPS R3000A-class CPU substrate is now established. Next construct the PlayStation memory/BIOS/GPU/DMA/interrupt machine graph, then add the remaining reusable 32-bit CPU, geometry/DSP and fixed-function GPU paths for Nintendo 64, Saturn, Jaguar and 3DO.
 
 This is where OmniCore needs a reusable dynamic-translation layer, reference interpreters, stronger worker isolation and WebGPU acceleration. Fast paths must be continuously checked against deterministic reference execution.
 
