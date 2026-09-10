@@ -34,6 +34,7 @@ Established:
 - Third ROM machine graph: ColecoVision reusing the Z80/SN76489 with TMS9918 Graphics I/II rendering, sprites, VDP NMI, BIOS/cartridge mapping, controllers and save states.
 - Fourth ROM machine graph: Genesis / Mega Drive combining 68000 + Z80, VDP, YM2612, SN76489, controllers, SMD decoding, SRAM persistence, interrupts, and deterministic state.
 - Fifth ROM machine graph: SNES / Super Famicom using W65C816 with LoROM/HiROM, WRAM/I/O/controllers, PPU VRAM/CGRAM/OAM and Mode 0/1 BG1 rendering, vblank/NMI, SRAM persistence, and deterministic state.
+- First fifth-generation machine graph: PlayStation with MIPS R3000A, mirrored RAM/scratchpad/user BIOS, COP0 interrupts, GPU VRAM/display and initial raster commands, GPU/OTC DMA, digital-pad serial I/O, memory-card persistence, and deterministic state.
 
 ## Stage 1 — finish the first cartridge families
 
@@ -62,7 +63,7 @@ Expansion chips are devices inside the loaded machine graph. They never select a
 
 ## Stage 3 — fifth generation
 
-The MIPS R3000A-class CPU substrate is now established. Next construct the PlayStation memory/BIOS/GPU/DMA/interrupt machine graph, then add the remaining reusable 32-bit CPU, geometry/DSP and fixed-function GPU paths for Nintendo 64, Saturn, Jaguar and 3DO.
+The PlayStation machine foundation is now launchable on top of the reusable MIPS R3000A: RAM/scratchpad/user BIOS, COP0/interrupts, initial GPU raster/VRAM/display commands, GPU linked-list/block DMA, OTC DMA, controller serial I/O, memory-card persistence and deterministic state are live. Next add CD-ROM media/controller, SPU synthesis, textured/blended GPU commands and timing validation, then build the remaining reusable 32-bit CPU, geometry/DSP and fixed-function GPU paths for Nintendo 64, Saturn, Jaguar and 3DO.
 
 This is where OmniCore needs a reusable dynamic-translation layer, reference interpreters, stronger worker isolation and WebGPU acceleration. Fast paths must be continuously checked against deterministic reference execution.
 

@@ -84,6 +84,7 @@ impl PlatformId {
                 | Self::MasterSystem
                 | Self::Genesis
                 | Self::Snes
+                | Self::PlayStation
         )
     }
 
@@ -97,7 +98,8 @@ impl PlatformId {
             | Self::Nes
             | Self::MasterSystem
             | Self::Genesis
-            | Self::Snes => SupportLevel::Foundation,
+            | Self::Snes
+            | Self::PlayStation => SupportLevel::Foundation,
             _ => SupportLevel::Planned,
         }
     }

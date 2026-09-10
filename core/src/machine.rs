@@ -2,7 +2,7 @@ use crate::blueprint::is_targeted;
 use crate::kernel::{AudioBuffer, InputState, VideoBuffer};
 use crate::machines::{
     Atari2600Machine, Atari5200Machine, Atari7800Machine, ColecoVisionMachine, GenesisMachine,
-    MasterSystemMachine, NesMachine, PongMachine, SnesMachine,
+    MasterSystemMachine, NesMachine, PlayStationMachine, PongMachine, SnesMachine,
 };
 use crate::platform::{PlatformId, SupportLevel};
 use crate::resources::{ResourceKind, ResourceStore};
@@ -69,6 +69,11 @@ pub fn create_machine(
             let image = resources.primary_game().ok_or_else(|| "SNES requires a staged cartridge image".to_string())?;
             let rom = image.materialize(16 * 1024 * 1024 + 512)?;
             Ok(Box::new(SnesMachine::from_rom(&rom)?) as Box<dyn Machine>)
+        }
+        PlatformId::PlayStation => {
+            let bios = resources.get(ResourceKind::Bios, 0).ok_or_else(|| "PlayStation requires a staged 512 KiB BIOS".to_string())?;
+            let bios = bios.materialize(512 * 1024)?;
+            Ok(Box::new(PlayStationMachine::from_bios(&bios)?) as Box<dyn Machine>)
         }
         PlatformId::Nes => {
             let image = resources.primary_game().ok_or_else(|| "NES requires a staged game image".to_string())?;
