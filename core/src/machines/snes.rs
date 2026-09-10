@@ -150,6 +150,7 @@ struct SnesBus {
     wram: Vec<u8>,
     ppu: SnesPpu,
     apu_ports: [u8; 4],
+    dma: [[u8; 16]; 8],
     nmitimen: u8,
     rdnmi: bool,
     nmi_pending: bool,
@@ -167,6 +168,7 @@ impl SnesBus {
             wram: vec![0; WRAM_SIZE],
             ppu: SnesPpu::new(),
             apu_ports: [0; 4],
+            dma: [[0; 16]; 8],
             nmitimen: 0,
             rdnmi: false,
             nmi_pending: false,
@@ -181,6 +183,7 @@ impl SnesBus {
     fn reset(&mut self) {
         self.ppu.reset();
         self.apu_ports = [0; 4];
+        self.dma = [[0; 16]; 8];
         self.nmitimen = 0;
         self.rdnmi = false;
         self.nmi_pending = false;
@@ -277,6 +280,11 @@ impl SnesBus {
             0x4219 => (self.joy_latched[0] >> 8) as u8,
             0x421a => self.joy_latched[1] as u8,
             0x421b => (self.joy_latched[1] >> 8) as u8,
+            0x4300..=0x437f => {
+                let channel = usize::from((offset - 0x4300) >> 4);
+                let reg = usize::from(offset & 0x0f);
+                self.dma[channel][reg]
+            }
             _ => return None,
         })
     }
@@ -295,9 +303,82 @@ impl SnesBus {
             0x2183 => self.wram_addr = (self.wram_addr & 0x0ffff) | (u32::from(value & 1) << 16),
             0x4016 => self.set_strobe(value & 1 != 0),
             0x4200 => self.nmitimen = value,
+            0x420b => self.run_dma(value),
+            0x4300..=0x437f => {
+                let channel = usize::from((offset - 0x4300) >> 4);
+                let reg = usize::from(offset & 0x0f);
+                self.dma[channel][reg] = value;
+            }
             _ => return false,
         }
         true
+    }
+
+    fn dma_b_offset(mode: u8, index: usize) -> u8 {
+        const PATTERNS: [[u8; 4]; 8] = [
+            [0, 0, 0, 0],
+            [0, 1, 0, 1],
+            [0, 0, 0, 0],
+            [0, 0, 1, 1],
+            [0, 1, 2, 3],
+            [0, 1, 0, 1],
+            [0, 0, 0, 0],
+            [0, 0, 1, 1],
+        ];
+        PATTERNS[usize::from(mode & 7)][index & 3]
+    }
+
+    fn dma_pattern_len(mode: u8) -> usize {
+        match mode & 7 {
+            0 => 1,
+            1 | 2 | 6 => 2,
+            _ => 4,
+        }
+    }
+
+    fn run_dma(&mut self, mask: u8) {
+        for channel in 0..8 {
+            if mask & (1 << channel) == 0 {
+                continue;
+            }
+            let regs = self.dma[channel];
+            let control = regs[0];
+            let bbase = 0x2100u16.wrapping_add(u16::from(regs[1]));
+            let bank = u32::from(regs[4]) << 16;
+            let mut aoffset = u16::from_le_bytes([regs[2], regs[3]]);
+            let encoded = u16::from_le_bytes([regs[5], regs[6]]);
+            let count = if encoded == 0 {
+                65_536usize
+            } else {
+                usize::from(encoded)
+            };
+            let fixed = control & 0x08 != 0;
+            let decrement = control & 0x10 != 0;
+            let reverse = control & 0x80 != 0;
+            let pattern_len = Self::dma_pattern_len(control);
+            for index in 0..count {
+                let b =
+                    bbase.wrapping_add(u16::from(Self::dma_b_offset(control, index % pattern_len)));
+                let a = bank | u32::from(aoffset);
+                if reverse {
+                    let value = self.read8(u32::from(b));
+                    self.write8(a, value);
+                } else {
+                    let value = self.read8(a);
+                    self.write8(u32::from(b), value);
+                }
+                if !fixed {
+                    aoffset = if decrement {
+                        aoffset.wrapping_sub(1)
+                    } else {
+                        aoffset.wrapping_add(1)
+                    };
+                }
+            }
+            self.dma[channel][2..4].copy_from_slice(&aoffset.to_le_bytes());
+            self.dma[channel][5] = 0;
+            self.dma[channel][6] = 0;
+        }
     }
 
     fn save(&self, out: &mut StateWriter) {
@@ -305,6 +386,9 @@ impl SnesBus {
         out.blob(&self.cartridge.sram);
         self.ppu.save(out);
         out.blob(&self.apu_ports);
+        for channel in self.dma {
+            out.blob(&channel);
+        }
         out.u8(self.nmitimen);
         out.u8(self.rdnmi as u8);
         out.u8(self.nmi_pending as u8);
@@ -334,6 +418,13 @@ impl SnesBus {
             return Err("invalid SNES APU port state length".into());
         }
         self.apu_ports.copy_from_slice(ports);
+        for channel in &mut self.dma {
+            let bytes = input.blob()?;
+            if bytes.len() != channel.len() {
+                return Err("invalid SNES DMA state length".into());
+            }
+            channel.copy_from_slice(bytes);
+        }
         self.nmitimen = input.u8()?;
         self.rdnmi = input.u8()? != 0;
         self.nmi_pending = input.u8()? != 0;
@@ -635,6 +726,26 @@ mod tests {
             .read_persistent(ResourceKind::Storage, 0, &mut persisted)
             .unwrap();
         assert_eq!(persisted, data);
+    }
+
+    #[test]
+    fn general_dma_moves_wram_into_ppu_b_bus() {
+        let rom = synthetic_lorom();
+        let mut machine = SnesMachine::from_rom(&rom).unwrap();
+        machine.bus.wram[0] = 0x1f;
+        machine.bus.wram[1] = 0x00;
+        machine.bus.ppu.write(0x2100, 0x0f);
+        machine.bus.write_low_io(0x4300, 0x00);
+        machine.bus.write_low_io(0x4301, 0x22);
+        machine.bus.write_low_io(0x4302, 0x00);
+        machine.bus.write_low_io(0x4303, 0x00);
+        machine.bus.write_low_io(0x4304, 0x7e);
+        machine.bus.write_low_io(0x4305, 0x02);
+        machine.bus.write_low_io(0x4306, 0x00);
+        machine.bus.write_low_io(0x420b, 0x01);
+        machine.bus.ppu.force_render();
+        assert!(machine.bus.ppu.video().pixels()[0] > 200);
+        assert_eq!(&machine.bus.dma[0][5..7], &[0, 0]);
     }
 
     #[test]
