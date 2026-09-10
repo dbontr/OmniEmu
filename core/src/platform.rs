@@ -82,6 +82,7 @@ impl PlatformId {
                 | Self::ColecoVision
                 | Self::Nes
                 | Self::MasterSystem
+                | Self::Genesis
         )
     }
 
@@ -93,7 +94,8 @@ impl PlatformId {
             | Self::ColecoVision
             | Self::Atari7800
             | Self::Nes
-            | Self::MasterSystem => SupportLevel::Foundation,
+            | Self::MasterSystem
+            | Self::Genesis => SupportLevel::Foundation,
             _ => SupportLevel::Planned,
         }
     }

@@ -334,4 +334,30 @@ assert(atari7800Audio.some((value) => value > 0), 'Atari 7800 TIA audio is silen
 assert(core.omni_save_state(0, 0) > 0, 'Atari 7800 save state is empty')
 core.omni_unload()
 
+assert(core.omni_can_launch(31) === 1, 'Genesis foundation should be launchable for development')
+const genesis = new Uint8Array(0x40000)
+genesis.fill(0xff)
+const g16 = (offset, value) => { genesis[offset] = value >> 8; genesis[offset + 1] = value & 0xff }
+const g32 = (offset, value) => { g16(offset, value >>> 16); g16(offset + 2, value & 0xffff) }
+g32(0, 0x00ffff00)
+g32(4, 0x00000200)
+const genesisWords = [
+  0x13fc, 0x0084, 0x00c0, 0x0011,
+  0x13fc, 0x0010, 0x00c0, 0x0011,
+  0x13fc, 0x0090, 0x00c0, 0x0011,
+  0x60fe,
+]
+genesisWords.forEach((word, index) => g16(0x200 + index * 2, word))
+core.omni_resources_clear()
+stageBytes(0, genesis, 'Genesis cartridge')
+ok(core.omni_load_staged(31), 'load staged Genesis cartridge')
+for (let frame = 0; frame < 2; frame++) ok(core.omni_run_frame(), `run Genesis frame ${frame}`)
+const genesisWidth = core.omni_video_width()
+const genesisHeight = core.omni_video_height()
+assert(genesisWidth === 320 && genesisHeight === 224, `unexpected Genesis surface ${genesisWidth}x${genesisHeight}`)
+const genesisAudio = new Float32Array(core.memory.buffer, core.omni_audio_ptr(), core.omni_audio_len())
+assert(genesisAudio.some((value) => Math.abs(value) > 0.001), 'Genesis PSG audio is silent')
+assert(core.omni_save_state(0, 0) > 0, 'Genesis save state is empty')
+core.omni_unload()
+
 console.log(`OmniCore WASM smoke passed: ${bytes.byteLength} bytes, ${width}x${height}, ${audioLen} audio samples.`)

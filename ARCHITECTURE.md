@@ -92,6 +92,8 @@ The Master System development graph is the second ROM-driven proof and the first
 
 ColecoVision is the third ROM-driven machine and demonstrates reuse across vendors: the same Z80 and SN76489 execute alongside a reusable TMS9918 device, an 8 KiB user BIOS, the Coleco memory/I/O map, controller multiplexing, Graphics I/II rendering, sprites, VDP NMI and deterministic state.
 
+Genesis / Mega Drive is the first 16-bit machine graph. It combines the reusable Motorola 68000 and Z80 engines with the console bus map, bus-request/reset behavior, controller ports, VDP VRAM/CRAM/VSRAM and plane/sprite rendering foundation, YM2612 FM/DAC/timers, SN76489 audio, SMD decoding, cartridge SRAM persistence and deterministic state. VDP DMA/cycle timing, full YM2612 fidelity, mapper breadth and compatibility validation remain foundation work.
+
 ## Browser acceleration path
 
 Today, OmniCore emits one RGBA framebuffer and interleaved `f32` audio buffer. The browser bridge uploads video through WebGL 2 and schedules audio through Web Audio. The global logical controller ABI provides a 64-bit digital mask plus eight signed 16-bit analog axes per player, including sticks, analog triggers and auxiliary axes.

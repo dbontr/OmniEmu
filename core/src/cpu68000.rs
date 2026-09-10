@@ -1,3 +1,5 @@
+use crate::state::{StateReader, StateWriter};
+
 pub trait Bus68000: Send {
     fn read8(&mut self, address: u32) -> u8;
     fn write8(&mut self, address: u32, value: u8);
@@ -364,6 +366,33 @@ impl M68000 {
         self.pc = bus.read32(u32::from(vector) * 4) & 0x00ff_ffff;
         self.cycles += 44;
         44
+    }
+
+    pub fn save(&self, out: &mut StateWriter) {
+        for value in self.d {
+            out.u32(value);
+        }
+        for value in self.a {
+            out.u32(value);
+        }
+        out.u32(self.pc);
+        out.u16(self.sr);
+        out.u64(self.cycles);
+        out.u8(self.stopped as u8);
+    }
+
+    pub fn load(&mut self, input: &mut StateReader<'_>) -> Result<(), String> {
+        for value in &mut self.d {
+            *value = input.u32()?;
+        }
+        for value in &mut self.a {
+            *value = input.u32()? & 0x00ff_ffff;
+        }
+        self.pc = input.u32()? & 0x00ff_ffff;
+        self.sr = input.u16()?;
+        self.cycles = input.u64()?;
+        self.stopped = input.u8()? != 0;
+        Ok(())
     }
 
     pub fn step<B: Bus68000>(&mut self, bus: &mut B) -> u32 {
