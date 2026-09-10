@@ -12,9 +12,8 @@ use super::snes_apu::SnesApu;
 use super::snes_ppu::SnesPpu;
 
 const FRAME_RATE: f64 = 60.098_813_897;
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
 const WRAM_SIZE: usize = 128 * 1024;
-const SAMPLE_RATE: u32 = 48_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnesMap {
@@ -678,10 +677,11 @@ impl SnesMachine {
         let mut bus = SnesBus::new(cartridge);
         let mut cpu = Cpu65816::default();
         cpu.reset(&mut bus);
+        let audio_rate = bus.apu.sample_rate();
         Ok(Self {
             cpu,
             bus,
-            audio: AudioBuffer::new(SAMPLE_RATE, 2),
+            audio: AudioBuffer::new(audio_rate, 2),
             powered: true,
         })
     }
@@ -699,11 +699,12 @@ impl SnesMachine {
         used
     }
 
-    fn silence_frame(&mut self) {
+    fn flush_audio(&mut self) {
         self.audio.begin_frame();
-        let frames = (f64::from(SAMPLE_RATE) / FRAME_RATE).round() as usize;
-        for _ in 0..frames {
-            self.audio.push_stereo(0.0, 0.0);
+        let samples = self.bus.apu.take_samples();
+        let (pairs, _) = samples.as_chunks::<2>();
+        for pair in pairs {
+            self.audio.push_stereo(pair[0], pair[1]);
         }
     }
 
@@ -750,7 +751,7 @@ impl Machine for SnesMachine {
         self.bus.reset();
         self.cpu.reset(&mut self.bus);
         self.powered = true;
-        self.silence_frame();
+        self.flush_audio();
     }
 
     fn run_frame(&mut self, input: &InputState) {
@@ -766,7 +767,7 @@ impl Machine for SnesMachine {
         if self.bus.ppu.frame() != target {
             self.powered = false;
         }
-        self.silence_frame();
+        self.flush_audio();
     }
 
     fn frame_rate(&self) -> f64 {
@@ -792,7 +793,7 @@ impl Machine for SnesMachine {
         self.load_cpu(&mut input)?;
         self.bus.load(&mut input)?;
         self.powered = input.u8()? != 0;
-        self.silence_frame();
+        self.flush_audio();
         input.finish()
     }
 
@@ -856,7 +857,7 @@ mod tests {
         assert_eq!(machine.video().width(), 256);
         assert_eq!(machine.video().height(), 224);
         assert!(machine.video().pixels()[0] > 200);
-        assert_eq!(machine.audio().sample_rate(), SAMPLE_RATE);
+        assert_eq!(machine.audio().sample_rate(), 32_000);
     }
 
     #[test]

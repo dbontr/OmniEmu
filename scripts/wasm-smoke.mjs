@@ -375,6 +375,9 @@ for (let frame = 0; frame < 2; frame++) ok(core.omni_run_frame(), 'run SNES fram
 assert(core.omni_video_width() === 256 && core.omni_video_height() === 224, 'unexpected SNES surface')
 const snesVideo = new Uint8Array(core.memory.buffer, core.omni_video_ptr(), core.omni_video_len())
 assert(snesVideo[0] > 180, 'SNES PPU backdrop did not render')
+assert(core.omni_audio_rate() === 32_000, 'unexpected SNES audio sample rate')
+assert(core.omni_audio_channels() === 2, 'unexpected SNES audio channel count')
+assert(core.omni_audio_len() > 0, 'SNES audio buffer is empty')
 assert(core.omni_save_state(0, 0) > 0, 'SNES save state is empty')
 core.omni_unload()
 

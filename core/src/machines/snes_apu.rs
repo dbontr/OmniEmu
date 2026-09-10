@@ -1,6 +1,8 @@
 use crate::cpu_spc700::{Spc700, Spc700Bus};
 use crate::state::{StateReader, StateWriter};
 
+use super::snes_dsp::SnesDsp;
+
 const SPC_HZ: u64 = 1_024_000;
 const MAIN_APPROX_HZ: u64 = 3_579_545;
 
@@ -66,42 +68,6 @@ impl SmpTimer {
         Ok(())
     }
 }
-struct SnesDsp {
-    regs: [u8; 128],
-}
-
-impl Default for SnesDsp {
-    fn default() -> Self {
-        Self { regs: [0; 128] }
-    }
-}
-
-impl SnesDsp {
-    fn read(&self, address: u8) -> u8 {
-        self.regs[usize::from(address & 0x7f)]
-    }
-
-    fn write(&mut self, address: u8, value: u8) {
-        let index = usize::from(address & 0x7f);
-        match index {
-            0x7c => self.regs[index] &= !value,
-            _ => self.regs[index] = value,
-        }
-    }
-
-    fn save(&self, out: &mut StateWriter) {
-        out.blob(&self.regs);
-    }
-
-    fn load(&mut self, input: &mut StateReader<'_>) -> Result<(), String> {
-        let regs = input.blob()?;
-        if regs.len() != self.regs.len() {
-            return Err("invalid SNES DSP register state length".into());
-        }
-        self.regs.copy_from_slice(regs);
-        Ok(())
-    }
-}
 struct SmpBus {
     ram: Vec<u8>,
     from_cpu: [u8; 4],
@@ -152,6 +118,7 @@ impl SmpBus {
     }
 
     fn tick(&mut self, cycles: u32) {
+        self.dsp.tick(&self.ram, cycles);
         self.timers[0].tick(cycles, 128);
         self.timers[1].tick(cycles, 128);
         self.timers[2].tick(cycles, 16);
@@ -321,15 +288,22 @@ impl SnesApu {
             .saturating_add(u64::from(main_cycles) * SPC_HZ);
         let spc_cycles = self.clock_phase / MAIN_APPROX_HZ;
         self.clock_phase %= MAIN_APPROX_HZ;
-        if self.hle != IplHle::Running {
-            return;
+        self.bus.tick(spc_cycles as u32);
+        if self.hle == IplHle::Running {
+            self.cycle_budget = self.cycle_budget.saturating_add(spc_cycles as i64);
+            while self.cycle_budget > 0 {
+                let used = self.cpu.step(&mut self.bus);
+                self.cycle_budget -= i64::from(used);
+            }
         }
-        self.cycle_budget = self.cycle_budget.saturating_add(spc_cycles as i64);
-        while self.cycle_budget > 0 {
-            let used = self.cpu.step(&mut self.bus);
-            self.bus.tick(used);
-            self.cycle_budget -= i64::from(used);
-        }
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.bus.dsp.sample_rate()
+    }
+
+    pub fn take_samples(&mut self) -> Vec<f32> {
+        self.bus.dsp.take_samples()
     }
 
     pub fn save(&self, out: &mut StateWriter) {

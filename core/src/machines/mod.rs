@@ -12,6 +12,7 @@ mod pong;
 mod sn76489;
 mod snes;
 mod snes_apu;
+mod snes_dsp;
 mod snes_ppu;
 mod tms9918;
 mod ym2612;
