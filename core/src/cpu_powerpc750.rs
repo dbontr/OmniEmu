@@ -23,6 +23,166 @@ const FPSCR_ZX: u32 = 1 << 26;
 const FPSCR_VE: u32 = 1 << 7;
 const FPSCR_ZE: u32 = 1 << 4;
 
+const DOUBLE_SIGN: u64 = 1 << 63;
+const DOUBLE_EXP: u64 = 0x7ff << 52;
+const DOUBLE_FRAC: u64 = (1 << 52) - 1;
+const DOUBLE_QBIT: u64 = 1 << 51;
+const CANONICAL_QNAN: u64 = DOUBLE_EXP | DOUBLE_QBIT;
+
+// Gekko reciprocal-estimate interpolation constants. These are hardware lookup data,
+// cross-checked against independent MIT-licensed console-validation work; see REFERENCES.md.
+const FRES_ESTIMATE: [(u32, i32); 32] = [
+    (0x7ff800, 0x3e1),
+    (0x783800, 0x3a7),
+    (0x70ea00, 0x371),
+    (0x6a0800, 0x340),
+    (0x638800, 0x313),
+    (0x5d6200, 0x2ea),
+    (0x579000, 0x2c4),
+    (0x520800, 0x2a0),
+    (0x4cc800, 0x27f),
+    (0x47ca00, 0x261),
+    (0x430800, 0x245),
+    (0x3e8000, 0x22a),
+    (0x3a2c00, 0x212),
+    (0x360800, 0x1fb),
+    (0x321400, 0x1e5),
+    (0x2e4a00, 0x1d1),
+    (0x2aa800, 0x1be),
+    (0x272c00, 0x1ac),
+    (0x23d600, 0x19b),
+    (0x209e00, 0x18b),
+    (0x1d8800, 0x17c),
+    (0x1a9000, 0x16e),
+    (0x17ae00, 0x15b),
+    (0x14f800, 0x15b),
+    (0x124400, 0x143),
+    (0x0fbe00, 0x143),
+    (0x0d3800, 0x12d),
+    (0x0ade00, 0x12d),
+    (0x088400, 0x11a),
+    (0x065000, 0x11a),
+    (0x041c00, 0x108),
+    (0x020c00, 0x106),
+];
+
+const FRSQRTE_ESTIMATE: [(u32, i32); 32] = [
+    (0x1a7e800, -0x568),
+    (0x17cb800, -0x4f3),
+    (0x1552800, -0x48d),
+    (0x130c000, -0x435),
+    (0x10f2000, -0x3e7),
+    (0x0eff000, -0x3a2),
+    (0x0d2e000, -0x365),
+    (0x0b7c000, -0x32e),
+    (0x09e5000, -0x2fc),
+    (0x0867000, -0x2d0),
+    (0x06ff000, -0x2a8),
+    (0x05ab800, -0x283),
+    (0x046a000, -0x261),
+    (0x0339800, -0x243),
+    (0x0218800, -0x226),
+    (0x0105800, -0x20b),
+    (0x3ffa000, -0x7a4),
+    (0x3c29000, -0x700),
+    (0x38aa000, -0x670),
+    (0x3572000, -0x5f2),
+    (0x3279000, -0x584),
+    (0x2fb7000, -0x524),
+    (0x2d26000, -0x4cc),
+    (0x2ac0000, -0x47e),
+    (0x2881000, -0x43a),
+    (0x2665000, -0x3fa),
+    (0x2468000, -0x3c2),
+    (0x2287000, -0x38e),
+    (0x20c1000, -0x35e),
+    (0x1f12000, -0x332),
+    (0x1d79000, -0x30a),
+    (0x1bf4000, -0x2e6),
+];
+
+fn is_signaling_nan(value: f64) -> bool {
+    let bits = value.to_bits();
+    bits & DOUBLE_EXP == DOUBLE_EXP && bits & DOUBLE_FRAC != 0 && bits & DOUBLE_QBIT == 0
+}
+
+fn quiet_nan(value: f64) -> f64 {
+    f64::from_bits(value.to_bits() | DOUBLE_QBIT)
+}
+
+fn gekko_reciprocal_estimate(value: f64) -> f64 {
+    let bits = value.to_bits();
+    let mantissa = bits & DOUBLE_FRAC;
+    let sign = bits & DOUBLE_SIGN;
+    let exponent = bits & DOUBLE_EXP;
+
+    if mantissa == 0 && exponent == 0 {
+        return f64::from_bits(sign | DOUBLE_EXP);
+    }
+    if exponent == DOUBLE_EXP {
+        return if mantissa == 0 {
+            f64::from_bits(sign)
+        } else {
+            quiet_nan(value)
+        };
+    }
+    if exponent < (895u64 << 52) {
+        return f64::from(f32::MAX).copysign(value);
+    }
+    if exponent >= (1149u64 << 52) {
+        return f64::from_bits(sign);
+    }
+
+    let output_exponent = (0x7fdu64 << 52) - exponent;
+    let index = (mantissa >> 37) as usize;
+    let (base, decrement) = FRES_ESTIMATE[index / 1024];
+    let interpolation = index % 1024;
+    let fraction = i64::from(base) - (i64::from(decrement) * interpolation as i64 + 1) / 2;
+    f64::from_bits(sign | output_exponent | ((fraction as u64) << 29))
+}
+
+fn gekko_reciprocal_sqrt_estimate(value: f64) -> f64 {
+    let bits = value.to_bits();
+    let mut mantissa = bits & DOUBLE_FRAC;
+    let sign = bits & DOUBLE_SIGN;
+    let mut exponent = (bits & DOUBLE_EXP) as i64;
+
+    if mantissa == 0 && exponent == 0 {
+        return f64::from_bits(sign | DOUBLE_EXP);
+    }
+    if exponent == DOUBLE_EXP as i64 {
+        if mantissa == 0 {
+            return if sign != 0 {
+                f64::from_bits(CANONICAL_QNAN)
+            } else {
+                0.0
+            };
+        }
+        return quiet_nan(value);
+    }
+    if sign != 0 {
+        return f64::from_bits(CANONICAL_QNAN);
+    }
+
+    if exponent == 0 {
+        while mantissa & (1 << 52) == 0 {
+            exponent -= 1i64 << 52;
+            mantissa <<= 1;
+        }
+        mantissa &= DOUBLE_FRAC;
+        exponent += 1i64 << 52;
+    }
+
+    let exponent_lsb = (exponent as u64) & (1 << 52);
+    let output_exponent =
+        ((0x3ffi64 << 52) - (exponent - (0x3fei64 << 52)) / 2) & DOUBLE_EXP as i64;
+    let index = ((exponent_lsb | mantissa) >> 37) as usize;
+    let (base, decrement) = FRSQRTE_ESTIMATE[index / 2048];
+    let interpolation = index % 2048;
+    let fraction = i64::from(base) + i64::from(decrement) * interpolation as i64;
+    f64::from_bits(output_exponent as u64 | ((fraction as u64) << 26))
+}
+
 const HID2_PSE: u32 = 1 << 29;
 const HID2_LSQE: u32 = 1 << 31;
 
@@ -1444,14 +1604,23 @@ impl PowerPc750 {
                 if b0 == 0.0 || b1 == 0.0 {
                     self.fpscr |= FPSCR_FX | FPSCR_ZX;
                 }
-                (b0.recip(), b1.recip())
+                if is_signaling_nan(b0) || is_signaling_nan(b1) {
+                    self.fpscr |= FPSCR_FX | FPSCR_VX;
+                }
+                (gekko_reciprocal_estimate(b0), gekko_reciprocal_estimate(b1))
             }
             25 => (a0 * c0, a1 * c1),
             26 => {
-                if b0 <= 0.0 || b1 <= 0.0 {
+                if b0 == 0.0 || b1 == 0.0 {
+                    self.fpscr |= FPSCR_FX | FPSCR_ZX;
+                }
+                if b0 < 0.0 || b1 < 0.0 || is_signaling_nan(b0) || is_signaling_nan(b1) {
                     self.fpscr |= FPSCR_FX | FPSCR_VX;
                 }
-                (b0.sqrt().recip(), b1.sqrt().recip())
+                (
+                    gekko_reciprocal_sqrt_estimate(b0),
+                    gekko_reciprocal_sqrt_estimate(b1),
+                )
             }
             28 => (a0 * c0 - b0, a1 * c1 - b1),
             29 => (a0 * c0 + b0, a1 * c1 + b1),
@@ -1475,21 +1644,35 @@ impl PowerPc750 {
         let fb = Self::rb(instruction);
         let fc = ((instruction >> 6) & 31) as usize;
         let xo = (instruction >> 1) & 31;
+        let b_full = f64::from_bits(self.fpr[fb]);
+        if xo == 24 {
+            if b_full == 0.0 {
+                self.fpscr |= FPSCR_FX | FPSCR_ZX;
+                if self.fpscr & FPSCR_ZE != 0 {
+                    self.take_exception(PowerPcException::Program, self.pc.wrapping_sub(4));
+                    return;
+                }
+            } else if is_signaling_nan(b_full) {
+                self.fpscr |= FPSCR_FX | FPSCR_VX;
+                if self.fpscr & FPSCR_VE != 0 {
+                    self.take_exception(PowerPcException::Program, self.pc.wrapping_sub(4));
+                    return;
+                }
+            }
+            let result = gekko_reciprocal_estimate(b_full);
+            self.set_paired_raw(fd, result.to_bits(), result.to_bits());
+            self.float_record(instruction, result);
+            return;
+        }
+
         let a = f64::from_bits(self.fpr[fa]) as f32;
-        let b = f64::from_bits(self.fpr[fb]) as f32;
+        let b = b_full as f32;
         let c = f64::from_bits(self.fpr[fc]) as f32;
         let result = match xo {
             18 => self.float_div(a, b) as f32,
             20 => a - b,
             21 => a + b,
-            22 => self.float_sqrt(a) as f32,
-            24 => {
-                if b == 0.0 {
-                    f32::INFINITY.copysign(b)
-                } else {
-                    b.recip()
-                }
-            }
+            22 => self.float_sqrt(b) as f32,
             25 => a * c,
             28 => a * c - b,
             29 => a * c + b,
@@ -1500,8 +1683,8 @@ impl PowerPc750 {
                 return;
             }
         };
-        self.fpr[fd] = f64::from(result).to_bits();
-        self.float_record(instruction, result as f64);
+        self.set_paired(fd, f64::from(result), f64::from(result));
+        self.float_record(instruction, f64::from(result));
     }
 
     fn execute_float_double(&mut self, instruction: u32) {
@@ -1533,7 +1716,11 @@ impl PowerPc750 {
                 };
                 self.set_cr_field(field, nibble);
             }
-            12 => self.fpr[fd] = (a as f32 as f64).to_bits(),
+            12 => {
+                let result = f64::from(b as f32);
+                self.set_paired(fd, result, result);
+                self.float_record(instruction, result);
+            }
             14 | 15 => {
                 let rounded = if xo == 15 {
                     b.trunc()
@@ -1579,7 +1766,20 @@ impl PowerPc750 {
                 self.float_record(instruction, result);
             }
             26 => {
-                let result = b.recip().sqrt();
+                if b == 0.0 {
+                    self.fpscr |= FPSCR_FX | FPSCR_ZX;
+                    if self.fpscr & FPSCR_ZE != 0 {
+                        self.take_exception(PowerPcException::Program, self.pc.wrapping_sub(4));
+                        return;
+                    }
+                } else if is_signaling_nan(b) || b < 0.0 {
+                    self.fpscr |= FPSCR_FX | FPSCR_VX;
+                    if self.fpscr & FPSCR_VE != 0 {
+                        self.take_exception(PowerPcException::Program, self.pc.wrapping_sub(4));
+                        return;
+                    }
+                }
+                let result = gekko_reciprocal_sqrt_estimate(b);
                 self.fpr[fd] = result.to_bits();
                 self.float_record(instruction, result);
             }
@@ -1951,6 +2151,15 @@ mod tests {
             | (sub10 << 1)
     }
 
+    fn fp_a(op: u32, fd: u8, fa: u8, fb: u8, fc: u8, xo: u32) -> u32 {
+        (op << 26)
+            | (u32::from(fd) << 21)
+            | (u32::from(fa) << 16)
+            | (u32::from(fb) << 11)
+            | (u32::from(fc) << 6)
+            | (xo << 1)
+    }
+
     #[test]
     fn integer_branch_memory_and_condition_register_execute() {
         let mut bus = TestBus::new();
@@ -2066,6 +2275,139 @@ mod tests {
         cpu.pc = 0x10c;
         cpu.execute(&mut bus, ps(5, 1, 2, 0, 21), 0x108);
         assert_eq!(cpu.srr0, 0x108);
+        assert_eq!(cpu.pc & 0xffff, 0x0700);
+    }
+
+    #[test]
+    fn gekko_estimate_tables_and_special_values_match_hardware_shape() {
+        assert_eq!(
+            gekko_reciprocal_estimate(1.0).to_bits(),
+            0x3fef_ff00_0000_0000
+        );
+        assert_eq!(
+            gekko_reciprocal_sqrt_estimate(1.0).to_bits(),
+            0x3fef_fe80_0000_0000
+        );
+        assert_eq!(
+            gekko_reciprocal_estimate(-0.0).to_bits(),
+            f64::NEG_INFINITY.to_bits()
+        );
+        assert_eq!(
+            gekko_reciprocal_sqrt_estimate(-0.0).to_bits(),
+            f64::NEG_INFINITY.to_bits()
+        );
+        assert_eq!(
+            gekko_reciprocal_estimate(f64::INFINITY).to_bits(),
+            0.0f64.to_bits()
+        );
+        assert_eq!(
+            gekko_reciprocal_sqrt_estimate(f64::INFINITY).to_bits(),
+            0.0f64.to_bits()
+        );
+        assert_eq!(
+            gekko_reciprocal_estimate(f64::from_bits(1)).to_bits(),
+            f64::from(f32::MAX).to_bits()
+        );
+        assert_eq!(
+            gekko_reciprocal_estimate(f64::from_bits(0x7fef_ffff_ffff_ffff)).to_bits(),
+            0.0f64.to_bits()
+        );
+        assert_eq!(
+            gekko_reciprocal_sqrt_estimate(f64::from_bits(1)).to_bits(),
+            0x617f_fe80_0000_0000
+        );
+        assert_eq!(
+            gekko_reciprocal_sqrt_estimate(f64::from_bits(0x7fef_ffff_ffff_ffff)).to_bits(),
+            0x1ff0_0008_2c00_0000
+        );
+        let signaling = f64::from_bits(0x7ff0_0000_0000_0123);
+        assert!(is_signaling_nan(signaling));
+        assert_eq!(
+            gekko_reciprocal_estimate(signaling).to_bits(),
+            0x7ff8_0000_0000_0123
+        );
+        assert_eq!(
+            gekko_reciprocal_sqrt_estimate(signaling).to_bits(),
+            0x7ff8_0000_0000_0123
+        );
+        assert_eq!(
+            gekko_reciprocal_sqrt_estimate(-1.0).to_bits(),
+            CANONICAL_QNAN
+        );
+    }
+
+    #[test]
+    fn gekko_scalar_and_paired_estimates_use_hardware_approximations() {
+        let mut bus = TestBus::new();
+        let mut cpu = PowerPc750::new();
+        cpu.reset_to(0x100);
+        cpu.msr |= MSR_FP;
+        cpu.hid2 = HID2_PSE | HID2_LSQE;
+
+        cpu.fpr[1] = 1.0f64.to_bits();
+        cpu.execute(&mut bus, fp_a(59, 2, 0, 1, 0, 24), 0x100);
+        assert_eq!(cpu.fpr[2], 0x3fef_ff00_0000_0000);
+        assert_eq!(cpu.paired1[2], cpu.fpr[2]);
+
+        cpu.paired1[3] = 0x1122_3344_5566_7788;
+        cpu.execute(&mut bus, fp_a(63, 3, 0, 1, 0, 26), 0x104);
+        assert_eq!(cpu.fpr[3], 0x3fef_fe80_0000_0000);
+        assert_eq!(cpu.paired1[3], 0x1122_3344_5566_7788);
+
+        cpu.set_paired(4, 1.0, 4.0);
+        cpu.execute(&mut bus, ps(5, 0, 4, 0, 24), 0x108);
+        let res = cpu.paired(5);
+        assert_eq!(res.0.to_bits(), gekko_reciprocal_estimate(1.0).to_bits());
+        assert_eq!(
+            res.1.to_bits(),
+            f64::from(gekko_reciprocal_estimate(4.0) as f32).to_bits()
+        );
+
+        cpu.execute(&mut bus, ps(6, 0, 4, 0, 26), 0x10c);
+        let rsqrt = cpu.paired(6);
+        assert_eq!(
+            rsqrt.0.to_bits(),
+            f64::from(gekko_reciprocal_sqrt_estimate(1.0) as f32).to_bits()
+        );
+        assert_eq!(
+            rsqrt.1.to_bits(),
+            f64::from(gekko_reciprocal_sqrt_estimate(4.0) as f32).to_bits()
+        );
+    }
+
+    #[test]
+    fn gekko_single_precision_ops_read_fb_and_fill_both_lanes() {
+        let mut bus = TestBus::new();
+        let mut cpu = PowerPc750::new();
+        cpu.reset_to(0x100);
+        cpu.msr |= MSR_FP;
+        cpu.fpr[1] = 144.0f64.to_bits();
+        cpu.fpr[2] = 9.0f64.to_bits();
+
+        cpu.execute(&mut bus, fp_a(59, 3, 1, 2, 0, 22), 0x100);
+        assert_eq!(cpu.paired(3), (3.0, 3.0));
+
+        cpu.fpr[2] = 3.75f64.to_bits();
+        cpu.execute(&mut bus, fp_a(63, 4, 1, 2, 0, 12), 0x104);
+        assert_eq!(cpu.paired(4), (3.75, 3.75));
+    }
+
+    #[test]
+    fn gekko_estimate_exceptions_preserve_destination_when_enabled() {
+        let mut bus = TestBus::new();
+        let mut cpu = PowerPc750::new();
+        cpu.reset_to(0x100);
+        cpu.msr |= MSR_FP;
+        cpu.fpscr = FPSCR_VE;
+        cpu.fpr[1] = 0x7ff0_0000_0000_0001;
+        cpu.fpr[2] = 0x0123_4567_89ab_cdef;
+        cpu.paired1[2] = 0xfedc_ba98_7654_3210;
+        cpu.pc = 0x104;
+        cpu.execute(&mut bus, fp_a(59, 2, 0, 1, 0, 24), 0x100);
+        assert_eq!(cpu.fpr[2], 0x0123_4567_89ab_cdef);
+        assert_eq!(cpu.paired1[2], 0xfedc_ba98_7654_3210);
+        assert_ne!(cpu.fpscr & (FPSCR_FX | FPSCR_VX), 0);
+        assert_eq!(cpu.srr0, 0x100);
         assert_eq!(cpu.pc & 0xffff, 0x0700);
     }
 
