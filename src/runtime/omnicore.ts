@@ -335,7 +335,14 @@ async function loadStagedWithHydration(
 }
 
 const PERSISTENT_RESOURCE_KINDS = [5, 6, 7] as const
-const PERSISTENCE_SLOT = 0
+const PERSISTENT_RESOURCE_SLOTS = [0, 1] as const
+
+interface PersistentResourceBinding {
+  kind: number
+  slot: number
+  key: string
+  last: Uint8Array | null
+}
 
 function readPersistent(exports: OmniExports, kind: number, slot: number): Uint8Array | null {
   const length = exports.omni_persistent_len(kind, slot)
@@ -398,37 +405,45 @@ export async function launchOmniCore(host: HTMLElement, request: OmniLaunchReque
     throw error
   }
 
-  let persistenceKey: string | null = null
-  let persistentKind: number | null = null
-  let lastPersistent: Uint8Array | null = null
+  const persistentResources: PersistentResourceBinding[] = []
   if (request.game) {
-    persistentKind = PERSISTENT_RESOURCE_KINDS.find(
-      (kind) => exports.omni_persistent_len(kind, PERSISTENCE_SLOT) > 0,
-    ) ?? null
-  }
-  if (persistentKind !== null && request.game) {
     try {
       const fingerprint = await fingerprintFile(request.game)
-      persistenceKey = `v1:${request.platform.omniCode}:${persistentKind}:${PERSISTENCE_SLOT}:${fingerprint}`
-      const stored = await loadPersistentResource(persistenceKey)
-      if (stored) writePersistent(exports, persistentKind, PERSISTENCE_SLOT, stored)
-      lastPersistent = readPersistent(exports, persistentKind, PERSISTENCE_SLOT)
+      for (const kind of PERSISTENT_RESOURCE_KINDS) {
+        for (const slot of PERSISTENT_RESOURCE_SLOTS) {
+          if (!exports.omni_persistent_len(kind, slot)) continue
+          const key = `v1:${request.platform.omniCode}:${kind}:${slot}:${fingerprint}`
+          try {
+            const stored = await loadPersistentResource(key)
+            if (stored) writePersistent(exports, kind, slot, stored)
+            persistentResources.push({ kind, slot, key, last: readPersistent(exports, kind, slot) })
+          } catch {
+            // Keep other persistent resources active if one slot is unavailable or corrupt.
+          }
+        }
+      }
     } catch {
-      persistenceKey = null
-      persistentKind = null
-      lastPersistent = null
+      persistentResources.length = 0
     }
   }
 
-  let persistenceWrite: Promise<void> | null = null
+  let persistenceWrite = Promise.resolve()
   const flushPersistence = () => {
-    if (!persistenceKey || persistentKind === null || persistenceWrite) return
-    const bytes = readPersistent(exports, persistentKind, PERSISTENCE_SLOT)
-    if (!bytes || sameBytes(lastPersistent, bytes)) return
-    lastPersistent = bytes
-    persistenceWrite = savePersistentResource(persistenceKey, bytes)
+    if (!persistentResources.length) return
+    const writes: Array<{ resource: PersistentResourceBinding; bytes: Uint8Array }> = []
+    for (const resource of persistentResources) {
+      const bytes = readPersistent(exports, resource.kind, resource.slot)
+      if (!bytes || sameBytes(resource.last, bytes)) continue
+      writes.push({ resource, bytes })
+    }
+    if (!writes.length) return
+    persistenceWrite = persistenceWrite
+      .then(() => Promise.all(writes.map(async ({ resource, bytes }) => {
+        await savePersistentResource(resource.key, bytes)
+        resource.last = bytes
+      })))
+      .then(() => undefined)
       .catch(() => undefined)
-      .finally(() => { persistenceWrite = null })
   }
 
   const video = await createVideoRenderer()
