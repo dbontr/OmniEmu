@@ -108,7 +108,24 @@
         "audio": {
           "rate": 48000,
           "channels": 2
-        }
+        },
+        "persistent": [
+          {
+            "kind": "memoryCard",
+            "slot": 0,
+            "length": 524288
+          },
+          {
+            "kind": "memoryCard",
+            "slot": 1,
+            "length": 524288
+          },
+          {
+            "kind": "storage",
+            "slot": 0,
+            "length": 68
+          }
+        ]
       }
     },
     {

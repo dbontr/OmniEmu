@@ -9,7 +9,7 @@ use crate::platform::PlatformId;
 use crate::resources::{ResourceBlob, ResourceKind};
 use crate::state::{StateReader, StateWriter};
 
-const STATE_VERSION: u32 = 4;
+const STATE_VERSION: u32 = 5;
 const MEM1_SIZE: usize = 24 * 1024 * 1024;
 const ARAM_SIZE: usize = 16 * 1024 * 1024;
 const EFB_SIZE: usize = 2 * 1024 * 1024;
@@ -66,6 +66,7 @@ const EXI_DMA_ADDRESS: usize = 0x6804;
 const EXI_DMA_LENGTH: usize = 0x6808;
 const EXI_DMA_CONTROL: usize = 0x680c;
 const EXI_IMM_DATA: usize = 0x6810;
+const EXI_CHANNEL_STRIDE: usize = 0x14;
 const EXI_STATUS_EXIINTMASK: u32 = 1 << 0;
 const EXI_STATUS_EXIINT: u32 = 1 << 1;
 const EXI_STATUS_TCINTMASK: u32 = 1 << 2;
@@ -309,13 +310,19 @@ impl Default for ExiCardState {
 }
 
 #[derive(Clone, Default)]
-struct ExiState {
+struct ExiChannelState {
     status: u32,
     dma_address: u32,
     dma_length: u32,
     control: u32,
     imm_data: u32,
     card: ExiCardState,
+}
+
+#[derive(Clone, Default)]
+struct ExiState {
+    channel0: ExiChannelState,
+    channel1: ExiChannelState,
     ipl: ExiIplState,
 }
 
@@ -326,7 +333,7 @@ struct GameCubeBoard {
     mmio: Box<[u8]>,
     disc: ResourceBlob,
     ipl_rom: Option<Box<[u8]>>,
-    memory_card: Box<[u8]>,
+    memory_cards: [Box<[u8]>; 2],
     input: InputState,
     audio_dma: AudioDma,
     exi: ExiState,
@@ -353,7 +360,10 @@ impl GameCubeBoard {
             mmio: vec![0; MMIO_SIZE].into_boxed_slice(),
             disc: image,
             ipl_rom,
-            memory_card: vec![0xff; MEMORY_CARD_SIZE].into_boxed_slice(),
+            memory_cards: [
+                vec![0xff; MEMORY_CARD_SIZE].into_boxed_slice(),
+                vec![0xff; MEMORY_CARD_SIZE].into_boxed_slice(),
+            ],
             input: InputState::default(),
             audio_dma: AudioDma::default(),
             exi: ExiState::default(),
@@ -380,7 +390,8 @@ impl GameCubeBoard {
         let ipl = self.exi.ipl.clone();
         self.exi = ExiState::default();
         self.exi.ipl = ipl;
-        self.exi.status = EXI_STATUS_EXTINT | EXI_STATUS_EXT;
+        self.exi.channel0.status = EXI_STATUS_EXTINT | EXI_STATUS_EXT;
+        self.exi.channel1.status = EXI_STATUS_EXTINT | EXI_STATUS_EXT | (1 << 7);
     }
 
     fn write_mem_u32(&mut self, address: u32, value: u32) {
@@ -414,57 +425,56 @@ impl GameCubeBoard {
         self.mmio[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
     }
 
-    fn exi_card_select(&mut self, selected: bool) {
+    fn exi_card_select(card: &mut ExiCardState, memory_card: &mut [u8], selected: bool) {
         if selected {
-            self.exi.card.position = 0;
+            card.position = 0;
             return;
         }
 
-        match self.exi.card.command {
-            0xf1 if self.exi.card.position > 2 => {
-                let base = (self.exi.card.address as usize & (MEMORY_CARD_SIZE - 1))
-                    & !(EXI_CARD_BLOCK_SIZE - 1);
-                self.memory_card[base..base + EXI_CARD_BLOCK_SIZE].fill(0xff);
-                self.exi.card.status |= EXI_CARD_STATUS_READY;
-                self.exi.card.status &= !EXI_CARD_STATUS_BUSY;
-                self.exi.card.interrupt_set = true;
+        match card.command {
+            0xf1 if card.position > 2 => {
+                let base =
+                    (card.address as usize & (MEMORY_CARD_SIZE - 1)) & !(EXI_CARD_BLOCK_SIZE - 1);
+                memory_card[base..base + EXI_CARD_BLOCK_SIZE].fill(0xff);
+                card.status |= EXI_CARD_STATUS_READY;
+                card.status &= !EXI_CARD_STATUS_BUSY;
+                card.interrupt_set = true;
             }
-            0xf2 if self.exi.card.position >= 5 => {
-                let count = (self.exi.card.position - 5).min(128) as usize;
-                let mut address = self.exi.card.address;
+            0xf2 if card.position >= 5 => {
+                let count = (card.position - 5).min(128) as usize;
+                let mut address = card.address;
                 for index in 0..count {
-                    self.memory_card[address as usize & (MEMORY_CARD_SIZE - 1)] =
-                        self.exi.card.programming_buffer[index];
+                    memory_card[address as usize & (MEMORY_CARD_SIZE - 1)] =
+                        card.programming_buffer[index];
                     address = (address & !0x1ff) | (address.wrapping_add(1) & 0x1ff);
                 }
-                self.exi.card.status |= EXI_CARD_STATUS_READY;
-                self.exi.card.status &= !EXI_CARD_STATUS_BUSY;
-                self.exi.card.interrupt_set = true;
+                card.status |= EXI_CARD_STATUS_READY;
+                card.status &= !EXI_CARD_STATUS_BUSY;
+                card.interrupt_set = true;
             }
-            0xf4 if self.exi.card.position > 1 => {
-                self.memory_card.fill(0xff);
-                self.exi.card.status |= EXI_CARD_STATUS_READY;
-                self.exi.card.status &= !EXI_CARD_STATUS_BUSY;
-                self.exi.card.interrupt_set = true;
+            0xf4 if card.position > 1 => {
+                memory_card.fill(0xff);
+                card.status |= EXI_CARD_STATUS_READY;
+                card.status &= !EXI_CARD_STATUS_BUSY;
+                card.interrupt_set = true;
             }
             _ => {}
         }
     }
 
-    fn exi_card_transfer_byte(&mut self, input: u8) -> u8 {
-        let position = self.exi.card.position;
+    fn exi_card_transfer_byte(card: &mut ExiCardState, memory_card: &mut [u8], input: u8) -> u8 {
+        let position = card.position;
         let mut output = 0xff;
         if position == 0 {
-            self.exi.card.command = input;
+            card.command = input;
             if input == 0x89 {
-                self.exi.card.status &=
-                    !(EXI_CARD_STATUS_PROGRAM_ERROR | EXI_CARD_STATUS_ERASE_ERROR);
-                self.exi.card.status |= EXI_CARD_STATUS_READY;
-                self.exi.card.interrupt_set = false;
-                self.exi.card.position = 0;
+                card.status &= !(EXI_CARD_STATUS_PROGRAM_ERROR | EXI_CARD_STATUS_ERASE_ERROR);
+                card.status |= EXI_CARD_STATUS_READY;
+                card.interrupt_set = false;
+                card.position = 0;
             }
         } else {
-            match self.exi.card.command {
+            match card.command {
                 0x00 => {
                     output = if position == 1 {
                         0x80
@@ -475,27 +485,26 @@ impl GameCubeBoard {
                 }
                 0x52 => {
                     match position {
-                        1 => self.exi.card.address = u32::from(input) << 17,
-                        2 => self.exi.card.address |= u32::from(input) << 9,
-                        3 => self.exi.card.address |= u32::from(input & 3) << 7,
-                        4 => self.exi.card.address |= u32::from(input & 0x7f),
+                        1 => card.address = u32::from(input) << 17,
+                        2 => card.address |= u32::from(input) << 9,
+                        3 => card.address |= u32::from(input & 3) << 7,
+                        4 => card.address |= u32::from(input & 0x7f),
                         _ => {}
                     }
                     if position > 1 {
-                        output = self.memory_card
-                            [self.exi.card.address as usize & (MEMORY_CARD_SIZE - 1)];
+                        output = memory_card[card.address as usize & (MEMORY_CARD_SIZE - 1)];
                         if position >= 9 {
-                            self.exi.card.address = (self.exi.card.address & !0x1ff)
-                                | (self.exi.card.address.wrapping_add(1) & 0x1ff);
+                            card.address =
+                                (card.address & !0x1ff) | (card.address.wrapping_add(1) & 0x1ff);
                         }
                     }
                 }
                 0x81 => {
                     if position == 1 {
-                        self.exi.card.interrupt_switch = input;
+                        card.interrupt_switch = input;
                     }
                 }
-                0x83 => output = self.exi.card.status,
+                0x83 => output = card.status,
                 0x85 => {
                     output = if position == 1 || position & 1 == 0 {
                         0xc2
@@ -504,26 +513,26 @@ impl GameCubeBoard {
                     };
                 }
                 0xf1 => match position {
-                    1 => self.exi.card.address = u32::from(input) << 17,
-                    2 => self.exi.card.address |= u32::from(input) << 9,
+                    1 => card.address = u32::from(input) << 17,
+                    2 => card.address |= u32::from(input) << 9,
                     _ => {}
                 },
                 0xf2 => {
                     match position {
-                        1 => self.exi.card.address = u32::from(input) << 17,
-                        2 => self.exi.card.address |= u32::from(input) << 9,
-                        3 => self.exi.card.address |= u32::from(input & 3) << 7,
-                        4 => self.exi.card.address |= u32::from(input & 0x7f),
+                        1 => card.address = u32::from(input) << 17,
+                        2 => card.address |= u32::from(input) << 9,
+                        3 => card.address |= u32::from(input & 3) << 7,
+                        4 => card.address |= u32::from(input & 0x7f),
                         _ => {}
                     }
                     if position >= 5 {
-                        self.exi.card.programming_buffer[((position - 5) & 0x7f) as usize] = input;
+                        card.programming_buffer[((position - 5) & 0x7f) as usize] = input;
                     }
                 }
                 _ => {}
             }
         }
-        self.exi.card.position = self.exi.card.position.wrapping_add(1);
+        card.position = card.position.wrapping_add(1);
         output
     }
 
@@ -565,14 +574,39 @@ impl GameCubeBoard {
         }
     }
 
-    fn exi_chip_select(&self) -> u8 {
-        ((self.exi.status & EXI_STATUS_CHIP_SELECT_MASK) >> 7) as u8
+    fn exi_channel(&self, channel: usize) -> &ExiChannelState {
+        match channel {
+            0 => &self.exi.channel0,
+            1 => &self.exi.channel1,
+            _ => unreachable!("GameCube EXI channel {channel} is not modeled"),
+        }
     }
 
-    fn exi_transfer_byte(&mut self, input: u8) -> u8 {
-        match self.exi_chip_select() {
-            1 => self.exi_card_transfer_byte(input),
-            2 => self.exi_ipl_transfer_byte(input),
+    fn exi_channel_mut(&mut self, channel: usize) -> &mut ExiChannelState {
+        match channel {
+            0 => &mut self.exi.channel0,
+            1 => &mut self.exi.channel1,
+            _ => unreachable!("GameCube EXI channel {channel} is not modeled"),
+        }
+    }
+
+    fn exi_chip_select(&self, channel: usize) -> u8 {
+        ((self.exi_channel(channel).status & EXI_STATUS_CHIP_SELECT_MASK) >> 7) as u8
+    }
+
+    fn exi_transfer_byte(&mut self, channel: usize, input: u8) -> u8 {
+        match (channel, self.exi_chip_select(channel)) {
+            (0, 1) => Self::exi_card_transfer_byte(
+                &mut self.exi.channel0.card,
+                &mut self.memory_cards[0],
+                input,
+            ),
+            (0, 2) => self.exi_ipl_transfer_byte(input),
+            (1, 1) => Self::exi_card_transfer_byte(
+                &mut self.exi.channel1.card,
+                &mut self.memory_cards[1],
+                input,
+            ),
             _ => 0xff,
         }
     }
@@ -598,130 +632,182 @@ impl GameCubeBoard {
     }
 
     fn refresh_exi_interrupt(&mut self) {
-        if self.exi.card.interrupt_switch != 0 && self.exi.card.interrupt_set {
-            self.exi.status |= EXI_STATUS_EXIINT;
+        for channel in 0..=1 {
+            let state = self.exi_channel_mut(channel);
+            if state.card.interrupt_switch != 0 && state.card.interrupt_set {
+                state.status |= EXI_STATUS_EXIINT;
+            }
         }
-        let active = self.exi.status & EXI_STATUS_EXIINT != 0
-            && self.exi.status & EXI_STATUS_EXIINTMASK != 0
-            || self.exi.status & EXI_STATUS_TCINT != 0
-                && self.exi.status & EXI_STATUS_TCINTMASK != 0
-            || self.exi.status & EXI_STATUS_EXTINT != 0
-                && self.exi.status & EXI_STATUS_EXTINTMASK != 0;
+        let active = [self.exi.channel0.status, self.exi.channel1.status]
+            .into_iter()
+            .any(|status| {
+                status & EXI_STATUS_EXIINT != 0 && status & EXI_STATUS_EXIINTMASK != 0
+                    || status & EXI_STATUS_TCINT != 0 && status & EXI_STATUS_TCINTMASK != 0
+                    || status & EXI_STATUS_EXTINT != 0 && status & EXI_STATUS_EXTINTMASK != 0
+            });
         self.set_pi_cause(PI_INT_EXI, active);
     }
 
-    fn write_exi_status(&mut self, value: u32) {
-        let previous_select = self.exi_chip_select();
+    fn write_exi_status(&mut self, channel: usize, value: u32) {
+        let previous_select = self.exi_chip_select(channel);
         let writable = EXI_STATUS_EXIINTMASK
             | EXI_STATUS_TCINTMASK
             | (0x7 << 4)
             | EXI_STATUS_CHIP_SELECT_MASK
             | EXI_STATUS_EXTINTMASK
-            | EXI_STATUS_ROMDIS;
-        let mut status = (self.exi.status & !writable) | (value & writable) | EXI_STATUS_EXT;
-        if value & EXI_STATUS_EXIINT != 0 {
-            status &= !EXI_STATUS_EXIINT;
-            self.exi.card.interrupt_set = false;
+            | if channel == 0 { EXI_STATUS_ROMDIS } else { 0 };
+        {
+            let state = self.exi_channel_mut(channel);
+            let mut status = (state.status & !writable) | (value & writable) | EXI_STATUS_EXT;
+            if value & EXI_STATUS_EXIINT != 0 {
+                status &= !EXI_STATUS_EXIINT;
+            }
+            if value & EXI_STATUS_TCINT != 0 {
+                status &= !EXI_STATUS_TCINT;
+            }
+            if value & EXI_STATUS_EXTINT != 0 {
+                status &= !EXI_STATUS_EXTINT;
+            }
+            state.status = status;
         }
-        if value & EXI_STATUS_TCINT != 0 {
-            status &= !EXI_STATUS_TCINT;
-        }
-        if value & EXI_STATUS_EXTINT != 0 {
-            status &= !EXI_STATUS_EXTINT;
-        }
-        self.exi.status = status;
-        let selected = self.exi_chip_select();
+
+        let selected = self.exi_chip_select(channel);
         if previous_select == 1 && selected != 1 {
-            self.exi_card_select(false);
+            match channel {
+                0 => Self::exi_card_select(
+                    &mut self.exi.channel0.card,
+                    &mut self.memory_cards[0],
+                    false,
+                ),
+                1 => Self::exi_card_select(
+                    &mut self.exi.channel1.card,
+                    &mut self.memory_cards[1],
+                    false,
+                ),
+                _ => {}
+            }
         }
         if previous_select != 1 && selected == 1 {
-            self.exi_card_select(true);
+            match channel {
+                0 => Self::exi_card_select(
+                    &mut self.exi.channel0.card,
+                    &mut self.memory_cards[0],
+                    true,
+                ),
+                1 => Self::exi_card_select(
+                    &mut self.exi.channel1.card,
+                    &mut self.memory_cards[1],
+                    true,
+                ),
+                _ => {}
+            }
         }
-        if previous_select != 2 && selected == 2 {
+        if channel == 0 && previous_select != 2 && selected == 2 {
             self.exi_ipl_select();
         }
         self.refresh_exi_interrupt();
     }
 
-    fn exi_dma_read(&mut self) {
-        let Some(start) = memory_index(self.exi.dma_address) else {
+    fn exi_dma_read(&mut self, channel: usize) {
+        let (dma_address, dma_length, card_command, card_address) = {
+            let state = self.exi_channel(channel);
+            (
+                state.dma_address,
+                state.dma_length,
+                state.card.command,
+                state.card.address,
+            )
+        };
+        let Some(start) = memory_index(dma_address) else {
             return;
         };
-        let count = (self.exi.dma_length as usize).min(self.mem1.len().saturating_sub(start));
-        if self.exi_chip_select() == 1 && self.exi.card.command == 0x52 {
-            let address = self.exi.card.address as usize;
+        let count = (dma_length as usize).min(self.mem1.len().saturating_sub(start));
+        if self.exi_chip_select(channel) == 1 && card_command == 0x52 {
+            let address = card_address as usize;
             for index in 0..count {
                 self.mem1[start + index] =
-                    self.memory_card[(address + index) & (MEMORY_CARD_SIZE - 1)];
+                    self.memory_cards[channel][(address + index) & (MEMORY_CARD_SIZE - 1)];
             }
         } else {
             for index in 0..count {
-                self.mem1[start + index] = self.exi_transfer_byte(0);
+                self.mem1[start + index] = self.exi_transfer_byte(channel, 0);
             }
         }
     }
 
-    fn exi_dma_write(&mut self) {
-        let Some(start) = memory_index(self.exi.dma_address) else {
+    fn exi_dma_write(&mut self, channel: usize) {
+        let (dma_address, dma_length, card_command, card_address) = {
+            let state = self.exi_channel(channel);
+            (
+                state.dma_address,
+                state.dma_length,
+                state.card.command,
+                state.card.address,
+            )
+        };
+        let Some(start) = memory_index(dma_address) else {
             return;
         };
-        let count = (self.exi.dma_length as usize).min(self.mem1.len().saturating_sub(start));
-        if self.exi_chip_select() == 1 && self.exi.card.command == 0xf2 {
-            let address = self.exi.card.address as usize;
+        let count = (dma_length as usize).min(self.mem1.len().saturating_sub(start));
+        if self.exi_chip_select(channel) == 1 && card_command == 0xf2 {
+            let address = card_address as usize;
             for index in 0..count {
-                self.memory_card[(address + index) & (MEMORY_CARD_SIZE - 1)] =
+                self.memory_cards[channel][(address + index) & (MEMORY_CARD_SIZE - 1)] =
                     self.mem1[start + index];
             }
-            self.exi.card.status |= EXI_CARD_STATUS_READY;
-            self.exi.card.status &= !EXI_CARD_STATUS_BUSY;
-            self.exi.card.interrupt_set = true;
-            self.exi.card.position = 0;
+            let state = self.exi_channel_mut(channel);
+            state.card.status |= EXI_CARD_STATUS_READY;
+            state.card.status &= !EXI_CARD_STATUS_BUSY;
+            state.card.interrupt_set = true;
+            state.card.position = 0;
         } else {
             for index in 0..count {
-                self.exi_transfer_byte(self.mem1[start + index]);
+                let byte = self.mem1[start + index];
+                self.exi_transfer_byte(channel, byte);
             }
         }
     }
 
-    fn write_exi_control(&mut self, value: u32) {
-        self.exi.control = value;
-        if value & 1 == 0 || self.exi_chip_select() == 0 {
+    fn write_exi_control(&mut self, channel: usize, value: u32) {
+        self.exi_channel_mut(channel).control = value;
+        if value & 1 == 0 || self.exi_chip_select(channel) == 0 {
             return;
         }
         let rw = (value >> 2) & 3;
         if value & 2 != 0 {
             match rw {
-                0 => self.exi_dma_read(),
-                1 => self.exi_dma_write(),
+                0 => self.exi_dma_read(channel),
+                1 => self.exi_dma_write(channel),
                 _ => {}
             }
         } else {
             let count = (((value >> 4) & 3) + 1) as usize;
-            let input = self.exi.imm_data.to_be_bytes();
+            let input = self.exi_channel(channel).imm_data.to_be_bytes();
             let mut output = [0u8; 4];
             match rw {
                 0 => {
                     for byte in output.iter_mut().take(count) {
-                        *byte = self.exi_transfer_byte(0);
+                        *byte = self.exi_transfer_byte(channel, 0);
                     }
-                    self.exi.imm_data = u32::from_be_bytes(output);
+                    self.exi_channel_mut(channel).imm_data = u32::from_be_bytes(output);
                 }
                 1 => {
                     for byte in input.into_iter().take(count) {
-                        self.exi_transfer_byte(byte);
+                        self.exi_transfer_byte(channel, byte);
                     }
                 }
                 2 => {
                     for (index, byte) in input.into_iter().take(count).enumerate() {
-                        output[index] = self.exi_transfer_byte(byte);
+                        output[index] = self.exi_transfer_byte(channel, byte);
                     }
-                    self.exi.imm_data = u32::from_be_bytes(output);
+                    self.exi_channel_mut(channel).imm_data = u32::from_be_bytes(output);
                 }
                 _ => {}
             }
         }
-        self.exi.control &= !1;
-        self.exi.status |= EXI_STATUS_TCINT;
+        let state = self.exi_channel_mut(channel);
+        state.control &= !1;
+        state.status |= EXI_STATUS_TCINT;
         self.refresh_exi_interrupt();
     }
 
@@ -1149,25 +1235,54 @@ impl GameCubeBoard {
         self.mmio_read_u16_raw(offset)
     }
 
+    fn decode_exi_register(offset: usize) -> Option<(usize, usize)> {
+        let relative = offset.checked_sub(EXI_STATUS)?;
+        let channel = relative / EXI_CHANNEL_STRIDE;
+        if channel > 1 {
+            return None;
+        }
+        let register = EXI_STATUS + relative % EXI_CHANNEL_STRIDE;
+        matches!(
+            register,
+            EXI_STATUS | EXI_DMA_ADDRESS | EXI_DMA_LENGTH | EXI_DMA_CONTROL | EXI_IMM_DATA
+        )
+        .then_some((channel, register))
+    }
+
     fn read_mmio32(&mut self, offset: usize) -> u32 {
         if (SI_CHANNEL_0_OUT..SI_IO_BUFFER).contains(&offset) {
             self.refresh_si_channels();
         }
-        match offset {
-            EXI_STATUS => {
-                self.exi.status |= EXI_STATUS_EXT;
+        if let Some((channel, register)) = Self::decode_exi_register(offset) {
+            if register == EXI_STATUS {
+                self.exi_channel_mut(channel).status |= EXI_STATUS_EXT;
                 self.refresh_exi_interrupt();
-                self.exi.status
             }
-            EXI_DMA_ADDRESS => self.exi.dma_address,
-            EXI_DMA_LENGTH => self.exi.dma_length,
-            EXI_DMA_CONTROL => self.exi.control,
-            EXI_IMM_DATA => self.exi.imm_data,
-            _ => self.mmio_read_u32_raw(offset),
+            let state = self.exi_channel(channel);
+            return match register {
+                EXI_STATUS => state.status,
+                EXI_DMA_ADDRESS => state.dma_address,
+                EXI_DMA_LENGTH => state.dma_length,
+                EXI_DMA_CONTROL => state.control,
+                EXI_IMM_DATA => state.imm_data,
+                _ => unreachable!(),
+            };
         }
+        self.mmio_read_u32_raw(offset)
     }
 
     fn write_mmio32(&mut self, offset: usize, value: u32) {
+        if let Some((channel, register)) = Self::decode_exi_register(offset) {
+            match register {
+                EXI_STATUS => self.write_exi_status(channel, value),
+                EXI_DMA_ADDRESS => self.exi_channel_mut(channel).dma_address = value & !0x1f,
+                EXI_DMA_LENGTH => self.exi_channel_mut(channel).dma_length = value,
+                EXI_DMA_CONTROL => self.write_exi_control(channel, value),
+                EXI_IMM_DATA => self.exi_channel_mut(channel).imm_data = value,
+                _ => unreachable!(),
+            }
+            return;
+        }
         match offset {
             PI_CAUSE => {}
             PI_MASK => self.mmio_write_u32_raw(offset, value),
@@ -1177,11 +1292,6 @@ impl GameCubeBoard {
                 self.service_di();
             }
             SI_COM_CSR => self.write_si_csr(value),
-            EXI_STATUS => self.write_exi_status(value),
-            EXI_DMA_ADDRESS => self.exi.dma_address = value & !0x1f,
-            EXI_DMA_LENGTH => self.exi.dma_length = value,
-            EXI_DMA_CONTROL => self.write_exi_control(value),
-            EXI_IMM_DATA => self.exi.imm_data = value,
             VI_PRERETRACE_HI | VI_POSTRETRACE_HI => {
                 self.write_mmio16(offset, (value >> 16) as u16);
                 self.write_mmio16(offset + 2, value as u16);
@@ -1207,29 +1317,58 @@ impl GameCubeBoard {
         Ok(entry)
     }
 
+    fn save_exi_channel(channel: &ExiChannelState, out: &mut StateWriter) {
+        out.u32(channel.status);
+        out.u32(channel.dma_address);
+        out.u32(channel.dma_length);
+        out.u32(channel.control);
+        out.u32(channel.imm_data);
+        out.u8(channel.card.status);
+        out.u8(channel.card.interrupt_switch);
+        out.u8(u8::from(channel.card.interrupt_set));
+        out.u8(channel.card.command);
+        out.u32(channel.card.position);
+        out.u32(channel.card.address);
+        out.blob(&channel.card.programming_buffer);
+    }
+
+    fn load_exi_channel(
+        channel: &mut ExiChannelState,
+        input: &mut StateReader<'_>,
+        label: &str,
+    ) -> Result<(), String> {
+        channel.status = input.u32()?;
+        channel.dma_address = input.u32()?;
+        channel.dma_length = input.u32()?;
+        channel.control = input.u32()?;
+        channel.imm_data = input.u32()?;
+        channel.card.status = input.u8()?;
+        channel.card.interrupt_switch = input.u8()?;
+        channel.card.interrupt_set = input.u8()? != 0;
+        channel.card.command = input.u8()?;
+        channel.card.position = input.u32()?;
+        channel.card.address = input.u32()?;
+        Self::load_blob(
+            input,
+            &mut channel.card.programming_buffer,
+            &format!("{label} memory-card programming buffer"),
+        )
+    }
+
     fn save(&self, out: &mut StateWriter) {
         out.blob(&self.mem1);
         out.blob(&self.aram);
         out.blob(&self.efb);
         out.blob(&self.mmio);
-        out.blob(&self.memory_card);
+        out.blob(&self.memory_cards[0]);
+        out.blob(&self.memory_cards[1]);
         out.u32(self.audio_dma.source);
         out.u32(self.audio_dma.cursor);
         out.u16(self.audio_dma.blocks);
         out.u16(self.audio_dma.remaining);
         out.u8(u8::from(self.audio_dma.enabled));
-        out.u32(self.exi.status);
-        out.u32(self.exi.dma_address);
-        out.u32(self.exi.dma_length);
-        out.u32(self.exi.control);
-        out.u32(self.exi.imm_data);
-        out.u8(self.exi.card.status);
-        out.u8(self.exi.card.interrupt_switch);
-        out.u8(u8::from(self.exi.card.interrupt_set));
-        out.u8(self.exi.card.command);
-        out.u32(self.exi.card.position);
-        out.u32(self.exi.card.address);
-        out.blob(&self.exi.card.programming_buffer);
+        Self::save_exi_channel(&self.exi.channel0, out);
+        Self::save_exi_channel(&self.exi.channel1, out);
         out.u32(self.exi.ipl.command);
         out.u8(self.exi.ipl.command_bytes);
         out.u32(self.exi.ipl.cursor);
@@ -1243,28 +1382,15 @@ impl GameCubeBoard {
         Self::load_blob(input, &mut self.aram, "ARAM")?;
         Self::load_blob(input, &mut self.efb, "EFB")?;
         Self::load_blob(input, &mut self.mmio, "MMIO")?;
-        Self::load_blob(input, &mut self.memory_card, "memory card")?;
+        Self::load_blob(input, &mut self.memory_cards[0], "slot-A memory card")?;
+        Self::load_blob(input, &mut self.memory_cards[1], "slot-B memory card")?;
         self.audio_dma.source = input.u32()?;
         self.audio_dma.cursor = input.u32()?;
         self.audio_dma.blocks = input.u16()?;
         self.audio_dma.remaining = input.u16()?;
         self.audio_dma.enabled = input.u8()? != 0;
-        self.exi.status = input.u32()?;
-        self.exi.dma_address = input.u32()?;
-        self.exi.dma_length = input.u32()?;
-        self.exi.control = input.u32()?;
-        self.exi.imm_data = input.u32()?;
-        self.exi.card.status = input.u8()?;
-        self.exi.card.interrupt_switch = input.u8()?;
-        self.exi.card.interrupt_set = input.u8()? != 0;
-        self.exi.card.command = input.u8()?;
-        self.exi.card.position = input.u32()?;
-        self.exi.card.address = input.u32()?;
-        Self::load_blob(
-            input,
-            &mut self.exi.card.programming_buffer,
-            "EXI memory-card programming buffer",
-        )?;
+        Self::load_exi_channel(&mut self.exi.channel0, input, "EXI channel 0")?;
+        Self::load_exi_channel(&mut self.exi.channel1, input, "EXI channel 1")?;
         self.exi.ipl.command = input.u32()?;
         self.exi.ipl.command_bytes = input.u8()?.min(4);
         self.exi.ipl.cursor = input.u32()?;
@@ -1540,7 +1666,7 @@ impl Machine for GameCubeMachine {
 
     fn persistent_len(&self, kind: ResourceKind, slot: u32) -> usize {
         match (kind, slot) {
-            (ResourceKind::MemoryCard, 0) => MEMORY_CARD_SIZE,
+            (ResourceKind::MemoryCard, 0 | 1) => MEMORY_CARD_SIZE,
             (ResourceKind::Storage, 0) => EXI_IPL_SRAM_SIZE,
             _ => 0,
         }
@@ -1548,21 +1674,21 @@ impl Machine for GameCubeMachine {
 
     fn read_persistent(&self, kind: ResourceKind, slot: u32, out: &mut [u8]) -> Result<(), String> {
         match (kind, slot) {
-            (ResourceKind::MemoryCard, 0) if out.len() == MEMORY_CARD_SIZE => {
-                out.copy_from_slice(&self.board.memory_card);
+            (ResourceKind::MemoryCard, 0 | 1) if out.len() == MEMORY_CARD_SIZE => {
+                out.copy_from_slice(&self.board.memory_cards[slot as usize]);
                 Ok(())
             }
             (ResourceKind::Storage, 0) if out.len() == EXI_IPL_SRAM_SIZE => {
                 out.copy_from_slice(&self.board.exi.ipl.sram);
                 Ok(())
             }
-            (ResourceKind::MemoryCard, 0) => {
+            (ResourceKind::MemoryCard, 0 | 1) => {
                 Err("GameCube memory-card output has the wrong size".into())
             }
             (ResourceKind::Storage, 0) => Err("GameCube IPL SRAM output has the wrong size".into()),
-            _ => {
-                Err("GameCube persistent resources are MemoryCard slot 0 and Storage slot 0".into())
-            }
+            _ => Err(
+                "GameCube persistent resources are MemoryCard slots 0-1 and Storage slot 0".into(),
+            ),
         }
     }
 
@@ -1573,21 +1699,21 @@ impl Machine for GameCubeMachine {
         data: &[u8],
     ) -> Result<(), String> {
         match (kind, slot) {
-            (ResourceKind::MemoryCard, 0) if data.len() == MEMORY_CARD_SIZE => {
-                self.board.memory_card.copy_from_slice(data);
+            (ResourceKind::MemoryCard, 0 | 1) if data.len() == MEMORY_CARD_SIZE => {
+                self.board.memory_cards[slot as usize].copy_from_slice(data);
                 Ok(())
             }
             (ResourceKind::Storage, 0) if data.len() == EXI_IPL_SRAM_SIZE => {
                 self.board.exi.ipl.sram.copy_from_slice(data);
                 Ok(())
             }
-            (ResourceKind::MemoryCard, 0) => {
+            (ResourceKind::MemoryCard, 0 | 1) => {
                 Err("GameCube memory-card image has the wrong size".into())
             }
             (ResourceKind::Storage, 0) => Err("GameCube IPL SRAM image has the wrong size".into()),
-            _ => {
-                Err("GameCube persistent resources are MemoryCard slot 0 and Storage slot 0".into())
-            }
+            _ => Err(
+                "GameCube persistent resources are MemoryCard slots 0-1 and Storage slot 0".into(),
+            ),
         }
     }
 }
@@ -1683,23 +1809,49 @@ mod tests {
         assert_ne!(board.mmio_read_u32_raw(SI_COM_CSR) & (1 << 31), 0);
     }
 
+    fn exi_register(channel: usize, register: usize) -> usize {
+        register + channel * EXI_CHANNEL_STRIDE
+    }
+
+    fn exi_select_card_channel(board: &mut GameCubeBoard, channel: usize) {
+        board.write_mmio32(exi_register(channel, EXI_STATUS), 1 << 7);
+    }
+
+    fn exi_reselect_card_channel(board: &mut GameCubeBoard, channel: usize) {
+        board.write_mmio32(exi_register(channel, EXI_STATUS), 0);
+        exi_select_card_channel(board, channel);
+    }
+
+    fn exi_imm_write_channel(board: &mut GameCubeBoard, channel: usize, value: u32, length: u32) {
+        board.write_mmio32(exi_register(channel, EXI_IMM_DATA), value);
+        board.write_mmio32(
+            exi_register(channel, EXI_DMA_CONTROL),
+            1 | (1 << 2) | ((length - 1) << 4),
+        );
+    }
+
+    fn exi_imm_read_channel(board: &mut GameCubeBoard, channel: usize, length: u32) -> u32 {
+        board.write_mmio32(
+            exi_register(channel, EXI_DMA_CONTROL),
+            1 | ((length - 1) << 4),
+        );
+        board.read_mmio32(exi_register(channel, EXI_IMM_DATA))
+    }
+
     fn exi_select_card(board: &mut GameCubeBoard) {
-        board.write_mmio32(EXI_STATUS, 1 << 7);
+        exi_select_card_channel(board, 0);
     }
 
     fn exi_reselect_card(board: &mut GameCubeBoard) {
-        board.write_mmio32(EXI_STATUS, 0);
-        exi_select_card(board);
+        exi_reselect_card_channel(board, 0);
     }
 
     fn exi_imm_write(board: &mut GameCubeBoard, value: u32, length: u32) {
-        board.write_mmio32(EXI_IMM_DATA, value);
-        board.write_mmio32(EXI_DMA_CONTROL, 1 | (1 << 2) | ((length - 1) << 4));
+        exi_imm_write_channel(board, 0, value, length);
     }
 
     fn exi_imm_read(board: &mut GameCubeBoard, length: u32) -> u32 {
-        board.write_mmio32(EXI_DMA_CONTROL, 1 | ((length - 1) << 4));
-        board.read_mmio32(EXI_IMM_DATA)
+        exi_imm_read_channel(board, 0, length)
     }
 
     fn exi_select_ipl(board: &mut GameCubeBoard) {
@@ -1821,7 +1973,7 @@ mod tests {
     #[test]
     fn exi_memory_card_dma_reads_programs_and_erases_guest_visible_storage() {
         let mut board = idle_board();
-        board.memory_card[0x120..0x128].copy_from_slice(b"OMNICORE");
+        board.memory_cards[0][0x120..0x128].copy_from_slice(b"OMNICORE");
         exi_select_card(&mut board);
         exi_imm_write(&mut board, 0x5200_0002, 4);
         exi_imm_write(&mut board, 0x2000_0000, 1);
@@ -1837,15 +1989,59 @@ mod tests {
         board.write_mmio32(EXI_DMA_ADDRESS, 0x2000);
         board.write_mmio32(EXI_DMA_LENGTH, 8);
         board.write_mmio32(EXI_DMA_CONTROL, 1 | 2 | (1 << 2));
-        assert_eq!(&board.memory_card[0x180..0x188], b"GAMECUBE");
+        assert_eq!(&board.memory_cards[0][0x180..0x188], b"GAMECUBE");
 
-        board.memory_card[0x2000..0x4000].fill(0x5a);
+        board.memory_cards[0][0x2000..0x4000].fill(0x5a);
         exi_reselect_card(&mut board);
         exi_imm_write(&mut board, 0xf100_1000, 3);
         board.write_mmio32(EXI_STATUS, 0);
-        assert!(board.memory_card[0x2000..0x4000]
+        assert!(board.memory_cards[0][0x2000..0x4000]
             .iter()
             .all(|byte| *byte == 0xff));
+    }
+
+    #[test]
+    fn exi_slot_b_uses_channel_one_and_independent_memory_card() {
+        let mut board = idle_board();
+        let channel = 1;
+        board.memory_cards[0][0x120..0x128].copy_from_slice(b"SLOTA123");
+        board.memory_cards[1][0x120..0x128].copy_from_slice(b"SLOTB123");
+
+        exi_reselect_card_channel(&mut board, channel);
+        exi_imm_write_channel(&mut board, channel, 0x5200_0002, 4);
+        exi_imm_write_channel(&mut board, channel, 0x2000_0000, 1);
+        board.write_mmio32(exi_register(channel, EXI_DMA_ADDRESS), 0x1000);
+        board.write_mmio32(exi_register(channel, EXI_DMA_LENGTH), 8);
+        board.write_mmio32(exi_register(channel, EXI_DMA_CONTROL), 1 | 2);
+        assert_eq!(&board.mem1[0x1000..0x1008], b"SLOTB123");
+        assert_eq!(&board.memory_cards[0][0x120..0x128], b"SLOTA123");
+
+        board.mem1[0x2000..0x2008].copy_from_slice(b"SECOND!!");
+        exi_reselect_card_channel(&mut board, channel);
+        exi_imm_write_channel(&mut board, channel, 0xf200_0003, 4);
+        exi_imm_write_channel(&mut board, channel, 0, 1);
+        board.write_mmio32(exi_register(channel, EXI_DMA_ADDRESS), 0x2000);
+        board.write_mmio32(exi_register(channel, EXI_DMA_LENGTH), 8);
+        board.write_mmio32(exi_register(channel, EXI_DMA_CONTROL), 1 | 2 | (1 << 2));
+        assert_eq!(&board.memory_cards[1][0x180..0x188], b"SECOND!!");
+        assert!(board.memory_cards[0][0x180..0x188]
+            .iter()
+            .all(|byte| *byte == 0xff));
+
+        board.write_mmio32(
+            exi_register(channel, EXI_STATUS),
+            (1 << 7) | EXI_STATUS_TCINTMASK | EXI_STATUS_TCINT,
+        );
+        assert_eq!(
+            board.read_mmio32(exi_register(channel, EXI_STATUS)) & EXI_STATUS_TCINT,
+            0
+        );
+        exi_imm_write_channel(&mut board, channel, 0x8300_0000, 1);
+        assert_ne!(
+            board.read_mmio32(exi_register(channel, EXI_STATUS)) & EXI_STATUS_TCINT,
+            0
+        );
+        assert_ne!(board.mmio_read_u32_raw(PI_CAUSE) & PI_INT_EXI, 0);
     }
 
     #[test]
@@ -1924,14 +2120,21 @@ mod tests {
     }
 
     #[test]
-    fn machine_state_and_memory_card_round_trip_are_deterministic() {
+    fn machine_state_and_memory_cards_round_trip_are_deterministic() {
         let image = ResourceBlob::from_bytes(&dol_bytes(&[0x4800_0000]));
         let mut machine = GameCubeMachine::from_image(image.clone()).unwrap();
         machine.cpu.gpr[7] = 0xfeed_beef;
         machine.board.mem1[0x6000..0x6004].copy_from_slice(&0x1234_5678u32.to_be_bytes());
-        let card = vec![0x3c; MEMORY_CARD_SIZE];
+        machine.board.exi.channel1.imm_data = 0x89ab_cdef;
+        machine.board.exi.channel1.card.address = 0x2468;
+
+        let card_a = vec![0x3c; MEMORY_CARD_SIZE];
+        let card_b = vec![0xa7; MEMORY_CARD_SIZE];
         machine
-            .write_persistent(ResourceKind::MemoryCard, 0, &card)
+            .write_persistent(ResourceKind::MemoryCard, 0, &card_a)
+            .unwrap();
+        machine
+            .write_persistent(ResourceKind::MemoryCard, 1, &card_b)
             .unwrap();
         let mut sram = default_exi_sram();
         sram[0..4].copy_from_slice(&1234u32.to_be_bytes());
@@ -1945,16 +2148,29 @@ mod tests {
         restored.load_state(&saved).unwrap();
         assert_eq!(restored.cpu.gpr[7], 0xfeed_beef);
         assert_eq!(restored.board.read32(0x8000_6000), 0x1234_5678);
-        let mut card_out = vec![0; MEMORY_CARD_SIZE];
+        assert_eq!(restored.board.exi.channel1.imm_data, 0x89ab_cdef);
+        assert_eq!(restored.board.exi.channel1.card.address, 0x2468);
+
+        let mut card_a_out = vec![0; MEMORY_CARD_SIZE];
+        let mut card_b_out = vec![0; MEMORY_CARD_SIZE];
         restored
-            .read_persistent(ResourceKind::MemoryCard, 0, &mut card_out)
+            .read_persistent(ResourceKind::MemoryCard, 0, &mut card_a_out)
             .unwrap();
-        assert_eq!(card_out, card);
+        restored
+            .read_persistent(ResourceKind::MemoryCard, 1, &mut card_b_out)
+            .unwrap();
+        assert_eq!(card_a_out, card_a);
+        assert_eq!(card_b_out, card_b);
+
         let mut sram_out = [0u8; EXI_IPL_SRAM_SIZE];
         restored
             .read_persistent(ResourceKind::Storage, 0, &mut sram_out)
             .unwrap();
         assert_eq!(sram_out, sram);
+        assert_eq!(
+            restored.persistent_len(ResourceKind::MemoryCard, 1),
+            MEMORY_CARD_SIZE
+        );
         assert_eq!(
             restored.persistent_len(ResourceKind::Storage, 0),
             EXI_IPL_SRAM_SIZE
