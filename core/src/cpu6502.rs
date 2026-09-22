@@ -19,6 +19,8 @@ pub struct Mos6502 {
     pub cycles: u64,
     pub stopped: bool,
     decimal_supported: bool,
+    direct_page_base: u16,
+    stack_page_base: u16,
 }
 
 impl Default for Mos6502 {
@@ -33,6 +35,8 @@ impl Default for Mos6502 {
             cycles: 0,
             stopped: false,
             decimal_supported: true,
+            direct_page_base: 0x0000,
+            stack_page_base: 0x0100,
         }
     }
 }
@@ -43,6 +47,11 @@ impl Mos6502 {
         self.pc = bus.read16(0xfffc);
         self.stopped = false;
         self.cycles = 7;
+    }
+
+    pub fn set_page_bases(&mut self, direct_page_base: u16, stack_page_base: u16) {
+        self.direct_page_base = direct_page_base & 0xff00;
+        self.stack_page_base = stack_page_base & 0xff00;
     }
 
     pub fn set_decimal_supported(&mut self, supported: bool) {
@@ -81,13 +90,13 @@ impl Mos6502 {
         lo | (hi << 8)
     }
     fn zp<B: Bus8>(&mut self, bus: &mut B) -> u16 {
-        self.fetch8(bus) as u16
+        self.direct_page_base | u16::from(self.fetch8(bus))
     }
     fn zpx<B: Bus8>(&mut self, bus: &mut B) -> u16 {
-        self.fetch8(bus).wrapping_add(self.x) as u16
+        self.direct_page_base | u16::from(self.fetch8(bus).wrapping_add(self.x))
     }
     fn zpy<B: Bus8>(&mut self, bus: &mut B) -> u16 {
-        self.fetch8(bus).wrapping_add(self.y) as u16
+        self.direct_page_base | u16::from(self.fetch8(bus).wrapping_add(self.y))
     }
     fn abs<B: Bus8>(&mut self, bus: &mut B) -> u16 {
         self.fetch16(bus)
@@ -104,14 +113,14 @@ impl Mos6502 {
     }
     fn indx<B: Bus8>(&mut self, bus: &mut B) -> u16 {
         let ptr = self.fetch8(bus).wrapping_add(self.x);
-        let lo = bus.read8(ptr as u16) as u16;
-        let hi = bus.read8(ptr.wrapping_add(1) as u16) as u16;
+        let lo = bus.read8(self.direct_page_base | u16::from(ptr)) as u16;
+        let hi = bus.read8(self.direct_page_base | u16::from(ptr.wrapping_add(1))) as u16;
         lo | (hi << 8)
     }
     fn indy<B: Bus8>(&mut self, bus: &mut B) -> (u16, bool) {
         let ptr = self.fetch8(bus);
-        let lo = bus.read8(ptr as u16) as u16;
-        let hi = bus.read8(ptr.wrapping_add(1) as u16) as u16;
+        let lo = bus.read8(self.direct_page_base | u16::from(ptr)) as u16;
+        let hi = bus.read8(self.direct_page_base | u16::from(ptr.wrapping_add(1))) as u16;
         let base = lo | (hi << 8);
         let addr = base.wrapping_add(self.y as u16);
         (addr, base & 0xff00 != addr & 0xff00)
@@ -123,12 +132,12 @@ impl Mos6502 {
         lo | (hi << 8)
     }
     fn push8<B: Bus8>(&mut self, bus: &mut B, value: u8) {
-        bus.write8(0x0100 | self.sp as u16, value);
+        bus.write8(self.stack_page_base | u16::from(self.sp), value);
         self.sp = self.sp.wrapping_sub(1);
     }
     fn pop8<B: Bus8>(&mut self, bus: &mut B) -> u8 {
         self.sp = self.sp.wrapping_add(1);
-        bus.read8(0x0100 | self.sp as u16)
+        bus.read8(self.stack_page_base | u16::from(self.sp))
     }
     fn push16<B: Bus8>(&mut self, bus: &mut B, value: u16) {
         self.push8(bus, (value >> 8) as u8);
@@ -479,6 +488,78 @@ impl Mos6502 {
                 self.sp = result;
                 self.set_zn(result);
                 4 + u32::from(crossed)
+            }
+            0x8b => {
+                // XAA is analog-sensitive on NMOS parts. Magic=$FF is a
+                // documented stable outcome on NES-class 2A03 samples.
+                self.a = self.x & self.fetch8(bus);
+                self.set_zn(self.a);
+                2
+            }
+            0x93 => {
+                let pointer = self.fetch8(bus);
+                let lo = bus.read8(self.direct_page_base | u16::from(pointer)) as u16;
+                let hi =
+                    bus.read8(self.direct_page_base | u16::from(pointer.wrapping_add(1))) as u16;
+                let base = lo | (hi << 8);
+                let address = base.wrapping_add(u16::from(self.y));
+                let value = self.a & self.x & ((base >> 8) as u8).wrapping_add(1);
+                let target = if base & 0xff00 != address & 0xff00 {
+                    (u16::from(value) << 8) | (address & 0x00ff)
+                } else {
+                    address
+                };
+                bus.write8(target, value);
+                6
+            }
+            0x9b => {
+                let base = self.fetch16(bus);
+                let address = base.wrapping_add(u16::from(self.y));
+                self.sp = self.a & self.x;
+                let value = self.sp & ((base >> 8) as u8).wrapping_add(1);
+                let target = if base & 0xff00 != address & 0xff00 {
+                    (u16::from(value) << 8) | (address & 0x00ff)
+                } else {
+                    address
+                };
+                bus.write8(target, value);
+                5
+            }
+            0x9c => {
+                let base = self.fetch16(bus);
+                let address = base.wrapping_add(u16::from(self.x));
+                let value = self.y & ((base >> 8) as u8).wrapping_add(1);
+                let target = if base & 0xff00 != address & 0xff00 {
+                    (u16::from(value) << 8) | (address & 0x00ff)
+                } else {
+                    address
+                };
+                bus.write8(target, value);
+                5
+            }
+            0x9e => {
+                let base = self.fetch16(bus);
+                let address = base.wrapping_add(u16::from(self.y));
+                let value = self.x & ((base >> 8) as u8).wrapping_add(1);
+                let target = if base & 0xff00 != address & 0xff00 {
+                    (u16::from(value) << 8) | (address & 0x00ff)
+                } else {
+                    address
+                };
+                bus.write8(target, value);
+                5
+            }
+            0x9f => {
+                let base = self.fetch16(bus);
+                let address = base.wrapping_add(u16::from(self.y));
+                let value = self.a & self.x & ((base >> 8) as u8).wrapping_add(1);
+                let target = if base & 0xff00 != address & 0xff00 {
+                    (u16::from(value) << 8) | (address & 0x00ff)
+                } else {
+                    address
+                };
+                bus.write8(target, value);
+                5
             }
 
             // Loads
@@ -1267,6 +1348,29 @@ mod tests {
     use crate::bus::Ram64k;
 
     #[test]
+    fn configurable_direct_and_stack_pages_do_not_change_absolute_addressing() {
+        let mut bus = Ram64k::new();
+        bus.load(
+            0x8000,
+            &[
+                0xa9, 0x5a, 0x85, 0x10, 0x8d, 0x10, 0x00, 0x48, 0xa9, 0x00, 0x68,
+            ],
+        );
+        bus.bytes_mut()[0xfffc] = 0x00;
+        bus.bytes_mut()[0xfffd] = 0x80;
+        let mut cpu = Mos6502::default();
+        cpu.set_page_bases(0x2000, 0x2100);
+        cpu.reset(&mut bus);
+        for _ in 0..6 {
+            cpu.step(&mut bus);
+        }
+        assert_eq!(bus.bytes()[0x2010], 0x5a);
+        assert_eq!(bus.bytes()[0x0010], 0x5a);
+        assert_eq!(bus.bytes()[0x21fd], 0x5a);
+        assert_eq!(cpu.a, 0x5a);
+    }
+
+    #[test]
     fn executes_arithmetic_branch_and_store() {
         let mut bus = Ram64k::new();
         bus.load(
@@ -1383,5 +1487,30 @@ mod tests {
         assert_eq!(binary.a, 0x9a);
         assert_eq!(binary.p & FLAG_CARRY, 0);
         assert_ne!(binary.p & FLAG_DECIMAL, 0);
+    }
+
+    #[test]
+    fn every_non_stp_nmos_opcode_has_an_execution_path() {
+        const STP: [u8; 12] = [
+            0x02, 0x12, 0x22, 0x32, 0x42, 0x52, 0x62, 0x72, 0x92, 0xb2, 0xd2, 0xf2,
+        ];
+        for opcode in 0u8..=u8::MAX {
+            let mut bus = Ram64k::new();
+            bus.bytes_mut()[0x8000] = opcode;
+            bus.bytes_mut()[0x8001] = 0;
+            bus.bytes_mut()[0x8002] = 2;
+            bus.bytes_mut()[0xfffc] = 0x00;
+            bus.bytes_mut()[0xfffd] = 0x80;
+            let mut cpu = Mos6502::default();
+            cpu.reset(&mut bus);
+            let cycles = cpu.step(&mut bus);
+            if STP.contains(&opcode) {
+                assert_eq!(cycles, 0, "STP opcode {opcode:02x} should halt");
+                assert!(cpu.stopped, "STP opcode {opcode:02x} should latch stop");
+            } else {
+                assert_ne!(cycles, 0, "opcode {opcode:02x} is missing");
+                assert!(!cpu.stopped, "opcode {opcode:02x} incorrectly halts");
+            }
+        }
     }
 }

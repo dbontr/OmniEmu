@@ -92,6 +92,52 @@ pub extern "C" fn omni_resource_create(kind: u32, slot: u32, len: u64) -> i32 {
 }
 
 #[no_mangle]
+pub extern "C" fn omni_resource_create_streaming(
+    kind: u32,
+    slot: u32,
+    len: u64,
+    max_chunks: u32,
+) -> i32 {
+    let mut state = core().lock().unwrap();
+    let Some(kind) = ResourceKind::from_u32(kind) else {
+        return fail(&mut state, "unknown resource kind");
+    };
+    match state
+        .resources
+        .create_streaming(kind, slot, len, max_chunks as usize)
+    {
+        Ok(()) => 0,
+        Err(error) => fail(&mut state, error),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn omni_resource_pending_start(kind: u32, slot: u32) -> u64 {
+    let state = core().lock().unwrap();
+    let Some(kind) = ResourceKind::from_u32(kind) else {
+        return u64::MAX;
+    };
+    state
+        .resources
+        .get(kind, slot)
+        .and_then(|resource| resource.pending_range())
+        .map_or(u64::MAX, |(start, _)| start)
+}
+
+#[no_mangle]
+pub extern "C" fn omni_resource_pending_end(kind: u32, slot: u32) -> u64 {
+    let state = core().lock().unwrap();
+    let Some(kind) = ResourceKind::from_u32(kind) else {
+        return 0;
+    };
+    state
+        .resources
+        .get(kind, slot)
+        .and_then(|resource| resource.pending_range())
+        .map_or(0, |(_, end)| end)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn omni_resource_write(
     kind: u32,
     slot: u32,

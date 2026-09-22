@@ -16,6 +16,7 @@ pub enum PlatformId {
     Sega32x = 33,
     PcEngine = 34,
     NeoGeo = 35,
+    SuperGrafx = 36,
     PlayStation = 40,
     Nintendo64 = 41,
     Saturn = 42,
@@ -52,6 +53,7 @@ impl PlatformId {
             33 => Self::Sega32x,
             34 => Self::PcEngine,
             35 => Self::NeoGeo,
+            36 => Self::SuperGrafx,
             40 => Self::PlayStation,
             41 => Self::Nintendo64,
             42 => Self::Saturn,
@@ -75,31 +77,70 @@ impl PlatformId {
     pub const fn is_launchable(self) -> bool {
         matches!(
             self,
-            Self::HomePong
+            Self::Odyssey
+                | Self::HomePong
                 | Self::Atari2600
                 | Self::Atari5200
                 | Self::Atari7800
                 | Self::ColecoVision
+                | Self::Intellivision
                 | Self::Nes
                 | Self::MasterSystem
+                | Self::SegaCd
+                | Self::Sega32x
+                | Self::PcEngine
+                | Self::NeoGeo
+                | Self::SuperGrafx
                 | Self::Genesis
                 | Self::Snes
                 | Self::PlayStation
+                | Self::Nintendo64
+                | Self::Saturn
+                | Self::Jaguar
+                | Self::ThreeDo
+                | Self::Dreamcast
+                | Self::PlayStation2
+                | Self::GameCube
+                | Self::Wii
+                | Self::Xbox
+                | Self::Xbox360
+                | Self::PlayStation3
+                | Self::WiiU
+                | Self::Switch
         )
     }
 
     pub const fn support_level(self) -> SupportLevel {
         match self {
-            Self::HomePong => SupportLevel::Playable,
+            Self::Odyssey | Self::HomePong => SupportLevel::Playable,
             Self::Atari2600
             | Self::Atari5200
             | Self::ColecoVision
+            | Self::Intellivision
             | Self::Atari7800
             | Self::Nes
             | Self::MasterSystem
+            | Self::SegaCd
+            | Self::Sega32x
+            | Self::PcEngine
+            | Self::NeoGeo
+            | Self::SuperGrafx
             | Self::Genesis
             | Self::Snes
-            | Self::PlayStation => SupportLevel::Foundation,
+            | Self::PlayStation
+            | Self::Nintendo64
+            | Self::Saturn
+            | Self::Jaguar
+            | Self::ThreeDo
+            | Self::Dreamcast
+            | Self::PlayStation2
+            | Self::GameCube
+            | Self::Wii
+            | Self::Xbox
+            | Self::Xbox360
+            | Self::PlayStation3
+            | Self::WiiU
+            | Self::Switch => SupportLevel::Foundation,
             _ => SupportLevel::Planned,
         }
     }

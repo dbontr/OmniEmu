@@ -1,7 +1,11 @@
 use super::pokey::Pokey;
 use crate::bus::Bus8;
 use crate::cpu6502::Mos6502;
-use crate::input::{AXIS_LEFT_X, AXIS_LEFT_Y, DOWN, FACE_SOUTH, LEFT, RIGHT, SELECT, START, UP};
+use crate::input::{
+    AXIS_LEFT_X, AXIS_LEFT_Y, DOWN, FACE_EAST, FACE_SOUTH, KEYPAD_0, KEYPAD_1, KEYPAD_2, KEYPAD_3,
+    KEYPAD_4, KEYPAD_5, KEYPAD_6, KEYPAD_7, KEYPAD_8, KEYPAD_9, KEYPAD_HASH, KEYPAD_STAR, LEFT,
+    PAUSE, RESET, RIGHT, SELECT, START, UP,
+};
 use crate::kernel::{AudioBuffer, InputState, VideoBuffer};
 use crate::machine::Machine;
 use crate::platform::PlatformId;
@@ -13,32 +17,272 @@ const CPU_HZ: u64 = 1_789_790;
 const FRAME_RATE: f64 = 59.94;
 const CPU_CYCLES_PER_LINE: u16 = 114;
 const SCANLINES: u16 = 262;
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Atari5200Mapper {
+    Linear32K,
+    TwoChip16K,
+    OneChip16K,
+    Standard8K,
+    Standard4K,
+    BountyBob40K,
+    BountyBob40KAlt,
+    SuperCart,
+}
+
+const KNOWN_TWO_CHIP_16K_CRC32: &[u32] = &[
+    0x0480_7705,
+    0x04b2_99a4,
+    0x0af1_9345,
+    0x0f99_6184,
+    0x10f3_3c90,
+    0x1d1c_ee27,
+    0x2a64_0143,
+    0x2c67_6662,
+    0x4019_ecec,
+    0x4336_c2cc,
+    0x536a_70fe,
+    0x5998_3c40,
+    0x69f2_3548,
+    0x6a68_7f9c,
+    0x73b5_b6fb,
+    0x752f_5efd,
+    0x75f5_66df,
+    0x7d81_9a9f,
+    0x84df_4925,
+    0x8873_ef51,
+    0x931a_454a,
+    0xa18a_9a40,
+    0xa976_06ab,
+    0xabc2_d1e4,
+    0xaea6_d2c2,
+    0xb3b8_e314,
+    0xb68d_61e8,
+    0xb8fa_aec3,
+    0xbd52_623b,
+    0xbfd3_0c01,
+    0xc597_c087,
+    0xcfd4_a7f9,
+    0xce07_d9ad,
+    0xd9ae_4518,
+    0xe8b1_30c4,
+    0xecbd_1853,
+    0xecfa_624f,
+    0xf1f4_2bbd,
+    0xfd54_1c80,
+];
+
+fn crc32_ieee(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn raw_16k_mapper(crc32: u32) -> Atari5200Mapper {
+    if KNOWN_TWO_CHIP_16K_CRC32.contains(&crc32) {
+        Atari5200Mapper::TwoChip16K
+    } else {
+        Atari5200Mapper::OneChip16K
+    }
+}
 
 struct Atari5200Cartridge {
     rom: Vec<u8>,
+    mapper: Atari5200Mapper,
+    bounty_bank_4000: u8,
+    bounty_bank_5000: u8,
+    super_bank: u8,
 }
 
 impl Atari5200Cartridge {
-    fn new(rom: &[u8]) -> Result<Self, String> {
-        if rom.is_empty() || rom.len() > 0x8000 {
-            return Err("Atari 5200 cartridge must contain 1-32 KiB".into());
+    fn new(image: &[u8]) -> Result<Self, String> {
+        let (mapper, rom, expected) = if image.len() >= 16 && &image[..4] == b"CART" {
+            let cart_type = u32::from_be_bytes(image[4..8].try_into().unwrap());
+            let (mapper, expected) = match cart_type {
+                4 => (Atari5200Mapper::Linear32K, 0x8000),
+                6 => (Atari5200Mapper::TwoChip16K, 0x4000),
+                7 => (Atari5200Mapper::BountyBob40K, 0xa000),
+                16 => (Atari5200Mapper::OneChip16K, 0x4000),
+                19 => (Atari5200Mapper::Standard8K, 0x2000),
+                20 => (Atari5200Mapper::Standard4K, 0x1000),
+                71 => (Atari5200Mapper::SuperCart, 0x10000),
+                72 => (Atari5200Mapper::SuperCart, 0x20000),
+                73 => (Atari5200Mapper::SuperCart, 0x40000),
+                74 => (Atari5200Mapper::SuperCart, 0x80000),
+                159 => (Atari5200Mapper::BountyBob40KAlt, 0xa000),
+                _ => return Err(format!("unsupported Atari 5200 CART type {cart_type}")),
+            };
+            (mapper, &image[16..], expected)
+        } else {
+            let mapper = match image.len() {
+                0x1000 => Atari5200Mapper::Standard4K,
+                0x2000 => Atari5200Mapper::Standard8K,
+                0x4000 => raw_16k_mapper(crc32_ieee(image)),
+                0x8000 => Atari5200Mapper::Linear32K,
+                0xa000 => Atari5200Mapper::BountyBob40K,
+                0x10000 | 0x20000 | 0x40000 | 0x80000 => Atari5200Mapper::SuperCart,
+                _ => {
+                    return Err(
+                        "Atari 5200 cartridge must be a supported 4/8/16/32/40/64/128/256/512 KiB raw image or CART container"
+                            .into(),
+                    )
+                }
+            };
+            (mapper, image, image.len())
+        };
+
+        if rom.len() != expected {
+            return Err(format!(
+                "Atari 5200 cartridge payload is {} bytes; mapper requires {expected} bytes",
+                rom.len()
+            ));
         }
-        Ok(Self { rom: rom.to_vec() })
+
+        Ok(Self {
+            rom: rom.to_vec(),
+            mapper,
+            bounty_bank_4000: 0,
+            bounty_bank_5000: 0,
+            super_bank: 0,
+        })
     }
 
-    fn read(&self, address: u16) -> u8 {
-        let window = usize::from(address.saturating_sub(0x4000));
-        if self.rom.len() == 0x8000 {
-            self.rom[window & 0x7fff]
-        } else {
-            let base = 0x8000usize.saturating_sub(self.rom.len());
-            if window < base {
-                0xff
-            } else {
-                self.rom[(window - base) % self.rom.len()]
+    fn reset(&mut self) {
+        self.bounty_bank_4000 = 0;
+        self.bounty_bank_5000 = 0;
+        self.super_bank = 0;
+    }
+
+    fn select_bounty_bank(&mut self, address: u16) {
+        match address {
+            0x4ff6..=0x4ff9 => self.bounty_bank_4000 = (address - 0x4ff6) as u8,
+            0x5ff6..=0x5ff9 => self.bounty_bank_5000 = (address - 0x5ff6) as u8,
+            _ => {}
+        }
+    }
+
+    fn select_super_bank(&mut self, address: u16) {
+        if !(0xbfc0..=0xbfff).contains(&address) {
+            return;
+        }
+        let mut bank = self.super_bank;
+        match address & 0x30 {
+            0x00 => bank = (bank & 0x03) | ((address as u8) & 0x0c),
+            0x10 => bank = (bank & 0x0c) | (((address as u8) & 0x0c) >> 2),
+            _ => bank = 0x0f,
+        }
+        let mask = (self.rom.len() / 0x8000).saturating_sub(1) as u8;
+        self.super_bank = bank & mask;
+    }
+
+    fn read(&mut self, address: u16) -> u8 {
+        if self.mapper == Atari5200Mapper::SuperCart {
+            self.select_super_bank(address);
+        }
+        if matches!(
+            self.mapper,
+            Atari5200Mapper::BountyBob40K | Atari5200Mapper::BountyBob40KAlt
+        ) {
+            self.select_bounty_bank(address);
+        }
+        match self.mapper {
+            Atari5200Mapper::Linear32K => self.rom[usize::from(address - 0x4000)],
+            Atari5200Mapper::TwoChip16K => match address {
+                0x4000..=0x7fff => self.rom[usize::from(address - 0x4000) & 0x1fff],
+                0x8000..=0xbfff => self.rom[0x2000 + (usize::from(address - 0x8000) & 0x1fff)],
+                _ => 0xff,
+            },
+            Atari5200Mapper::OneChip16K => {
+                if address < 0x8000 {
+                    0xff
+                } else {
+                    self.rom[usize::from(address - 0x8000) & 0x3fff]
+                }
+            }
+            Atari5200Mapper::Standard8K => {
+                if address < 0x8000 {
+                    0xff
+                } else {
+                    self.rom[usize::from(address - 0x8000) & 0x1fff]
+                }
+            }
+            Atari5200Mapper::Standard4K => {
+                if address < 0x8000 {
+                    0xff
+                } else {
+                    self.rom[usize::from(address - 0x8000) & 0x0fff]
+                }
+            }
+            Atari5200Mapper::BountyBob40K => match address {
+                0x4000..=0x4fff => {
+                    let base = usize::from(self.bounty_bank_4000) * 0x1000;
+                    self.rom[base + usize::from(address - 0x4000)]
+                }
+                0x5000..=0x5fff => {
+                    let base = (4 + usize::from(self.bounty_bank_5000)) * 0x1000;
+                    self.rom[base + usize::from(address - 0x5000)]
+                }
+                0x8000..=0xbfff => self.rom[0x8000 + (usize::from(address - 0x8000) & 0x1fff)],
+                _ => 0xff,
+            },
+            Atari5200Mapper::BountyBob40KAlt => match address {
+                0x4000..=0x4fff => {
+                    let base = 0x2000 + usize::from(self.bounty_bank_4000) * 0x1000;
+                    self.rom[base + usize::from(address - 0x4000)]
+                }
+                0x5000..=0x5fff => {
+                    let base = 0x6000 + usize::from(self.bounty_bank_5000) * 0x1000;
+                    self.rom[base + usize::from(address - 0x5000)]
+                }
+                0x8000..=0xbfff => self.rom[usize::from(address - 0x8000) & 0x1fff],
+                _ => 0xff,
+            },
+            Atari5200Mapper::SuperCart => {
+                if !(0x4000..=0xbfff).contains(&address) {
+                    0xff
+                } else {
+                    self.rom[usize::from(self.super_bank) * 0x8000 + usize::from(address - 0x4000)]
+                }
             }
         }
+    }
+
+    fn write(&mut self, address: u16, _value: u8) {
+        if self.mapper == Atari5200Mapper::SuperCart {
+            self.select_super_bank(address);
+        }
+        if matches!(
+            self.mapper,
+            Atari5200Mapper::BountyBob40K | Atari5200Mapper::BountyBob40KAlt
+        ) {
+            self.select_bounty_bank(address);
+        }
+    }
+
+    fn save(&self, out: &mut StateWriter) {
+        out.u8(self.bounty_bank_4000);
+        out.u8(self.bounty_bank_5000);
+        out.u8(self.super_bank);
+    }
+
+    fn load(&mut self, input: &mut StateReader<'_>) -> Result<(), String> {
+        self.bounty_bank_4000 = input.u8()?.min(3);
+        self.bounty_bank_5000 = input.u8()?.min(3);
+        let super_bank = input.u8()?;
+        if self.mapper == Atari5200Mapper::SuperCart
+            && usize::from(super_bank) >= self.rom.len() / 0x8000
+        {
+            return Err("Atari 5200 state contains an invalid SuperCart bank".into());
+        }
+        self.super_bank = super_bank;
+        Ok(())
     }
 }
 
@@ -461,6 +705,7 @@ impl Atari5200Bus {
     }
 
     fn reset_devices(&mut self) {
+        self.cartridge.reset();
         self.gtia.reset();
         self.antic.reset();
         self.pokey.reset();
@@ -475,7 +720,8 @@ impl Atari5200Bus {
 
     fn set_inputs(&mut self, input: &InputState) {
         self.gtia.set_inputs(input);
-        for player in 0..2usize {
+        let pots_enabled = self.gtia.write_regs[0x1f] & 0x04 != 0;
+        for player in 0..4usize {
             let mut x = input.axes[player][AXIS_LEFT_X];
             let mut y = input.axes[player][AXIS_LEFT_Y];
             let buttons = input.buttons[player];
@@ -489,21 +735,44 @@ impl Atari5200Bus {
             } else if buttons & DOWN != 0 {
                 y = i16::MAX;
             }
-            self.pokey.set_pot(player * 2, axis_to_pot(x));
-            self.pokey.set_pot(player * 2 + 1, axis_to_pot(y));
+            let (x_pot, y_pot) = if pots_enabled {
+                (axis_to_pot(x), axis_to_pot(y))
+            } else {
+                (228, 228)
+            };
+            self.pokey.set_pot(player * 2, x_pot);
+            self.pokey.set_pot(player * 2 + 1, y_pot);
         }
-        let keypad = if input.buttons[0] & START != 0 {
-            0x0c
-        } else if input.buttons[0] & SELECT != 0 {
-            0x05
-        } else {
-            0xff
-        };
-        self.pokey.set_keyboard(keypad);
+
+        let selected = usize::from(self.gtia.write_regs[0x1f] & 0x03);
+        let buttons = input.buttons[selected];
+        let keypad = [
+            (KEYPAD_1, 0x1e),
+            (KEYPAD_2, 0x1c),
+            (KEYPAD_3, 0x1a),
+            (START, 0x18),
+            (KEYPAD_4, 0x16),
+            (KEYPAD_5, 0x14),
+            (KEYPAD_6, 0x12),
+            (PAUSE | SELECT, 0x10),
+            (KEYPAD_7, 0x0e),
+            (KEYPAD_8, 0x0c),
+            (KEYPAD_9, 0x0a),
+            (RESET, 0x08),
+            (KEYPAD_STAR, 0x06),
+            (KEYPAD_0, 0x04),
+            (KEYPAD_HASH, 0x02),
+        ]
+        .into_iter()
+        .find_map(|(button, code)| (buttons & button != 0).then_some(code))
+        .unwrap_or(0xff);
+        let top_button = buttons & FACE_EAST != 0;
+        self.pokey.set_keyboard_state(keypad, top_button);
     }
 
     fn save(&self, out: &mut StateWriter) {
         out.blob(&self.ram);
+        self.cartridge.save(out);
         self.gtia.save(out);
         self.antic.save(out);
         self.pokey.save(out);
@@ -515,6 +784,7 @@ impl Atari5200Bus {
             return Err("Atari 5200 state has invalid RAM length".into());
         }
         self.ram.copy_from_slice(ram);
+        self.cartridge.load(input)?;
         self.gtia.load(input)?;
         self.antic.load(input)?;
         self.pokey.load(input)
@@ -542,6 +812,7 @@ impl Bus8 for Atari5200Bus {
     fn write8(&mut self, address: u16, value: u8) {
         match address {
             0x0000..=0x3fff => self.ram[address as usize] = value,
+            0x4000..=0xbfff => self.cartridge.write(address, value),
             0xc000..=0xc0ff => self.gtia.write(address, value),
             0xd400..=0xd4ff => self.antic.write(address, value),
             0xe800..=0xe8ff => self.pokey.write(address, value),
@@ -713,6 +984,14 @@ mod tests {
         cart
     }
 
+    fn cart_container(cart_type: u32, payload: &[u8]) -> Vec<u8> {
+        let mut image = vec![0; 16 + payload.len()];
+        image[..4].copy_from_slice(b"CART");
+        image[4..8].copy_from_slice(&cart_type.to_be_bytes());
+        image[16..].copy_from_slice(payload);
+        image
+    }
+
     fn install_display_list(machine: &mut Atari5200Machine) {
         let list = 0x2000usize;
         let screen = 0x2100usize;
@@ -735,6 +1014,190 @@ mod tests {
     }
 
     #[test]
+    fn raw_16k_mapper_uses_known_commercial_crc_profiles() {
+        assert_eq!(crc32_ieee(b"123456789"), 0xcbf4_3926);
+        assert_eq!(raw_16k_mapper(0x536a_70fe), Atari5200Mapper::TwoChip16K);
+        assert_eq!(raw_16k_mapper(0xf43e_7cd0), Atari5200Mapper::OneChip16K);
+    }
+
+    #[test]
+    fn standard_cartridge_sizes_follow_5200_mirroring_rules() {
+        let mut four = vec![0; 0x1000];
+        four[0] = 0x41;
+        four[0x0fff] = 0x4f;
+        let mut cart = Atari5200Cartridge::new(&four).unwrap();
+        assert_eq!(cart.read(0x4000), 0xff);
+        assert_eq!(cart.read(0x8000), 0x41);
+        assert_eq!(cart.read(0x9000), 0x41);
+        assert_eq!(cart.read(0xa000), 0x41);
+        assert_eq!(cart.read(0xbfff), 0x4f);
+
+        let mut eight = vec![0; 0x2000];
+        eight[0] = 0x81;
+        eight[0x1fff] = 0x8f;
+        let mut cart = Atari5200Cartridge::new(&eight).unwrap();
+        assert_eq!(cart.read(0x4000), 0xff);
+        assert_eq!(cart.read(0x8000), 0x81);
+        assert_eq!(cart.read(0xa000), 0x81);
+        assert_eq!(cart.read(0xbfff), 0x8f);
+
+        let mut one_chip = vec![0; 0x4000];
+        one_chip[0] = 0x16;
+        one_chip[0x3fff] = 0x1f;
+        let mut cart = Atari5200Cartridge::new(&one_chip).unwrap();
+        assert_eq!(cart.read(0x4000), 0xff);
+        assert_eq!(cart.read(0x8000), 0x16);
+        assert_eq!(cart.read(0xbfff), 0x1f);
+    }
+
+    #[test]
+    fn cart_type_six_maps_two_chip_16k_halves_into_mirrored_windows() {
+        let mut payload = vec![0x11; 0x4000];
+        payload[0x2000..].fill(0x22);
+        let image = cart_container(6, &payload);
+        let mut cart = Atari5200Cartridge::new(&image).unwrap();
+
+        assert_eq!(cart.mapper, Atari5200Mapper::TwoChip16K);
+        assert_eq!(cart.read(0x4000), 0x11);
+        assert_eq!(cart.read(0x6000), 0x11);
+        assert_eq!(cart.read(0x8000), 0x22);
+        assert_eq!(cart.read(0xa000), 0x22);
+    }
+
+    #[test]
+    fn bounty_bob_40k_accesses_switch_both_windows_and_state_round_trips() {
+        let mut rom = vec![0; 0xa000];
+        for bank in 0..8usize {
+            rom[bank * 0x1000..(bank + 1) * 0x1000].fill(bank as u8);
+        }
+        rom[0x8000..0x9000].fill(0x80);
+        rom[0x9000..0xa000].fill(0x81);
+
+        let mut cart = Atari5200Cartridge::new(&rom).unwrap();
+        assert_eq!(cart.mapper, Atari5200Mapper::BountyBob40K);
+        assert_eq!(cart.read(0x4000), 0);
+        assert_eq!(cart.read(0x5000), 4);
+
+        assert_eq!(cart.read(0x4ff8), 2);
+        assert_eq!(cart.read(0x4000), 2);
+        cart.write(0x5ff9, 0);
+        assert_eq!(cart.read(0x5000), 7);
+
+        assert_eq!(cart.read(0x8000), 0x80);
+        assert_eq!(cart.read(0x9000), 0x81);
+        assert_eq!(cart.read(0xa000), 0x80);
+        assert_eq!(cart.read(0xb000), 0x81);
+
+        let mut writer = StateWriter::new(PlatformId::Atari5200, STATE_VERSION);
+        cart.save(&mut writer);
+        let state = writer.finish();
+        let mut restored = Atari5200Cartridge::new(&rom).unwrap();
+        let mut reader = StateReader::new(&state, PlatformId::Atari5200, STATE_VERSION).unwrap();
+        restored.load(&mut reader).unwrap();
+        reader.finish().unwrap();
+        assert_eq!(restored.read(0x4000), 2);
+        assert_eq!(restored.read(0x5000), 7);
+
+        restored.reset();
+        assert_eq!(restored.read(0x4000), 0);
+        assert_eq!(restored.read(0x5000), 4);
+    }
+
+    #[test]
+    fn cart_type_159_uses_alternate_bounty_bob_rom_wiring() {
+        let mut payload = vec![0; 0xa000];
+        for bank in 0..10usize {
+            payload[bank * 0x1000..(bank + 1) * 0x1000].fill(bank as u8);
+        }
+        let image = cart_container(159, &payload);
+        let mut cart = Atari5200Cartridge::new(&image).unwrap();
+
+        assert_eq!(cart.mapper, Atari5200Mapper::BountyBob40KAlt);
+        assert_eq!(cart.read(0x4000), 2);
+        assert_eq!(cart.read(0x5000), 6);
+        assert_eq!(cart.read(0x8000), 0);
+        assert_eq!(cart.read(0x9000), 1);
+        assert_eq!(cart.read(0xa000), 0);
+        assert_eq!(cart.read(0xb000), 1);
+
+        assert_eq!(cart.read(0x4ff9), 5);
+        cart.write(0x5ff8, 0);
+        assert_eq!(cart.read(0x4000), 5);
+        assert_eq!(cart.read(0x5000), 8);
+    }
+
+    #[test]
+    fn supercart_types_71_through_74_bank_full_thirty_two_kib_window() {
+        for (cart_type, banks) in [(71u32, 2usize), (72, 4), (73, 8), (74, 16)] {
+            let mut payload = vec![0; banks * 0x8000];
+            for bank in 0..banks {
+                payload[bank * 0x8000..(bank + 1) * 0x8000].fill(bank as u8);
+            }
+            let image = cart_container(cart_type, &payload);
+            let mut cart = Atari5200Cartridge::new(&image).unwrap();
+            assert_eq!(cart.mapper, Atari5200Mapper::SuperCart);
+            assert_eq!(cart.read(0x4000), 0);
+            assert_eq!(cart.read(0xbfbf), 0);
+
+            let target = banks - 1;
+            let high = 0xbfc0 | ((target as u16) & 0x0c);
+            let low = 0xbfd0 | (((target as u16) & 0x03) << 2);
+            let _ = cart.read(high);
+            cart.write(low, 0);
+            assert_eq!(usize::from(cart.super_bank), target);
+            assert_eq!(cart.read(0x4000), target as u8);
+            assert_eq!(cart.read(0xbfff), target as u8);
+
+            cart.reset();
+            assert_eq!(cart.read(0x4000), 0);
+            assert_eq!(cart.read(0xbfe0), target as u8);
+            assert_eq!(usize::from(cart.super_bank), target);
+
+            let mut writer = StateWriter::new(PlatformId::Atari5200, STATE_VERSION);
+            cart.save(&mut writer);
+            let state = writer.finish();
+            cart.reset();
+            let mut reader =
+                StateReader::new(&state, PlatformId::Atari5200, STATE_VERSION).unwrap();
+            cart.load(&mut reader).unwrap();
+            reader.finish().unwrap();
+            assert_eq!(usize::from(cart.super_bank), target);
+            assert_eq!(cart.read(0x4000), target as u8);
+        }
+    }
+
+    #[test]
+    fn raw_supercart_sizes_select_bank_switched_mapper() {
+        for banks in [2usize, 4, 8, 16] {
+            let mut payload = vec![0; banks * 0x8000];
+            for bank in 0..banks {
+                payload[bank * 0x8000..(bank + 1) * 0x8000].fill((0x40 + bank) as u8);
+            }
+            let mut cart = Atari5200Cartridge::new(&payload).unwrap();
+            assert_eq!(cart.mapper, Atari5200Mapper::SuperCart);
+            assert_eq!(cart.read(0x4000), 0x40);
+
+            let target = banks - 1;
+            let high = 0xbfc0 | ((target as u16) & 0x0c);
+            let low = 0xbfd0 | (((target as u16) & 0x03) << 2);
+            cart.write(high, 0);
+            cart.write(low, 0);
+            assert_eq!(usize::from(cart.super_bank), target);
+            assert_eq!(cart.read(0x4000), (0x40 + target) as u8);
+        }
+    }
+
+    #[test]
+    fn supercart_container_sizes_are_type_specific() {
+        let payload = vec![0; 0x20000];
+        let error = match Atari5200Cartridge::new(&cart_container(71, &payload)) {
+            Ok(_) => panic!("type 71 must reject a 128 KiB payload"),
+            Err(error) => error,
+        };
+        assert!(error.contains("mapper requires 65536 bytes"));
+    }
+
+    #[test]
     fn synthetic_machine_runs_cpu_antic_gtia_and_pokey() {
         let mut machine = Atari5200Machine::new(&synthetic_cart(), &synthetic_bios()).unwrap();
         install_display_list(&mut machine);
@@ -752,9 +1215,77 @@ mod tests {
         let mut input = InputState::default();
         input.axes[0][AXIS_LEFT_X] = i16::MIN;
         input.axes[0][AXIS_LEFT_Y] = i16::MAX;
+        machine.bus.gtia.write_regs[0x1f] = 0x04;
         machine.bus.set_inputs(&input);
         assert_eq!(machine.bus.pokey.read(0), 0);
         assert_eq!(machine.bus.pokey.read(1), 228);
+
+        machine.bus.gtia.write_regs[0x1f] = 0;
+        machine.bus.set_inputs(&input);
+        assert_eq!(machine.bus.pokey.read(0), 228);
+        assert_eq!(machine.bus.pokey.read(1), 228);
+    }
+
+    #[test]
+    fn keypad_reports_all_5200_codes_for_selected_controller() {
+        let mut machine = Atari5200Machine::new(&synthetic_cart(), &synthetic_bios()).unwrap();
+        let cases = [
+            (KEYPAD_1, 0x1e),
+            (KEYPAD_2, 0x1c),
+            (KEYPAD_3, 0x1a),
+            (START, 0x18),
+            (KEYPAD_4, 0x16),
+            (KEYPAD_5, 0x14),
+            (KEYPAD_6, 0x12),
+            (PAUSE, 0x10),
+            (KEYPAD_7, 0x0e),
+            (KEYPAD_8, 0x0c),
+            (KEYPAD_9, 0x0a),
+            (RESET, 0x08),
+            (KEYPAD_STAR, 0x06),
+            (KEYPAD_0, 0x04),
+            (KEYPAD_HASH, 0x02),
+        ];
+        for (button, code) in cases {
+            let mut input = InputState::default();
+            input.buttons[0] = button;
+            machine.bus.gtia.write_regs[0x1f] = 0;
+            machine.bus.set_inputs(&input);
+            assert_eq!(machine.bus.pokey.read(0x09), code);
+        }
+
+        let mut input = InputState::default();
+        input.buttons[0] = KEYPAD_1;
+        input.buttons[2] = KEYPAD_7;
+        machine.bus.gtia.write_regs[0x1f] = 2;
+        machine.bus.set_inputs(&input);
+        assert_eq!(machine.bus.pokey.read(0x09), 0x0e);
+
+        let mut input = InputState::default();
+        input.buttons[0] = SELECT;
+        machine.bus.gtia.write_regs[0x1f] = 0;
+        machine.bus.set_inputs(&input);
+        assert_eq!(machine.bus.pokey.read(0x09), 0x10);
+    }
+
+    #[test]
+    fn selected_top_trigger_drives_pokey_shift_control_and_break_irq() {
+        let mut machine = Atari5200Machine::new(&synthetic_cart(), &synthetic_bios()).unwrap();
+        machine.bus.pokey.write(0x0e, 0x80);
+        machine.bus.gtia.write_regs[0x1f] = 0;
+
+        let mut input = InputState::default();
+        input.buttons[0] = KEYPAD_1 | FACE_EAST;
+        machine.bus.set_inputs(&input);
+
+        assert_eq!(machine.bus.pokey.read(0x09), 0xde);
+        assert_eq!(machine.bus.pokey.read(0x0f) & 0x08, 0);
+        assert_eq!(machine.bus.pokey.read(0x0e) & 0x80, 0);
+        assert!(machine.bus.pokey.irq_pending());
+
+        input.buttons[0] = 0;
+        machine.bus.set_inputs(&input);
+        assert_eq!(machine.bus.pokey.read(0x0f) & 0x08, 0x08);
     }
 
     #[test]

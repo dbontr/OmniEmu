@@ -1,6 +1,7 @@
 import './styles.css'
-import { PLATFORMS, candidatesForFile, platformById, type Platform } from './catalog'
+import { PLATFORMS, biosForFile, candidatesForFile, platformById, type Platform } from './catalog'
 import { launchOmniCore, runtimeAvailable, type OmniSession } from './runtime/omnicore'
+import { prepareGameFiles } from './runtime/cue'
 import { defaultProfile, loadInputProfile, primaryBindings, saveInputProfile, type InputProfile } from './input/mapping'
 
 type MessageKind = 'idle' | 'loading' | 'ready' | 'running' | 'error'
@@ -9,6 +10,7 @@ interface AppState {
   platform: Platform
   game: File | null
   bios: File | null
+  firmware: File | null
   session: OmniSession | null
   input: InputProfile
   message: string
@@ -20,6 +22,7 @@ const state: AppState = {
   platform: firstRunnable,
   game: null,
   bios: null,
+  firmware: null,
   session: null,
   input: loadInputProfile(),
   message: 'Drop a game file or choose one from disk.',
@@ -36,6 +39,7 @@ const idle = el<HTMLElement>('#player-idle')
 const inspector = el<HTMLElement>('#inspector')
 const gameInput = el<HTMLInputElement>('#game-input')
 const biosInput = el<HTMLInputElement>('#bios-input')
+const firmwareInput = el<HTMLInputElement>('#firmware-input')
 const platformSelect = el<HTMLSelectElement>('#platform-select')
 
 renderPlatformSidebar()
@@ -56,7 +60,7 @@ function shellMarkup() {
   <div class="app-shell">
     <header class="topbar">
       <div class="brand"><img src="${mascot}" alt=""><div><strong>OmniEmu</strong><small>one core · every console</small></div></div>
-      <label class="button file-button">Open game<input id="game-input" type="file"></label>
+      <label class="button file-button">Open game<input id="game-input" type="file" multiple></label>
       <button class="button" id="details-button" type="button"><span class="long">Game &amp; system </span>details</button>
       <div class="topbar-actions">
         <button class="button" id="controls-button" type="button">Controllers</button>
@@ -76,7 +80,7 @@ function shellMarkup() {
             <img src="${mascot}" alt="OmniEmu's emu mascot">
             <h1>Load a game.</h1>
             <p>Games stay on this device. One OmniCore WebAssembly engine owns the machine, timing, video, audio, saves, and global controller model across every console.</p>
-            <label class="drop-zone" id="drop-zone"><strong>Drop a ROM, disc image, or archive here</strong><span>or click to choose a local game</span><input class="sr-only" id="drop-input" type="file"></label>
+            <label class="drop-zone" id="drop-zone"><strong>Drop a ROM, disc image, or archive here</strong><span>or click to choose a local game</span><input class="sr-only" id="drop-input" type="file" multiple></label>
           </div>
         </section>
         <footer class="player-bar">
@@ -90,11 +94,12 @@ function shellMarkup() {
           <h2>Game</h2>
           <div class="field"><label for="platform-select">Console</label><select id="platform-select"></select></div>
           <div class="field"><label>Selected file</label><p id="game-file">No game selected</p></div>
-          <div class="field" id="bios-field"><label>BIOS / firmware</label><label class="button file-button"><span id="bios-label">Choose BIOS file</span><input id="bios-input" type="file"></label></div>
+          <div class="field" id="bios-field"><label>BIOS</label><label class="button file-button"><span id="bios-label">Choose BIOS file</span><input id="bios-input" type="file"></label></div>
+          <div class="field" id="firmware-field"><label>Additional firmware</label><label class="button file-button"><span id="firmware-label">Choose firmware file</span><input id="firmware-input" type="file"></label></div>
           <div id="detection-note"></div>
         </section>
         <section><h2>Acceleration</h2><div class="status-grid" id="capabilities"></div></section>
-        <section><h2>Privacy</h2><p>Game and BIOS files stay local. OmniEmu copies them directly into the single OmniCore WebAssembly memory and never uploads them.</p></section>
+        <section><h2>Privacy</h2><p>Game and BIOS files stay local. OmniEmu stages cartridge-sized content into OmniCore memory and hydrates large streamed media from local file ranges on demand; it never uploads game or firmware bytes.</p></section>
       </aside>
     </div>
     <div id="modal-root"></div>
@@ -122,18 +127,31 @@ function selectPlatform(id: string) {
   if (!platform) return
   state.platform = platform
   state.bios = null
+  state.firmware = null
   biosInput.value = ''
+  firmwareInput.value = ''
   if (state.game) state.message = `${platform.name} selected for ${state.game.name}.`
   refreshUi()
 }
 const dropInput = el<HTMLInputElement>('#drop-input')
 const dropZone = el<HTMLElement>('#drop-zone')
 
-gameInput.addEventListener('change', () => gameInput.files?.[0] && chooseGame(gameInput.files[0]))
-dropInput.addEventListener('change', () => dropInput.files?.[0] && chooseGame(dropInput.files[0]))
+gameInput.addEventListener('change', () => {
+  const files = Array.from(gameInput.files ?? [])
+  if (files.length) void chooseGames(files)
+})
+dropInput.addEventListener('change', () => {
+  const files = Array.from(dropInput.files ?? [])
+  if (files.length) void chooseGames(files)
+})
 biosInput.addEventListener('change', () => {
   state.bios = biosInput.files?.[0] ?? null
-  state.message = state.bios ? `${state.bios.name} selected for ${state.platform.name}.` : 'Firmware selection cleared.'
+  state.message = state.bios ? `${state.bios.name} selected for ${state.platform.name}.` : 'BIOS selection cleared.'
+  refreshUi()
+})
+firmwareInput.addEventListener('change', () => {
+  state.firmware = firmwareInput.files?.[0] ?? null
+  state.message = state.firmware ? `${state.firmware.name} selected for ${state.platform.name}.` : 'Firmware selection cleared.'
   refreshUi()
 })
 
@@ -142,23 +160,38 @@ dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag'))
 dropZone.addEventListener('drop', (event) => {
   event.preventDefault()
   dropZone.classList.remove('drag')
-  const file = event.dataTransfer?.files?.[0]
-  if (file) chooseGame(file)
+  const files = Array.from(event.dataTransfer?.files ?? [])
+  if (files.length) void chooseGames(files)
 })
-function chooseGame(file: File) {
+async function chooseGames(files: readonly File[]) {
   stopSession(false)
+  try {
+    const prepared = await prepareGameFiles(files)
+    chooseGame(prepared.file, prepared.sourceFiles)
+  } catch (error) {
+    state.game = null
+    state.messageKind = 'error'
+    state.message = error instanceof Error ? error.message : String(error)
+    refreshUi()
+  }
+}
+function chooseGame(file: File, sourceFiles = 1) {
   state.game = file
   const candidates = candidatesForFile(file.name)
   const runnable = candidates.find((platform) => runtimeAvailable(platform))
   if (runnable) state.platform = runnable
   state.bios = null
+  state.firmware = null
   biosInput.value = ''
+  firmwareInput.value = ''
   state.messageKind = 'idle'
-  state.message = candidates.length > 1
-    ? `${file.name} matches ${candidates.length} systems. Verify the console before launch.`
-    : candidates.length === 1
-      ? `${candidates[0].name} detected from the file type.`
-      : 'File type was not recognized. Choose the console manually.'
+  state.message = sourceFiles > 1
+    ? `${file.name} CUE set ready with ${sourceFiles - 1} companion file${sourceFiles === 2 ? '' : 's'}.`
+    : candidates.length > 1
+      ? `${file.name} matches ${candidates.length} systems. Verify the console before launch.`
+      : candidates.length === 1
+        ? `${candidates[0].name} detected from the file type.`
+        : 'File type was not recognized. Choose the console manually.'
   refreshUi()
 }
 function refreshUi() {
@@ -168,23 +201,28 @@ function refreshUi() {
   el<HTMLElement>('#system-meta').textContent = `Generation ${state.platform.generation} · ${state.platform.vendor} · ${state.platform.years}`
   el<HTMLElement>('#game-file').textContent = state.game ? `${state.game.name} · ${formatBytes(state.game.size)}` : 'No game selected'
   el<HTMLElement>('#bios-label').textContent = state.bios ? state.bios.name : 'Choose local BIOS file'
+  el<HTMLElement>('#firmware-label').textContent = state.firmware ? state.firmware.name : 'Choose local firmware file'
 
   const chipRoot = el<HTMLElement>('#system-chips')
   chipRoot.innerHTML = `<span class="chip ${state.platform.tier}">${state.platform.tier}</span>${state.platform.extensions.slice(0, 5).map((ext) => `<span class="chip">.${ext}</span>`).join('')}`
 
+  const biosRequirement = biosForFile(state.platform, state.game?.name)
   const biosField = el<HTMLElement>('#bios-field')
-  biosField.classList.toggle('hidden', !state.platform.bios)
+  biosField.classList.toggle('hidden', !biosRequirement)
+  const firmwareField = el<HTMLElement>('#firmware-field')
+  firmwareField.classList.toggle('hidden', !state.platform.firmware)
   const note = el<HTMLElement>('#system-note')
-  note.innerHTML = platformNotice(state.platform)
+  note.innerHTML = platformNotice(state.platform, biosRequirement)
   updateDetectionNote()
   refreshCapabilities()
   refreshPlayerBar()
 }
-function platformNotice(platform: Platform) {
+function platformNotice(platform: Platform, biosRequirement = platform.bios) {
   const parts: string[] = []
   if (platform.tier === 'planned') parts.push('This machine is assigned a permanent OmniCore platform id, but its hardware graph is not implemented yet. Launch remains disabled until it runs inside the same OmniCore binary.')
-  if (platform.tier === 'foundation') parts.push('The shared OmniCore CPU/kernel substrate for this machine family exists, but the complete console hardware graph is not playable yet.')
-  if (platform.bios === 'required') parts.push('This console requires a local BIOS/firmware file supplied by the user.')
+  if (platform.tier === 'foundation') parts.push('This console has a runnable OmniCore machine graph, but timing, peripheral, or compatibility validation is not complete enough for the playable tier.')
+  if (biosRequirement === 'required') parts.push('This console requires a local BIOS file supplied by the user.')
+  if (platform.firmware === 'required') parts.push('This console also requires its additional local firmware image.')
   if (platform.note) parts.push(platform.note)
   return parts.length ? `<div class="notice ${platform.tier === 'planned' ? 'warning' : ''}">${parts.map(escapeHtml).join(' ')}</div>` : ''
 }
@@ -204,9 +242,9 @@ function refreshCapabilities() {
   const gamepads = navigator.getGamepads?.().filter(Boolean).length ?? 0
   const checks: Array<[string, boolean, string]> = [
     ['OmniCore WASM', typeof WebAssembly !== 'undefined', 'single binary'],
-    ['WebGL 2', webgl2, webgl2 ? 'hardware rendering' : 'legacy fallback'],
+    ['WebGL 2', webgl2, webgl2 ? 'fallback available' : 'unavailable'],
     ['WASM threads', crossOriginIsolated && typeof SharedArrayBuffer !== 'undefined', crossOriginIsolated ? 'available' : 'single-thread fallback'],
-    ['WebGPU API', 'gpu' in navigator, 'future unified GPU path'],
+    ['WebGPU API', 'gpu' in navigator, 'preferred renderer'],
     ['Gamepads', gamepads > 0, gamepads ? `${gamepads} connected` : 'none connected'],
   ]
   root.innerHTML = checks.map(([label, ok, detail]) => `<span>${label}</span><strong class="${ok ? 'good' : 'warn'}">${escapeHtml(detail)}</strong>`).join('')
@@ -216,7 +254,11 @@ function refreshPlayerBar() {
   el<HTMLElement>('#player-title').textContent = state.game ? state.game.name.replace(/\.[^.]+$/, '') : state.platform.romless ? state.platform.name : 'No game loaded'
   el<HTMLElement>('#player-status').textContent = state.message
   const hasGame = !!state.game || state.platform.romless === true
-  const canLaunch = hasGame && runtimeAvailable(state.platform) && (state.platform.bios !== 'required' || !!state.bios)
+  const biosRequirement = biosForFile(state.platform, state.game?.name)
+  const canLaunch = hasGame
+    && runtimeAvailable(state.platform)
+    && (biosRequirement !== 'required' || !!state.bios)
+    && (state.platform.firmware !== 'required' || !!state.firmware)
   el<HTMLButtonElement>('#launch-button').disabled = !canLaunch || state.messageKind === 'loading'
   el<HTMLButtonElement>('#stop-button').disabled = !state.session
 }
@@ -235,9 +277,16 @@ el<HTMLButtonElement>('#fullscreen-button').addEventListener('click', async () =
 })
 async function launchSelectedGame() {
   if ((!state.game && !state.platform.romless) || !runtimeAvailable(state.platform)) return
-  if (state.platform.bios === 'required' && !state.bios) {
+  const biosRequirement = biosForFile(state.platform, state.game?.name)
+  if (biosRequirement === 'required' && !state.bios) {
     state.messageKind = 'error'
-    state.message = `${state.platform.name} requires a local BIOS/firmware file before launch.`
+    state.message = `${state.platform.name} requires a local BIOS file before launch.`
+    refreshPlayerBar()
+    return
+  }
+  if (state.platform.firmware === 'required' && !state.firmware) {
+    state.messageKind = 'error'
+    state.message = `${state.platform.name} requires its additional local firmware image before launch.`
     refreshPlayerBar()
     return
   }
@@ -248,7 +297,7 @@ async function launchSelectedGame() {
   idle.classList.add('hidden')
   host.classList.remove('hidden')
   try {
-    state.session = await launchOmniCore(host, { platform: state.platform, game: state.game, bios: state.bios, inputProfile: state.input })
+    state.session = await launchOmniCore(host, { platform: state.platform, game: state.game, bios: state.bios, firmware: state.firmware, inputProfile: state.input })
     state.messageKind = 'running'
     state.message = `${state.platform.name} running inside the single OmniCore WebAssembly engine.`
   } catch (error) {

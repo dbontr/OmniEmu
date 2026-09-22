@@ -151,6 +151,58 @@ impl ShaderCache {
     }
 }
 
+pub trait ShaderTranslator {
+    fn translate(&mut self, stage: ShaderStage, guest_code: &[u8]) -> Result<String, String>;
+}
+
+#[derive(Debug, Default)]
+pub struct ShaderPipeline {
+    cache: ShaderCache,
+}
+
+impl ShaderPipeline {
+    pub fn cache(&self) -> &ShaderCache {
+        &self.cache
+    }
+
+    pub fn clear(&mut self) {
+        self.cache.clear();
+    }
+
+    pub fn source_changed(&mut self, source_generation: u64) {
+        self.cache.invalidate_generation(source_generation);
+    }
+
+    pub fn resolve<'a, T: ShaderTranslator>(
+        &'a mut self,
+        stage: ShaderStage,
+        guest_hash: u64,
+        source_generation: u64,
+        guest_code: &[u8],
+        translator: &mut T,
+    ) -> Result<&'a TranslatedShader, String> {
+        if self
+            .cache
+            .get(stage, guest_hash, source_generation)
+            .is_none()
+        {
+            let webgpu_source = translator.translate(stage, guest_code)?;
+            if webgpu_source.trim().is_empty() {
+                return Err("shader translator produced empty WebGPU source".into());
+            }
+            self.cache.insert(TranslatedShader {
+                guest_hash,
+                stage,
+                source_generation,
+                webgpu_source,
+            });
+        }
+        self.cache
+            .get(stage, guest_hash, source_generation)
+            .ok_or_else(|| "translated shader disappeared from the shader cache".to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +240,39 @@ mod tests {
         assert!(cache.get(ShaderStage::Vertex, 0x1234, 10).is_none());
         cache.invalidate_generation(10);
         assert!(cache.is_empty());
+    }
+
+    struct TestShaderTranslator {
+        calls: usize,
+    }
+
+    impl ShaderTranslator for TestShaderTranslator {
+        fn translate(&mut self, stage: ShaderStage, guest_code: &[u8]) -> Result<String, String> {
+            self.calls += 1;
+            Ok(format!("// {stage:?} {}", guest_code.len()))
+        }
+    }
+
+    #[test]
+    fn shader_pipeline_translates_once_per_generation() {
+        let mut pipeline = ShaderPipeline::default();
+        let mut translator = TestShaderTranslator { calls: 0 };
+        let first = pipeline
+            .resolve(ShaderStage::Fragment, 44, 2, &[1, 2], &mut translator)
+            .unwrap()
+            .webgpu_source
+            .clone();
+        let second = pipeline
+            .resolve(ShaderStage::Fragment, 44, 2, &[1, 2], &mut translator)
+            .unwrap()
+            .webgpu_source
+            .clone();
+        assert_eq!(first, second);
+        assert_eq!(translator.calls, 1);
+        pipeline.source_changed(3);
+        pipeline
+            .resolve(ShaderStage::Fragment, 44, 3, &[1, 2], &mut translator)
+            .unwrap();
+        assert_eq!(translator.calls, 2);
     }
 }

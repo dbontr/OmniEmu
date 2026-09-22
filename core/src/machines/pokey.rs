@@ -45,8 +45,11 @@ pub struct Pokey {
     irq_enable: u8,
     irq_status: u8,
     skctl: u8,
+    skstat: u8,
     pots: [u8; 8],
     keyboard: u8,
+    keyboard_down: bool,
+    break_pressed: bool,
     random: u32,
     cpu_hz: u64,
     sample_phase: u64,
@@ -67,8 +70,11 @@ impl Pokey {
             irq_enable: 0,
             irq_status: 0xff,
             skctl: 0,
+            skstat: 0xff,
             pots: [0x80; 8],
             keyboard: 0xff,
+            keyboard_down: false,
+            break_pressed: false,
             random: 0x1ffff,
             cpu_hz,
             sample_phase: 0,
@@ -89,8 +95,33 @@ impl Pokey {
         }
     }
 
-    pub fn set_keyboard(&mut self, value: u8) {
-        self.keyboard = value;
+    pub fn set_keyboard_state(&mut self, value: u8, break_pressed: bool) {
+        let key_down = value != 0xff;
+        let encoded = (value & 0x3f) | if break_pressed && key_down { 0xc0 } else { 0 };
+        let changed =
+            key_down && (!self.keyboard_down || (self.keyboard & 0x3f) != (encoded & 0x3f));
+
+        if key_down {
+            self.keyboard = encoded;
+            self.skstat &= !0x04;
+            if changed && self.irq_enable & 0x40 != 0 {
+                self.irq_status &= !0x40;
+            }
+        } else {
+            self.skstat |= 0x04;
+        }
+
+        if break_pressed {
+            self.skstat &= !0x08;
+            if !self.break_pressed && self.irq_enable & 0x80 != 0 {
+                self.irq_status &= !0x80;
+            }
+        } else {
+            self.skstat |= 0x08;
+        }
+
+        self.keyboard_down = key_down;
+        self.break_pressed = break_pressed;
     }
 
     pub fn read(&mut self, address: u16) -> u8 {
@@ -102,8 +133,8 @@ impl Pokey {
                 self.clock_random();
                 (self.random & 0xff) as u8
             }
-            0x0d => self.irq_status,
-            0x0f => self.skctl,
+            0x0e => self.irq_status,
+            0x0f => self.skstat,
             _ => 0xff,
         }
     }
@@ -124,8 +155,8 @@ impl Pokey {
                     channel.counter = 1;
                 }
             }
-            0x0a => self.irq_status = 0xff,
-            0x0d => {
+            0x0a => self.skstat |= 0xe0,
+            0x0e => {
                 self.irq_enable = value;
                 self.irq_status |= !value;
             }
@@ -213,8 +244,11 @@ impl Pokey {
         out.u8(self.irq_enable);
         out.u8(self.irq_status);
         out.u8(self.skctl);
+        out.u8(self.skstat);
         out.blob(&self.pots);
         out.u8(self.keyboard);
+        out.u8(u8::from(self.keyboard_down));
+        out.u8(u8::from(self.break_pressed));
         out.u32(self.random);
         out.u64(self.sample_phase);
     }
@@ -230,12 +264,15 @@ impl Pokey {
         self.irq_enable = input.u8()?;
         self.irq_status = input.u8()?;
         self.skctl = input.u8()?;
+        self.skstat = input.u8()?;
         let pots = input.blob()?;
         if pots.len() != self.pots.len() {
             return Err("POKEY state has invalid POT register length".into());
         }
         self.pots.copy_from_slice(pots);
         self.keyboard = input.u8()?;
+        self.keyboard_down = input.u8()? != 0;
+        self.break_pressed = input.u8()? != 0;
         self.random = input.u32()? & 0x1ffff;
         if self.random == 0 {
             self.random = 0x1ffff;
@@ -256,7 +293,7 @@ mod tests {
         let mut pokey = Pokey::new(DEFAULT_CPU_HZ);
         pokey.write(0x00, 3);
         pokey.write(0x01, 0xaf);
-        pokey.write(0x0d, 0x01);
+        pokey.write(0x0e, 0x01);
         pokey.tick(20_000);
         let samples = pokey.take_samples();
         assert!(!samples.is_empty());
@@ -265,11 +302,34 @@ mod tests {
     }
 
     #[test]
+    fn control_registers_and_keyboard_break_status_use_hardware_offsets() {
+        let mut pokey = Pokey::new(DEFAULT_CPU_HZ);
+        pokey.write(0x0d, 0xc0);
+        assert_eq!(pokey.irq_enable, 0);
+
+        pokey.write(0x0e, 0xc0);
+        pokey.set_keyboard_state(0x1e, true);
+        assert_eq!(pokey.read(0x09), 0xde);
+        assert_eq!(pokey.read(0x0e) & 0xc0, 0);
+        assert_eq!(pokey.read(0x0f) & 0x0c, 0);
+        assert!(pokey.irq_pending());
+
+        pokey.set_keyboard_state(0xff, false);
+        assert_eq!(pokey.read(0x0f) & 0x0c, 0x0c);
+
+        pokey.skstat &= !0xe0;
+        pokey.write(0x0a, 0);
+        assert_eq!(pokey.read(0x0f) & 0xe0, 0xe0);
+    }
+
+    #[test]
     fn state_round_trip_preserves_registers_and_pots() {
         let mut pokey = Pokey::new(DEFAULT_CPU_HZ);
         pokey.write(0x04, 17);
         pokey.write(0x05, 0xcf);
         pokey.set_pot(3, 0x42);
+        pokey.write(0x0e, 0xc0);
+        pokey.set_keyboard_state(0x14, true);
         pokey.tick(1234);
         let mut writer = StateWriter::new(PlatformId::Atari5200, 9);
         pokey.save(&mut writer);
@@ -281,6 +341,11 @@ mod tests {
         assert_eq!(restored.channels[2].frequency, 17);
         assert_eq!(restored.channels[2].control, 0xcf);
         assert_eq!(restored.pots[3], 0x42);
+        assert_eq!(restored.keyboard, 0xd4);
+        assert!(restored.keyboard_down);
+        assert!(restored.break_pressed);
+        assert_eq!(restored.skstat & 0x0c, 0);
+        assert_eq!(restored.irq_status & 0xc0, 0);
         assert_eq!(restored.sample_phase, pokey.sample_phase);
     }
 }

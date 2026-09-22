@@ -1,6 +1,8 @@
-import type { Platform } from '../catalog'
+import { mediaForFile, type Platform } from '../catalog'
 import type { InputProfile } from '../input/mapping'
+import { AudioScheduler } from './audio'
 import { fingerprintFile, loadPersistentResource, savePersistentResource } from './persistence'
+import { createVideoRenderer } from './video'
 
 interface OmniExports extends WebAssembly.Exports {
   memory: WebAssembly.Memory
@@ -9,6 +11,9 @@ interface OmniExports extends WebAssembly.Exports {
   omni_can_launch(platform: number): number
   omni_resources_clear(): void
   omni_resource_create(kind: number, slot: number, len: bigint): number
+  omni_resource_create_streaming(kind: number, slot: number, len: bigint, maxChunks: number): number
+  omni_resource_pending_start(kind: number, slot: number): bigint
+  omni_resource_pending_end(kind: number, slot: number): bigint
   omni_resource_write(kind: number, slot: number, offset: bigint, ptr: number, len: number): number
   omni_load_staged(platform: number): number
   omni_alloc(len: number): number
@@ -40,6 +45,7 @@ export interface OmniLaunchRequest {
   platform: Platform
   game?: File | null
   bios?: File | null
+  firmware?: File | null
   inputProfile: InputProfile
 }
 
@@ -69,119 +75,6 @@ async function loadExports(): Promise<OmniExports> {
   })()
   return exportsPromise
 }
-class VideoRenderer {
-  readonly canvas = document.createElement('canvas')
-  private readonly gl: WebGL2RenderingContext
-  private readonly texture: WebGLTexture
-  private textureWidth = 0
-  private textureHeight = 0
-
-  constructor() {
-    const gl = this.canvas.getContext('webgl2', { alpha: false, antialias: false, depth: false, stencil: false })
-    if (!gl) throw new Error('OmniCore requires WebGL 2 for the unified video path.')
-    this.gl = gl
-    this.canvas.className = 'omnicore-canvas'
-    const program = this.createProgram()
-    const vao = gl.createVertexArray()
-    if (!vao) throw new Error('Unable to create OmniCore video vertex array.')
-    gl.bindVertexArray(vao)
-    gl.useProgram(program)
-    const vertices = gl.createBuffer()
-    if (!vertices) throw new Error('Unable to create OmniCore video vertex buffer.')
-    gl.bindBuffer(gl.ARRAY_BUFFER, vertices)
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW)
-    const position = gl.getAttribLocation(program, 'a_position')
-    gl.enableVertexAttribArray(position)
-    gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0)
-    this.texture = gl.createTexture()!
-    gl.bindTexture(gl.TEXTURE_2D, this.texture)
-    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
-    gl.uniform1i(gl.getUniformLocation(program, 'u_frame'), 0)
-    gl.disable(gl.DEPTH_TEST)
-    gl.disable(gl.CULL_FACE)
-    gl.disable(gl.BLEND)
-  }
-
-  private createProgram() {
-    const gl = this.gl
-    const vertex = `#version 300 es
-      in vec2 a_position; out vec2 v_uv;
-      void main(){ gl_Position=vec4(a_position,0.0,1.0); v_uv=vec2((a_position.x+1.0)*0.5,1.0-(a_position.y+1.0)*0.5); }`
-    const fragment = `#version 300 es
-      precision mediump float; in vec2 v_uv; uniform sampler2D u_frame; out vec4 outColor;
-      void main(){ outColor=texture(u_frame,v_uv); }`
-    const compile = (type: number, shaderSource: string) => {
-      const shader = gl.createShader(type)!
-      gl.shaderSource(shader, shaderSource)
-      gl.compileShader(shader)
-      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-        throw new Error(gl.getShaderInfoLog(shader) || 'Video shader failed.')
-      }
-      return shader
-    }
-    const program = gl.createProgram()!
-    gl.attachShader(program, compile(gl.VERTEX_SHADER, vertex))
-    gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fragment))
-    gl.linkProgram(program)
-    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-      throw new Error(gl.getProgramInfoLog(program) || 'Video program failed.')
-    }
-    return program
-  }
-
-  draw(width: number, height: number, pixels: Uint8Array) {
-    const gl = this.gl
-    if (this.canvas.width !== width || this.canvas.height !== height) {
-      this.canvas.width = width
-      this.canvas.height = height
-    }
-    gl.viewport(0, 0, width, height)
-    gl.bindTexture(gl.TEXTURE_2D, this.texture)
-    if (this.textureWidth !== width || this.textureHeight !== height) {
-      this.textureWidth = width
-      this.textureHeight = height
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
-    }
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, pixels)
-    gl.drawArrays(gl.TRIANGLES, 0, 3)
-  }
-}
-class AudioScheduler {
-  private context: AudioContext | null = null
-  private cursor = 0
-
-  async resume() {
-    this.context ??= new AudioContext({ latencyHint: 'interactive' })
-    if (this.context.state === 'suspended') await this.context.resume()
-  }
-
-  schedule(samples: Float32Array, sampleRate: number, channels: number) {
-    if (!samples.length || !sampleRate || !channels) return
-    const context = this.context
-    if (!context) return
-    const frames = Math.floor(samples.length / channels)
-    const buffer = context.createBuffer(channels, frames, sampleRate)
-    for (let channel = 0; channel < channels; channel++) {
-      const target = buffer.getChannelData(channel)
-      for (let frame = 0; frame < frames; frame++) target[frame] = samples[frame * channels + channel] ?? 0
-    }
-    const source = context.createBufferSource()
-    source.buffer = buffer; source.connect(context.destination)
-    const now = context.currentTime
-    if (this.cursor < now || this.cursor - now > 0.18) this.cursor = now
-    source.start(this.cursor)
-    this.cursor += frames / sampleRate
-  }
-
-  dispose() {
-    const context = this.context; this.context = null; this.cursor = 0
-    if (context) void context.close()
-  }
-}
 const PAD_BUTTONS: Record<string, number> = {
   BUTTON_1: 0, BUTTON_2: 1, BUTTON_3: 2, BUTTON_4: 3,
   LEFT_TOP_SHOULDER: 4, RIGHT_TOP_SHOULDER: 5,
@@ -199,11 +92,25 @@ const PAD_AXES: Record<string, [number, number]> = {
 class InputScanner {
   private pressed = new Set<string>()
   private readonly profile: InputProfile
-  constructor(profile: InputProfile) {
+  private readonly pointerSurface: HTMLCanvasElement
+  private pointerX = 0
+  private pointerY = 0
+  private pointerTouch = false
+  private pointerClick = false
+
+  constructor(profile: InputProfile, pointerSurface: HTMLCanvasElement) {
     this.profile = profile
+    this.pointerSurface = pointerSurface
+    this.pointerSurface.style.touchAction = 'none'
     window.addEventListener('keydown', this.keyDown)
     window.addEventListener('keyup', this.keyUp)
     window.addEventListener('blur', this.blur)
+    this.pointerSurface.addEventListener('pointermove', this.pointerMove)
+    this.pointerSurface.addEventListener('pointerenter', this.pointerMove)
+    this.pointerSurface.addEventListener('pointerleave', this.pointerLeave)
+    this.pointerSurface.addEventListener('pointerdown', this.pointerDown)
+    this.pointerSurface.addEventListener('pointerup', this.pointerUp)
+    this.pointerSurface.addEventListener('pointercancel', this.pointerLeave)
   }
 
   readButtons(player: number): bigint {
@@ -213,6 +120,10 @@ class InputScanner {
       if (binding.index > 15) continue
       const strength = Math.max(this.keyboard(binding.keyboard) ? 1 : 0, this.gamepadStrength(pad, binding.gamepad))
       if (strength > 0.5) mask |= 1n << BigInt(binding.index)
+    }
+    if (player === 0) {
+      if (this.pointerTouch) mask |= 1n << 32n
+      if (this.pointerClick) mask |= 1n << 33n
     }
     return mask
   }
@@ -232,6 +143,10 @@ class InputScanner {
     axes[3] = signedAxis(strength(22) - strength(23))
     axes[4] = triggerAxis(strength(12))
     axes[5] = triggerAxis(strength(13))
+    if (player === 0) {
+      axes[6] = signedAxis(this.pointerX)
+      axes[7] = signedAxis(this.pointerY)
+    }
     return axes
   }
 
@@ -257,7 +172,37 @@ class InputScanner {
     const key = event.key.toLowerCase()
     if (this.isMappedKey(key)) { event.preventDefault(); this.pressed.delete(key) }
   }
-  private blur = () => this.pressed.clear()
+  private updatePointer(event: PointerEvent) {
+    const rect = this.pointerSurface.getBoundingClientRect()
+    if (rect.width <= 0 || rect.height <= 0) return
+    const x = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width))
+    const y = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height))
+    this.pointerX = x * 2 - 1
+    this.pointerY = y * 2 - 1
+    this.pointerTouch = event.pointerType === 'mouse'
+      ? true
+      : event.pressure > 0 || event.buttons !== 0
+    this.pointerClick = (event.buttons & 1) !== 0
+  }
+
+  private pointerMove = (event: PointerEvent) => this.updatePointer(event)
+  private pointerDown = (event: PointerEvent) => {
+    event.preventDefault()
+    this.updatePointer(event)
+  }
+  private pointerUp = (event: PointerEvent) => {
+    event.preventDefault()
+    this.updatePointer(event)
+  }
+  private pointerLeave = () => {
+    this.pointerTouch = false
+    this.pointerClick = false
+  }
+  private blur = () => {
+    this.pressed.clear()
+    this.pointerTouch = false
+    this.pointerClick = false
+  }
   private isMappedKey(key: string) {
     return Object.values(this.profile.players).some((bindings) =>
       bindings.some((binding) => binding.keyboard.toLowerCase() === key))
@@ -266,6 +211,12 @@ class InputScanner {
     window.removeEventListener('keydown', this.keyDown)
     window.removeEventListener('keyup', this.keyUp)
     window.removeEventListener('blur', this.blur)
+    this.pointerSurface.removeEventListener('pointermove', this.pointerMove)
+    this.pointerSurface.removeEventListener('pointerenter', this.pointerMove)
+    this.pointerSurface.removeEventListener('pointerleave', this.pointerLeave)
+    this.pointerSurface.removeEventListener('pointerdown', this.pointerDown)
+    this.pointerSurface.removeEventListener('pointerup', this.pointerUp)
+    this.pointerSurface.removeEventListener('pointercancel', this.pointerLeave)
     this.pressed.clear()
   }
 }
@@ -283,32 +234,107 @@ function lastError(exports: OmniExports) {
 }
 
 const STAGE_CHUNK_BYTES = 1024 * 1024
+const STREAM_CACHE_CHUNKS = 512
+const NO_PENDING_RANGE = -1n
+
+async function writeFileRange(
+  exports: OmniExports,
+  kind: number,
+  slot: number,
+  file: File,
+  start: number,
+  end: number,
+) {
+  if (end <= start) return
+  const bytes = new Uint8Array(await file.slice(start, end).arrayBuffer())
+  const ptr = exports.omni_alloc(bytes.byteLength)
+  if (!ptr) throw new Error(`OmniCore could not allocate ${bytes.byteLength} staging bytes.`)
+  try {
+    new Uint8Array(exports.memory.buffer, ptr, bytes.byteLength).set(bytes)
+    requireOk(exports, exports.omni_resource_write(kind, slot, BigInt(start), ptr, bytes.byteLength))
+  } finally {
+    exports.omni_free(ptr, bytes.byteLength)
+  }
+}
 
 async function stageFile(
   exports: OmniExports,
   kind: number,
   slot: number,
   file?: File | null,
+  streaming = false,
 ) {
   if (!file) return
+  if (streaming) {
+    requireOk(
+      exports,
+      exports.omni_resource_create_streaming(kind, slot, BigInt(file.size), STREAM_CACHE_CHUNKS),
+    )
+    await writeFileRange(exports, kind, slot, file, 0, Math.min(file.size, STAGE_CHUNK_BYTES))
+    return
+  }
   requireOk(exports, exports.omni_resource_create(kind, slot, BigInt(file.size)))
   for (let offset = 0; offset < file.size; offset += STAGE_CHUNK_BYTES) {
-    const end = Math.min(file.size, offset + STAGE_CHUNK_BYTES)
-    const bytes = new Uint8Array(await file.slice(offset, end).arrayBuffer())
-    const ptr = exports.omni_alloc(bytes.byteLength)
-    if (!ptr) throw new Error(`OmniCore could not allocate ${bytes.byteLength} staging bytes.`)
-    try {
-      new Uint8Array(exports.memory.buffer, ptr, bytes.byteLength).set(bytes)
-      requireOk(exports, exports.omni_resource_write(kind, slot, BigInt(offset), ptr, bytes.byteLength))
-    } finally {
-      exports.omni_free(ptr, bytes.byteLength)
-    }
+    await writeFileRange(
+      exports,
+      kind,
+      slot,
+      file,
+      offset,
+      Math.min(file.size, offset + STAGE_CHUNK_BYTES),
+    )
   }
 }
+
+async function hydratePendingResource(
+  exports: OmniExports,
+  kind: number,
+  slot: number,
+  file?: File | null,
+) {
+  if (!file) return false
+  const start = exports.omni_resource_pending_start(kind, slot)
+  if (start === NO_PENDING_RANGE) return false
+  const end = exports.omni_resource_pending_end(kind, slot)
+  if (end <= start || end > BigInt(file.size)) {
+    throw new Error('OmniCore requested an invalid media range.')
+  }
+  const requestedStart = Number(start)
+  const requestedEnd = Number(end)
+  if (!Number.isSafeInteger(requestedStart) || !Number.isSafeInteger(requestedEnd)) {
+    throw new Error('OmniCore requested a media range outside browser file limits.')
+  }
+  const windowStart = Math.floor(requestedStart / STAGE_CHUNK_BYTES) * STAGE_CHUNK_BYTES
+  const windowEnd = Math.min(
+    file.size,
+    Math.max(requestedEnd, windowStart + STAGE_CHUNK_BYTES),
+  )
+  await writeFileRange(exports, kind, slot, file, windowStart, windowEnd)
+  return true
+}
+
 function requireOk(exports: OmniExports, result: number) {
   if (result !== 0) throw new Error(lastError(exports))
 }
-const STORAGE_RESOURCE = 5
+
+async function loadStagedWithHydration(
+  exports: OmniExports,
+  platform: number,
+  primaryKind: number,
+  primaryFile?: File | null,
+  streaming = false,
+) {
+  for (let attempt = 0; attempt < 128; attempt++) {
+    const result = exports.omni_load_staged(platform)
+    if (result === 0) return
+    if (!streaming || !(await hydratePendingResource(exports, primaryKind, 0, primaryFile))) {
+      throw new Error(lastError(exports))
+    }
+  }
+  throw new Error('OmniCore requested too many media ranges while constructing the machine.')
+}
+
+const PERSISTENT_RESOURCE_KINDS = [5, 6, 7] as const
 const PERSISTENCE_SLOT = 0
 
 function readPersistent(exports: OmniExports, kind: number, slot: number): Uint8Array | null {
@@ -353,34 +379,51 @@ export async function launchOmniCore(host: HTMLElement, request: OmniLaunchReque
     throw new Error(`${request.platform.name} does not have a runnable machine graph in OmniCore yet.`)
   }
   exports.omni_resources_clear()
+  const primaryMedia = mediaForFile(request.platform, request.game?.name)
+  const primaryKind = primaryMedia === 'disc' ? 4 : 0
+  const streamingPrimary = primaryMedia === 'disc'
   try {
-    await stageFile(exports, 0, 0, request.game)
+    await stageFile(exports, primaryKind, 0, request.game, streamingPrimary)
     await stageFile(exports, 1, 0, request.bios)
-    requireOk(exports, exports.omni_load_staged(request.platform.omniCode))
+    await stageFile(exports, 2, 0, request.firmware)
+    await loadStagedWithHydration(
+      exports,
+      request.platform.omniCode,
+      primaryKind,
+      request.game,
+      streamingPrimary,
+    )
   } catch (error) {
     exports.omni_resources_clear()
     throw error
   }
 
   let persistenceKey: string | null = null
+  let persistentKind: number | null = null
   let lastPersistent: Uint8Array | null = null
-  if (exports.omni_persistent_len(STORAGE_RESOURCE, PERSISTENCE_SLOT) && request.game) {
+  if (request.game) {
+    persistentKind = PERSISTENT_RESOURCE_KINDS.find(
+      (kind) => exports.omni_persistent_len(kind, PERSISTENCE_SLOT) > 0,
+    ) ?? null
+  }
+  if (persistentKind !== null && request.game) {
     try {
       const fingerprint = await fingerprintFile(request.game)
-      persistenceKey = `v1:${request.platform.omniCode}:${STORAGE_RESOURCE}:${PERSISTENCE_SLOT}:${fingerprint}`
+      persistenceKey = `v1:${request.platform.omniCode}:${persistentKind}:${PERSISTENCE_SLOT}:${fingerprint}`
       const stored = await loadPersistentResource(persistenceKey)
-      if (stored) writePersistent(exports, STORAGE_RESOURCE, PERSISTENCE_SLOT, stored)
-      lastPersistent = readPersistent(exports, STORAGE_RESOURCE, PERSISTENCE_SLOT)
+      if (stored) writePersistent(exports, persistentKind, PERSISTENCE_SLOT, stored)
+      lastPersistent = readPersistent(exports, persistentKind, PERSISTENCE_SLOT)
     } catch {
       persistenceKey = null
+      persistentKind = null
       lastPersistent = null
     }
   }
 
   let persistenceWrite: Promise<void> | null = null
   const flushPersistence = () => {
-    if (!persistenceKey || persistenceWrite) return
-    const bytes = readPersistent(exports, STORAGE_RESOURCE, PERSISTENCE_SLOT)
+    if (!persistenceKey || persistentKind === null || persistenceWrite) return
+    const bytes = readPersistent(exports, persistentKind, PERSISTENCE_SLOT)
     if (!bytes || sameBytes(lastPersistent, bytes)) return
     lastPersistent = bytes
     persistenceWrite = savePersistentResource(persistenceKey, bytes)
@@ -388,9 +431,9 @@ export async function launchOmniCore(host: HTMLElement, request: OmniLaunchReque
       .finally(() => { persistenceWrite = null })
   }
 
-  const video = new VideoRenderer()
+  const video = await createVideoRenderer()
   const audio = new AudioScheduler()
-  const input = new InputScanner(request.inputProfile)
+  const input = new InputScanner(request.inputProfile, video.canvas)
   host.replaceChildren(video.canvas)
   await audio.resume()
 
@@ -402,7 +445,7 @@ export async function launchOmniCore(host: HTMLElement, request: OmniLaunchReque
   document.addEventListener('visibilitychange', visibilityHandler)
   const frameMs = 1000 / Math.max(1, exports.omni_frame_rate())
   let nextFrame = performance.now()
-  const drawFrame = () => {
+  const drawFrame = async () => {
     for (let player = 0; player < 4; player++) {
       requireOk(exports, exports.omni_set_input(player, input.readButtons(player)))
       const axes = input.readAxes(player)
@@ -411,6 +454,9 @@ export async function launchOmniCore(host: HTMLElement, request: OmniLaunchReque
       }
     }
     requireOk(exports, exports.omni_run_frame())
+    if (streamingPrimary) {
+      await hydratePendingResource(exports, primaryKind, 0, request.game)
+    }
     persistenceFrames++
     if (persistenceFrames >= 300) { persistenceFrames = 0; flushPersistence() }
     const width = exports.omni_video_width()
@@ -428,20 +474,24 @@ export async function launchOmniCore(host: HTMLElement, request: OmniLaunchReque
     }
   }
 
-  const tick = (now: number) => {
+  const tick = async (now: number) => {
     if (!alive) return
     try {
       let frames = 0
-      while (now >= nextFrame && frames < 2) { drawFrame(); nextFrame += frameMs; frames++ }
+      while (now >= nextFrame && frames < 2) {
+        await drawFrame()
+        nextFrame += frameMs
+        frames++
+      }
       if (now - nextFrame > frameMs * 4) nextFrame = now + frameMs
     } catch (error) {
       alive = false
       const message = error instanceof Error ? error.message : String(error)
       window.dispatchEvent(new CustomEvent('omnicore:error', { detail: { message } }))
     }
-    if (alive) frameHandle = requestAnimationFrame(tick)
+    if (alive) frameHandle = requestAnimationFrame((time) => { void tick(time) })
   }
-  frameHandle = requestAnimationFrame(tick)
+  frameHandle = requestAnimationFrame((time) => { void tick(time) })
   return {
     canvas: video.canvas,
     reset() { requireOk(exports, exports.omni_reset()); nextFrame = performance.now() },
@@ -469,7 +519,7 @@ export async function launchOmniCore(host: HTMLElement, request: OmniLaunchReque
       disposed = true; alive = false; cancelAnimationFrame(frameHandle)
       document.removeEventListener('visibilitychange', visibilityHandler)
       flushPersistence()
-      input.dispose(); audio.dispose(); exports.omni_unload(); video.canvas.remove()
+      input.dispose(); audio.dispose(); video.dispose(); exports.omni_unload(); video.canvas.remove()
     },
   }
 }

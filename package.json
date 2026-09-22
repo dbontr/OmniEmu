@@ -14,10 +14,11 @@
     "core:test": "node scripts/core-task.mjs test",
     "core:build": "node scripts/core-task.mjs build",
     "core:smoke": "node scripts/wasm-smoke.mjs",
+    "compatibility:smoke": "node scripts/compatibility-runner.mjs compatibility/smoke.json",
     "build": "npm run core:build && npm run core:smoke && tsc && vite build",
     "preview": "vite preview",
     "verify:branding": "node scripts/verify-branding.mjs",
-    "verify": "npm run verify:branding && npm run core:fmt && npm run core:clippy && npm run core:test && npm run build"
+    "verify": "npm run verify:branding && npm run core:fmt && npm run core:clippy && npm run core:test && npm run build && npm run compatibility:smoke"
   },
   "devDependencies": {
     "coi-serviceworker": "^0.1.7",

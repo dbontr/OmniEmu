@@ -164,6 +164,110 @@ impl ExecutionPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockExit {
+    Fallthrough(u64),
+    Branch(u64),
+    Yield,
+    Halt,
+}
+
+pub trait BlockTranslator {
+    fn translate(
+        &mut self,
+        isa: GuestIsa,
+        guest_pc: u64,
+        mmu_generation: u64,
+    ) -> Result<IrBlock, String>;
+}
+
+pub trait BlockRunner<Context> {
+    fn run(&mut self, context: &mut Context, block: &IrBlock) -> Result<BlockExit, String>;
+}
+
+#[derive(Debug)]
+pub struct ExecutionEngine {
+    mode: ExecutionMode,
+    cache: CodeCache,
+}
+
+impl ExecutionEngine {
+    pub fn new(mode: ExecutionMode) -> Self {
+        Self {
+            mode,
+            cache: CodeCache::default(),
+        }
+    }
+
+    pub fn mode(&self) -> ExecutionMode {
+        self.mode
+    }
+
+    pub fn cache(&self) -> &CodeCache {
+        &self.cache
+    }
+
+    pub fn invalidate_range(&mut self, start: u64, end: u64) {
+        self.cache.invalidate_range(start, end);
+    }
+
+    pub fn invalidate_all(&mut self) {
+        self.cache.invalidate_all();
+    }
+
+    pub fn run_block<Context, Translator, Runner>(
+        &mut self,
+        isa: GuestIsa,
+        guest_pc: u64,
+        mmu_generation: u64,
+        translator: &mut Translator,
+        runner: &mut Runner,
+        context: &mut Context,
+    ) -> Result<BlockExit, String>
+    where
+        Translator: BlockTranslator,
+        Runner: BlockRunner<Context>,
+    {
+        if self.mode == ExecutionMode::Interpreter {
+            let block = translator.translate(isa, guest_pc, mmu_generation)?;
+            Self::validate_block(&block, isa, guest_pc, mmu_generation)?;
+            return runner.run(context, &block);
+        }
+
+        if self.cache.get(isa, guest_pc, mmu_generation).is_none() {
+            let block = translator.translate(isa, guest_pc, mmu_generation)?;
+            Self::validate_block(&block, isa, guest_pc, mmu_generation)?;
+            self.cache.insert(block);
+        }
+        let block = self
+            .cache
+            .get(isa, guest_pc, mmu_generation)
+            .ok_or_else(|| "translated block disappeared from the execution cache".to_string())?;
+        runner.run(context, block)
+    }
+
+    fn validate_block(
+        block: &IrBlock,
+        isa: GuestIsa,
+        guest_pc: u64,
+        mmu_generation: u64,
+    ) -> Result<(), String> {
+        if block.isa != isa || block.guest_pc != guest_pc {
+            return Err("translator returned a block for the wrong guest address".into());
+        }
+        if block.mmu_generation != mmu_generation {
+            return Err("translator returned a block for the wrong MMU generation".into());
+        }
+        if block.end_pc <= block.guest_pc {
+            return Err("translated block must advance the guest program counter".into());
+        }
+        if block.ops.is_empty() {
+            return Err("translated block contains no operations".into());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +316,73 @@ mod tests {
         assert!(plan.guest_isas.contains(&GuestIsa::ArmV8));
         let ps3 = blueprint(PlatformId::PlayStation3).unwrap();
         assert!(ExecutionPlan::for_system(&ps3).needs_vector_path);
+    }
+
+    struct TestTranslator {
+        translations: usize,
+    }
+
+    impl BlockTranslator for TestTranslator {
+        fn translate(
+            &mut self,
+            isa: GuestIsa,
+            guest_pc: u64,
+            mmu_generation: u64,
+        ) -> Result<IrBlock, String> {
+            self.translations += 1;
+            Ok(IrBlock {
+                isa,
+                guest_pc,
+                end_pc: guest_pc + 4,
+                mmu_generation,
+                ops: vec![IrOp::Barrier],
+            })
+        }
+    }
+
+    struct TestRunner;
+
+    impl BlockRunner<u64> for TestRunner {
+        fn run(&mut self, context: &mut u64, block: &IrBlock) -> Result<BlockExit, String> {
+            *context += block.ops.len() as u64;
+            Ok(BlockExit::Fallthrough(block.end_pc))
+        }
+    }
+
+    #[test]
+    fn cached_execution_translates_once_until_invalidated() {
+        let mut engine = ExecutionEngine::new(ExecutionMode::WasmTranslator);
+        let mut translator = TestTranslator { translations: 0 };
+        let mut runner = TestRunner;
+        let mut context = 0;
+        for _ in 0..2 {
+            assert_eq!(
+                engine
+                    .run_block(
+                        GuestIsa::ArmV8,
+                        0x4000,
+                        7,
+                        &mut translator,
+                        &mut runner,
+                        &mut context,
+                    )
+                    .unwrap(),
+                BlockExit::Fallthrough(0x4004)
+            );
+        }
+        assert_eq!(translator.translations, 1);
+        assert_eq!(context, 2);
+        engine.invalidate_range(0x4000, 0x4004);
+        engine
+            .run_block(
+                GuestIsa::ArmV8,
+                0x4000,
+                7,
+                &mut translator,
+                &mut runner,
+                &mut context,
+            )
+            .unwrap();
+        assert_eq!(translator.translations, 2);
     }
 }

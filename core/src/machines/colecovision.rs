@@ -1,7 +1,11 @@
 use super::sn76489::Sn76489;
 use super::tms9918::Tms9918;
 use crate::cpu_z80::{Z80Bus, Z80};
-use crate::input::{DOWN, FACE_EAST, FACE_SOUTH, LEFT, RIGHT, UP};
+use crate::input::{
+    AXIS_RIGHT_X, DOWN, FACE_EAST, FACE_NORTH, FACE_SOUTH, FACE_WEST, KEYPAD_0, KEYPAD_1, KEYPAD_2,
+    KEYPAD_3, KEYPAD_4, KEYPAD_5, KEYPAD_6, KEYPAD_7, KEYPAD_8, KEYPAD_9, KEYPAD_HASH, KEYPAD_STAR,
+    LEFT, RIGHT, UP,
+};
 use crate::kernel::{AudioBuffer, InputState, VideoBuffer};
 use crate::machine::Machine;
 use crate::platform::PlatformId;
@@ -9,16 +13,24 @@ use crate::state::{StateReader, StateWriter};
 
 const CPU_CLOCK: f64 = 3_579_545.0;
 const FRAME_RATE: f64 = 59.922_743;
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 4;
 
 struct ColecoBus {
     bios: Vec<u8>,
     rom: Vec<u8>,
+    megacart_banks: usize,
+    megacart_bank: usize,
     ram: [u8; 1024],
     vdp: Tms9918,
     psg: Sn76489,
     keypad_mode: bool,
     controllers: [u8; 2],
+    keypads: [u8; 2],
+    spinner_reload: [u8; 2],
+    spinner_status: [u8; 2],
+    spinner_countdown: [u32; 2],
+    spinner_d7_cycles: [u32; 2],
+    spinner_irq_cycles: [u32; 2],
 }
 
 impl ColecoBus {
@@ -29,52 +41,174 @@ impl ColecoBus {
                 bios.len()
             ));
         }
-        if rom.is_empty() || rom.len() > 0x8000 {
-            return Err(format!(
-                "ColecoVision cartridge must be 1..=32768 bytes, got {}",
-                rom.len()
-            ));
+        if rom.is_empty() {
+            return Err("ColecoVision cartridge cannot be empty".into());
         }
+        let megacart_banks = if rom.len() > 0x8000 {
+            if !(0x10000..=0x100000).contains(&rom.len())
+                || !rom.len().is_power_of_two()
+                || !rom.len().is_multiple_of(0x4000)
+            {
+                return Err(format!(
+                    "ColecoVision MegaCart must be a 64 KiB to 1 MiB power-of-two image, got {} bytes",
+                    rom.len()
+                ));
+            }
+            rom.len() / 0x4000
+        } else {
+            0
+        };
         Ok(Self {
             bios: bios.to_vec(),
             rom: rom.to_vec(),
+            megacart_banks,
+            megacart_bank: 0,
             ram: [0; 1024],
             vdp: Tms9918::default(),
             psg: Sn76489::default(),
             keypad_mode: false,
-            controllers: [0xff; 2],
+            controllers: [0x7f; 2],
+            keypads: [0x7f; 2],
+            spinner_reload: [0; 2],
+            spinner_status: [0; 2],
+            spinner_countdown: [0; 2],
+            spinner_d7_cycles: [0; 2],
+            spinner_irq_cycles: [0; 2],
         })
+    }
+
+    fn keypad_nibble(mask: u64) -> u8 {
+        let mut value = 0x0f;
+        let mapping = [
+            (KEYPAD_0, 0x0a),
+            (KEYPAD_1, 0x0d),
+            (KEYPAD_2, 0x07),
+            (KEYPAD_3, 0x0c),
+            (KEYPAD_4, 0x02),
+            (KEYPAD_5, 0x03),
+            (KEYPAD_6, 0x0e),
+            (KEYPAD_7, 0x05),
+            (KEYPAD_8, 0x01),
+            (KEYPAD_9, 0x0b),
+            (KEYPAD_HASH, 0x06),
+            (KEYPAD_STAR, 0x09),
+        ];
+        for (button, encoded) in mapping {
+            if mask & button != 0 {
+                value &= encoded;
+            }
+        }
+        value
+    }
+
+    fn spinner_reload_from_axis(axis: i16) -> u8 {
+        let magnitude = i32::from(axis).unsigned_abs();
+        if magnitude < 1024 {
+            return 0;
+        }
+        let scaled = (magnitude * 127).div_ceil(32_767).clamp(1, 127) as u8;
+        if axis < 0 {
+            0u8.wrapping_sub(scaled)
+        } else {
+            scaled
+        }
+    }
+
+    fn spinner_interval_cycles(reload: u8) -> u32 {
+        let magnitude = u32::from((reload as i8).unsigned_abs()).max(1);
+        ((CPU_CLOCK * 0.5 / f64::from(magnitude)).round() as u32).max(1)
     }
 
     fn set_inputs(&mut self, input: &InputState) {
         for player in 0..2 {
             let mask = input.buttons[player];
-            let mut value = 0x7f;
+
+            let mut joystick = 0x7f;
             if mask & UP != 0 {
-                value &= !0x01;
+                joystick &= !0x01;
             }
             if mask & RIGHT != 0 {
-                value &= !0x02;
+                joystick &= !0x02;
             }
             if mask & DOWN != 0 {
-                value &= !0x04;
+                joystick &= !0x04;
             }
             if mask & LEFT != 0 {
-                value &= !0x08;
-            }
-            if mask & FACE_SOUTH != 0 {
-                value &= !0x40;
+                joystick &= !0x08;
             }
             if mask & FACE_EAST != 0 {
-                value &= !0x10;
+                joystick &= !0x40;
             }
-            self.controllers[player] = value;
+            self.controllers[player] = joystick;
+
+            let mut keypad = 0x70 | Self::keypad_nibble(mask);
+            if mask & FACE_NORTH != 0 {
+                keypad &= 0x74;
+            }
+            if mask & FACE_WEST != 0 {
+                keypad &= 0x78;
+            }
+            if mask & FACE_SOUTH != 0 {
+                keypad &= !0x40;
+            }
+            self.keypads[player] = keypad;
+
+            let reload = Self::spinner_reload_from_axis(input.axes[player][AXIS_RIGHT_X]);
+            if reload != self.spinner_reload[player] {
+                self.spinner_reload[player] = reload;
+                self.spinner_countdown[player] = if reload == 0 {
+                    0
+                } else {
+                    Self::spinner_interval_cycles(reload)
+                };
+            }
         }
+    }
+
+    fn trigger_spinner_pulse(&mut self, player: usize) {
+        self.spinner_status[player] = self.spinner_reload[player];
+        self.spinner_d7_cycles[player] = (CPU_CLOCK * 0.000_500).round() as u32;
+        self.spinner_irq_cycles[player] = (CPU_CLOCK * 0.000_011).round() as u32;
+    }
+
+    fn tick_spinner(&mut self, cycles: u32) {
+        for player in 0..2 {
+            let prior_d7 = self.spinner_d7_cycles[player];
+            self.spinner_d7_cycles[player] = prior_d7.saturating_sub(cycles);
+            if prior_d7 != 0 && self.spinner_d7_cycles[player] == 0 {
+                self.spinner_status[player] = 0;
+            }
+            self.spinner_irq_cycles[player] =
+                self.spinner_irq_cycles[player].saturating_sub(cycles);
+
+            let reload = self.spinner_reload[player];
+            if reload == 0 {
+                self.spinner_countdown[player] = 0;
+                continue;
+            }
+
+            let interval = Self::spinner_interval_cycles(reload);
+            let mut remaining = cycles;
+            if self.spinner_countdown[player] == 0 {
+                self.spinner_countdown[player] = interval;
+            }
+            while remaining >= self.spinner_countdown[player] {
+                remaining -= self.spinner_countdown[player];
+                self.trigger_spinner_pulse(player);
+                self.spinner_countdown[player] = interval;
+            }
+            self.spinner_countdown[player] -= remaining;
+        }
+    }
+
+    fn spinner_irq_active(&self) -> bool {
+        self.spinner_irq_cycles.iter().any(|&cycles| cycles != 0)
     }
 
     fn tick(&mut self, cycles: u32) {
         self.vdp.tick_cpu_cycles(cycles);
         self.psg.tick_cpu_cycles(cycles);
+        self.tick_spinner(cycles);
     }
 
     fn save(&self, out: &mut StateWriter) {
@@ -84,6 +218,24 @@ impl ColecoBus {
         out.u8(self.keypad_mode as u8);
         out.u8(self.controllers[0]);
         out.u8(self.controllers[1]);
+        out.u8(self.keypads[0]);
+        out.u8(self.keypads[1]);
+        for value in self.spinner_reload {
+            out.u8(value);
+        }
+        for value in self.spinner_status {
+            out.u8(value);
+        }
+        for value in self.spinner_countdown {
+            out.u32(value);
+        }
+        for value in self.spinner_d7_cycles {
+            out.u32(value);
+        }
+        for value in self.spinner_irq_cycles {
+            out.u32(value);
+        }
+        out.u8(self.megacart_bank as u8);
     }
 
     fn load(&mut self, input: &mut StateReader<'_>) -> Result<(), String> {
@@ -97,6 +249,34 @@ impl ColecoBus {
         self.keypad_mode = input.u8()? != 0;
         self.controllers[0] = input.u8()?;
         self.controllers[1] = input.u8()?;
+        self.keypads[0] = input.u8()?;
+        self.keypads[1] = input.u8()?;
+        for value in &mut self.spinner_reload {
+            *value = input.u8()?;
+        }
+        for value in &mut self.spinner_status {
+            *value = input.u8()?;
+        }
+        for value in &mut self.spinner_countdown {
+            *value = input.u32()?;
+        }
+        for value in &mut self.spinner_d7_cycles {
+            *value = input.u32()?;
+        }
+        for value in &mut self.spinner_irq_cycles {
+            *value = input.u32()?;
+        }
+        let megacart_bank = usize::from(input.u8()?);
+        if self.megacart_banks == 0 {
+            if megacart_bank != 0 {
+                return Err(
+                    "ColecoVision state selects a MegaCart bank for a standard cartridge".into(),
+                );
+            }
+        } else if megacart_bank >= self.megacart_banks {
+            return Err("ColecoVision state contains an invalid MegaCart bank".into());
+        }
+        self.megacart_bank = megacart_bank;
         Ok(())
     }
 }
@@ -106,6 +286,18 @@ impl Z80Bus for ColecoBus {
         match address {
             0x0000..=0x1fff => self.bios[address as usize],
             0x6000..=0x7fff => self.ram[address as usize & 0x03ff],
+            0x8000..=0xbfff if self.megacart_banks != 0 => {
+                let bank = self.megacart_banks - 1;
+                self.rom[bank * 0x4000 + usize::from(address - 0x8000)]
+            }
+            0xc000..=0xffbf if self.megacart_banks != 0 => {
+                self.rom[self.megacart_bank * 0x4000 + usize::from(address - 0xc000)]
+            }
+            0xffc0..=0xffff if self.megacart_banks != 0 => {
+                let selector = usize::from(0xffff - address) & (self.megacart_banks - 1);
+                self.megacart_bank = self.megacart_banks - selector - 1;
+                0
+            }
             0x8000..=0xffff => {
                 let index = (address as usize - 0x8000) % self.rom.len();
                 self.rom[index]
@@ -128,9 +320,20 @@ impl Z80Bus for ColecoBus {
             0xe0..=0xff => {
                 let player = usize::from((low & 0x02) != 0);
                 if self.keypad_mode {
-                    0x7f
+                    self.keypads[player]
                 } else {
-                    self.controllers[player]
+                    let mut data = self.controllers[player];
+                    let status = self.spinner_status[player];
+                    if status & 0x80 != 0 {
+                        data ^= 0x30;
+                    } else if status != 0 {
+                        data ^= 0x10;
+                    }
+                    if self.spinner_d7_cycles[player] != 0 {
+                        data | 0x80
+                    } else {
+                        data
+                    }
                 }
             }
             _ => 0xff,
@@ -174,6 +377,12 @@ impl ColecoVisionMachine {
             let interrupt_cycles = self.cpu.nmi(&mut self.bus);
             self.bus.tick(interrupt_cycles);
         }
+        if self.bus.spinner_irq_active() {
+            let interrupt_cycles = self.cpu.irq(&mut self.bus, 0xff);
+            if interrupt_cycles != 0 {
+                self.bus.tick(interrupt_cycles);
+            }
+        }
         cycles
     }
 
@@ -195,6 +404,15 @@ impl Machine for ColecoVisionMachine {
         self.bus.ram = [0; 1024];
         self.bus.vdp.reset();
         self.bus.psg.reset();
+        self.bus.keypad_mode = false;
+        self.bus.controllers = [0x7f; 2];
+        self.bus.keypads = [0x7f; 2];
+        self.bus.spinner_reload = [0; 2];
+        self.bus.spinner_status = [0; 2];
+        self.bus.spinner_countdown = [0; 2];
+        self.bus.spinner_d7_cycles = [0; 2];
+        self.bus.spinner_irq_cycles = [0; 2];
+        self.bus.megacart_bank = 0;
         self.powered = true;
         self.audio.begin_frame();
     }
@@ -279,6 +497,72 @@ mod tests {
         (bios, rom)
     }
 
+    fn synthetic_megacart(banks: usize) -> Vec<u8> {
+        assert!(banks.is_power_of_two() && (4..=64).contains(&banks));
+        let mut rom = vec![0; banks * 0x4000];
+        for bank in 0..banks {
+            rom[bank * 0x4000..(bank + 1) * 0x4000].fill(bank as u8);
+        }
+        rom
+    }
+
+    #[test]
+    fn megacart_maps_fixed_last_bank_and_read_selected_switchable_bank() {
+        let (bios, _) = synthetic_images();
+        let rom = synthetic_megacart(4);
+        let mut bus = ColecoBus::new(&bios, &rom).unwrap();
+
+        assert_eq!(bus.megacart_banks, 4);
+        assert_eq!(bus.mem_read(0x8000), 3);
+        assert_eq!(bus.mem_read(0xbfff), 3);
+        assert_eq!(bus.mem_read(0xc000), 0);
+
+        assert_eq!(bus.mem_read(0xfffe), 0);
+        assert_eq!(bus.megacart_bank, 2);
+        assert_eq!(bus.mem_read(0xc000), 2);
+        assert_eq!(bus.mem_read(0xfffd), 0);
+        assert_eq!(bus.megacart_bank, 1);
+        assert_eq!(bus.mem_read(0xc000), 1);
+        assert_eq!(bus.mem_read(0xffff), 0);
+        assert_eq!(bus.megacart_bank, 3);
+        assert_eq!(bus.mem_read(0xc000), 3);
+        assert_eq!(bus.mem_read(0x8000), 3);
+    }
+
+    #[test]
+    fn megacart_bank_round_trips_through_state_and_reset() {
+        let (bios, _) = synthetic_images();
+        let rom = synthetic_megacart(8);
+        let mut machine = ColecoVisionMachine::from_images(&bios, &rom).unwrap();
+
+        machine.bus.mem_read(0xfffa);
+        assert_eq!(machine.bus.megacart_bank, 2);
+        let snapshot = machine.save_state().unwrap();
+
+        machine.bus.mem_read(0xffff);
+        assert_eq!(machine.bus.megacart_bank, 7);
+        machine.load_state(&snapshot).unwrap();
+        assert_eq!(machine.bus.megacart_bank, 2);
+        assert_eq!(machine.bus.mem_read(0xc000), 2);
+
+        machine.reset();
+        assert_eq!(machine.bus.megacart_bank, 0);
+        assert_eq!(machine.bus.mem_read(0xc000), 0);
+    }
+
+    #[test]
+    fn megacart_rejects_non_power_of_two_and_oversized_images() {
+        let (bios, _) = synthetic_images();
+        assert!(ColecoBus::new(&bios, &vec![0; 0xc000])
+            .err()
+            .unwrap()
+            .contains("MegaCart"));
+        assert!(ColecoBus::new(&bios, &vec![0; 0x200000])
+            .err()
+            .unwrap()
+            .contains("MegaCart"));
+    }
+
     #[test]
     fn synthetic_cartridge_runs_shared_z80_vdp_and_psg() {
         let (bios, rom) = synthetic_images();
@@ -294,6 +578,136 @@ mod tests {
             .iter()
             .any(|pixel| { pixel[0] > 180 && pixel[1] > 180 && pixel[2] > 180 }));
         assert!(!machine.audio().samples().is_empty());
+    }
+
+    #[test]
+    fn controller_strobes_select_joystick_and_keypad_halves() {
+        let (bios, rom) = synthetic_images();
+        let mut bus = ColecoBus::new(&bios, &rom).unwrap();
+        let mut input = InputState::default();
+        input.buttons[0] = UP | RIGHT | FACE_SOUTH | FACE_EAST | KEYPAD_1;
+        bus.set_inputs(&input);
+
+        assert_eq!(bus.io_read(0xfc), 0x3c);
+
+        bus.io_write(0x80, 0);
+        assert_eq!(bus.io_read(0xfc), 0x3d);
+
+        bus.io_write(0xc0, 0);
+        assert_eq!(bus.io_read(0xfc), 0x3c);
+    }
+
+    #[test]
+    fn keypad_matrix_uses_hardware_codes_and_multi_key_diode_behavior() {
+        let (bios, rom) = synthetic_images();
+        let mut bus = ColecoBus::new(&bios, &rom).unwrap();
+        bus.io_write(0x80, 0);
+
+        let cases = [
+            (KEYPAD_0, 0x0a),
+            (KEYPAD_1, 0x0d),
+            (KEYPAD_2, 0x07),
+            (KEYPAD_3, 0x0c),
+            (KEYPAD_4, 0x02),
+            (KEYPAD_5, 0x03),
+            (KEYPAD_6, 0x0e),
+            (KEYPAD_7, 0x05),
+            (KEYPAD_8, 0x01),
+            (KEYPAD_9, 0x0b),
+            (KEYPAD_HASH, 0x06),
+            (KEYPAD_STAR, 0x09),
+        ];
+        for (button, code) in cases {
+            let mut input = InputState::default();
+            input.buttons[0] = button;
+            bus.set_inputs(&input);
+            assert_eq!(bus.io_read(0xfc), 0x70 | code);
+        }
+
+        let mut input = InputState::default();
+        input.buttons[0] = KEYPAD_1 | KEYPAD_4;
+        bus.set_inputs(&input);
+        assert_eq!(bus.io_read(0xfc), 0x70);
+    }
+
+    #[test]
+    fn super_action_extra_fire_buttons_share_keypad_matrix() {
+        let (bios, rom) = synthetic_images();
+        let mut bus = ColecoBus::new(&bios, &rom).unwrap();
+        bus.io_write(0x80, 0);
+
+        let mut input = InputState::default();
+        input.buttons[0] = FACE_NORTH;
+        bus.set_inputs(&input);
+        assert_eq!(bus.io_read(0xfc), 0x74);
+
+        input.buttons[0] = FACE_WEST;
+        bus.set_inputs(&input);
+        assert_eq!(bus.io_read(0xfc), 0x78);
+
+        input.buttons[0] = FACE_NORTH | FACE_WEST;
+        bus.set_inputs(&input);
+        assert_eq!(bus.io_read(0xfc), 0x70);
+    }
+
+    #[test]
+    fn driving_controller_combines_digital_pedal_with_spinner_wheel() {
+        let (bios, rom) = synthetic_images();
+        let mut bus = ColecoBus::new(&bios, &rom).unwrap();
+        let mut input = InputState::default();
+        input.buttons[0] = FACE_EAST;
+        input.axes[0][AXIS_RIGHT_X] = i16::MAX;
+        bus.set_inputs(&input);
+
+        assert_eq!(bus.io_read(0xfc) & 0x40, 0);
+        let interval = ColecoBus::spinner_interval_cycles(bus.spinner_reload[0]);
+        bus.tick(interval);
+        let driven = bus.io_read(0xfc);
+        assert_eq!(driven & 0x40, 0);
+        assert_eq!(driven & 0x10, 0);
+        assert_ne!(driven & 0x80, 0);
+
+        input.buttons[0] = 0;
+        bus.set_inputs(&input);
+        assert_ne!(bus.io_read(0xfc) & 0x40, 0);
+    }
+
+    #[test]
+    fn spinner_pulses_encode_direction_irq_and_round_trip_state() {
+        let (bios, rom) = synthetic_images();
+        let mut machine = ColecoVisionMachine::from_images(&bios, &rom).unwrap();
+
+        let mut input = InputState::default();
+        input.axes[0][AXIS_RIGHT_X] = i16::MAX;
+        machine.bus.set_inputs(&input);
+        assert_eq!(machine.bus.spinner_reload[0], 127);
+
+        let interval = ColecoBus::spinner_interval_cycles(machine.bus.spinner_reload[0]);
+        machine.bus.tick(interval);
+        assert_eq!(machine.bus.spinner_status[0], 127);
+        assert!(machine.bus.spinner_irq_active());
+        assert_ne!(machine.bus.io_read(0xfc) & 0x80, 0);
+        assert_eq!(machine.bus.io_read(0xfc) & 0x30, 0x20);
+
+        let snapshot = machine.save_state().unwrap();
+        let saved_d7 = machine.bus.spinner_d7_cycles[0];
+        let saved_irq = machine.bus.spinner_irq_cycles[0];
+
+        machine.bus.tick(saved_d7.max(saved_irq));
+        assert_eq!(machine.bus.spinner_status[0], 0);
+        assert!(!machine.bus.spinner_irq_active());
+
+        machine.load_state(&snapshot).unwrap();
+        assert_eq!(machine.bus.spinner_status[0], 127);
+        assert_eq!(machine.bus.spinner_d7_cycles[0], saved_d7);
+        assert_eq!(machine.bus.spinner_irq_cycles[0], saved_irq);
+
+        input.axes[0][AXIS_RIGHT_X] = i16::MIN;
+        machine.bus.set_inputs(&input);
+        let interval = ColecoBus::spinner_interval_cycles(machine.bus.spinner_reload[0]);
+        machine.bus.tick(interval);
+        assert_ne!(machine.bus.spinner_status[0] & 0x80, 0);
+        assert_eq!(machine.bus.io_read(0xfc) & 0x30, 0x00);
     }
 
     #[test]

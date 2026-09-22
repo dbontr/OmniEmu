@@ -30,6 +30,9 @@ impl StateWriter {
     pub fn u64(&mut self, value: u64) {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
+    pub fn u128(&mut self, value: u128) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
     pub fn f32(&mut self, value: f32) {
         self.u32(value.to_bits());
     }
@@ -108,6 +111,9 @@ impl<'a> StateReader<'a> {
     pub fn u64(&mut self) -> Result<u64, String> {
         Ok(u64::from_le_bytes(self.take()?))
     }
+    pub fn u128(&mut self) -> Result<u128, String> {
+        Ok(u128::from_le_bytes(self.take()?))
+    }
     pub fn f32(&mut self) -> Result<f32, String> {
         Ok(f32::from_bits(self.u32()?))
     }
@@ -146,6 +152,7 @@ mod tests {
     fn state_codec_is_versioned_and_endian_stable() {
         let mut writer = StateWriter::new(PlatformId::HomePong, 7);
         writer.u16(0x1234);
+        writer.u128(0x0123456789abcdef_fedcba9876543210);
         writer.f32(1.25);
         writer.blob(&[1, 2, 3]);
         let bytes = writer.finish();
@@ -153,6 +160,7 @@ mod tests {
         assert_eq!(&bytes[20..22], &[0x34, 0x12]);
         let mut reader = StateReader::new(&bytes, PlatformId::HomePong, 7).unwrap();
         assert_eq!(reader.u16().unwrap(), 0x1234);
+        assert_eq!(reader.u128().unwrap(), 0x0123456789abcdef_fedcba9876543210);
         assert_eq!(reader.f32().unwrap(), 1.25);
         assert_eq!(reader.blob().unwrap(), &[1, 2, 3]);
         reader.finish().unwrap();

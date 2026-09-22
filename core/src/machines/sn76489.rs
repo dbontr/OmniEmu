@@ -23,6 +23,7 @@ const VOLUME: [f32; 16] = [
 
 #[derive(Debug, Clone)]
 pub struct Sn76489 {
+    clock_hz: u64,
     tone_period: [u16; 3],
     tone_counter: [u16; 3],
     tone_level: [bool; 3],
@@ -39,7 +40,14 @@ pub struct Sn76489 {
 
 impl Default for Sn76489 {
     fn default() -> Self {
+        Self::new(PSG_CLOCK)
+    }
+}
+
+impl Sn76489 {
+    pub fn new(clock_hz: u64) -> Self {
         Self {
+            clock_hz: clock_hz.max(1),
             tone_period: [1; 3],
             tone_counter: [1; 3],
             tone_level: [false; 3],
@@ -54,11 +62,10 @@ impl Default for Sn76489 {
             samples: Vec::with_capacity(1024),
         }
     }
-}
 
-impl Sn76489 {
     pub fn reset(&mut self) {
-        *self = Self::default();
+        let clock_hz = self.clock_hz;
+        *self = Self::new(clock_hz);
     }
 
     pub fn begin_frame(&mut self) {
@@ -106,8 +113,8 @@ impl Sn76489 {
     pub fn tick_cpu_cycles(&mut self, cycles: u32) {
         for _ in 0..cycles {
             self.sample_phase += SAMPLE_RATE;
-            if self.sample_phase >= PSG_CLOCK {
-                self.sample_phase -= PSG_CLOCK;
+            if self.sample_phase >= self.clock_hz {
+                self.sample_phase -= self.clock_hz;
                 self.samples.push(self.mix());
             }
             self.divider = self.divider.wrapping_add(1);
@@ -209,7 +216,7 @@ impl Sn76489 {
         self.noise_level = input.u8()? != 0;
         self.latched_register = input.u8()?;
         self.divider = input.u8()?;
-        self.sample_phase = input.u64()?;
+        self.sample_phase = input.u64()? % self.clock_hz;
         self.samples.clear();
         Ok(())
     }
@@ -227,6 +234,33 @@ mod tests {
         psg.write(0x90);
         psg.tick_cpu_cycles(PSG_CLOCK as u32 / 30);
         assert!(psg.samples().iter().any(|sample| *sample > 0.0));
+    }
+
+    #[test]
+    fn custom_clock_survives_reset_and_state_round_trip() {
+        const PAL_CLOCK: u64 = 3_546_893;
+        let mut psg = Sn76489::new(PAL_CLOCK);
+        psg.sample_phase = PAL_CLOCK - 1;
+        psg.reset();
+        assert_eq!(psg.clock_hz, PAL_CLOCK);
+        assert_eq!(psg.sample_phase, 0);
+
+        psg.sample_phase = PAL_CLOCK - 1;
+        let mut writer = StateWriter::new(crate::platform::PlatformId::Genesis, 99);
+        psg.save(&mut writer);
+        let bytes = writer.finish();
+
+        let mut restored = Sn76489::new(PAL_CLOCK);
+        let mut reader =
+            StateReader::new(&bytes, crate::platform::PlatformId::Genesis, 99).unwrap();
+        restored.load(&mut reader).unwrap();
+        reader.finish().unwrap();
+        assert_eq!(restored.clock_hz, PAL_CLOCK);
+        assert_eq!(restored.sample_phase, PAL_CLOCK - 1);
+
+        restored.tick_cpu_cycles(1);
+        assert_eq!(restored.samples().len(), 1);
+        assert_eq!(restored.sample_phase, 47_999);
     }
 
     #[test]

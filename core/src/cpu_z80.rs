@@ -898,8 +898,14 @@ impl Z80 {
         let z = opcode & 7;
         let p = y >> 1;
         let q = y & 1;
-        if x != 1 {
+        if matches!(
+            opcode,
+            0xa0..=0xa3 | 0xa8..=0xab | 0xb0..=0xb3 | 0xb8..=0xbb
+        ) {
             return self.execute_block(bus, opcode);
+        }
+        if x != 1 {
+            return 8;
         }
         match z {
             0 => {
@@ -1467,6 +1473,28 @@ mod tests {
         assert_eq!(bus.output.last().map(|entry| entry.1), Some(0x55));
         assert_eq!(cpu.a, 0xa5);
     }
+    #[test]
+    fn undefined_ed_opcodes_are_side_effect_free_nops() {
+        for opcode in [0x00, 0x04, 0x80, 0x84, 0x9b, 0xc0, 0xff] {
+            let mut bus = TestBus::default();
+            bus.memory[0] = 0xed;
+            bus.memory[1] = opcode;
+            bus.memory[0x8000] = 0x5a;
+            let mut cpu = Z80::default();
+            cpu.set_hl(0x8000);
+            cpu.set_de(0x9000);
+            cpu.set_bc(0x0101);
+
+            assert_eq!(cpu.step(&mut bus), 8, "ED {opcode:02x} cycle count");
+            assert_eq!(cpu.pc, 2, "ED {opcode:02x} program counter");
+            assert_eq!(cpu.hl(), 0x8000, "ED {opcode:02x} changed HL");
+            assert_eq!(cpu.de(), 0x9000, "ED {opcode:02x} changed DE");
+            assert_eq!(cpu.bc(), 0x0101, "ED {opcode:02x} changed BC");
+            assert_eq!(bus.memory[0x9000], 0, "ED {opcode:02x} wrote memory");
+            assert!(bus.output.is_empty(), "ED {opcode:02x} performed I/O");
+        }
+    }
+
     #[test]
     fn indexed_loads_and_interrupt_mode_two_work() {
         let mut bus = TestBus::default();

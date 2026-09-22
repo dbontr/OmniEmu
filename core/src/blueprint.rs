@@ -90,6 +90,7 @@ pub struct SystemBlueprint {
 
 const NONE: &[ResourceKind] = &[];
 const BIOS: &[ResourceKind] = &[ResourceKind::Bios];
+const BIOS_FIRMWARE: &[ResourceKind] = &[ResourceKind::Bios, ResourceKind::Firmware];
 const BIOS_DISC: &[ResourceKind] = &[ResourceKind::Bios, ResourceKind::Disc];
 const FIRMWARE_DISC: &[ResourceKind] = &[ResourceKind::Firmware, ResourceKind::Disc];
 const FIRMWARE_KEYS: &[ResourceKind] = &[ResourceKind::Firmware, ResourceKind::Keys];
@@ -109,6 +110,7 @@ pub const TARGET_PLATFORMS: &[PlatformId] = &[
     PlatformId::SegaCd,
     PlatformId::Sega32x,
     PlatformId::PcEngine,
+    PlatformId::SuperGrafx,
     PlatformId::NeoGeo,
     PlatformId::PlayStation,
     PlatformId::Nintendo64,
@@ -195,7 +197,7 @@ pub fn blueprint(platform: PlatformId) -> Option<SystemBlueprint> {
             memory: Physical16,
             graphics: TileSprite,
             media: Cartridge,
-            required_resources: BIOS,
+            required_resources: BIOS_FIRMWARE,
             persistent_storage: false,
             encrypted_content: false,
         },
@@ -271,7 +273,7 @@ pub fn blueprint(platform: PlatformId) -> Option<SystemBlueprint> {
             cpus: vec![
                 cpu(M68000, 1, Big, 24),
                 cpu(Z80, 1, Little, 16),
-                cpu(Sh2, 2, Little, 32),
+                cpu(Sh2, 2, Big, 32),
             ],
             memory: Physical32,
             graphics: FixedFunction3d,
@@ -289,6 +291,17 @@ pub fn blueprint(platform: PlatformId) -> Option<SystemBlueprint> {
             media: Cartridge,
             required_resources: NONE,
             persistent_storage: true,
+            encrypted_content: false,
+        },
+        PlatformId::SuperGrafx => SystemBlueprint {
+            platform,
+            generation: 4,
+            cpus: vec![cpu(HuC6280, 1, Little, 21)],
+            memory: Physical24,
+            graphics: TileSprite,
+            media: Cartridge,
+            required_resources: NONE,
+            persistent_storage: false,
             encrypted_content: false,
         },
         PlatformId::NeoGeo => SystemBlueprint {
@@ -328,7 +341,7 @@ pub fn blueprint(platform: PlatformId) -> Option<SystemBlueprint> {
             platform,
             generation: 5,
             cpus: vec![
-                cpu(Sh2, 2, Little, 32),
+                cpu(Sh2, 2, Big, 32),
                 cpu(M68000, 1, Big, 24),
                 cpu(Dsp, 1, Little, 32),
             ],
@@ -482,7 +495,7 @@ mod tests {
 
     #[test]
     fn every_target_has_a_blueprint_and_high_end_addressing() {
-        assert_eq!(TARGET_PLATFORMS.len(), 29);
+        assert_eq!(TARGET_PLATFORMS.len(), 30);
         for &platform in TARGET_PLATFORMS {
             let system = blueprint(platform).expect("target must have blueprint");
             assert_eq!(system.platform, platform);
@@ -491,6 +504,27 @@ mod tests {
         assert_eq!(
             blueprint(PlatformId::Switch).unwrap().memory,
             MemoryModel::Virtual64
+        );
+    }
+
+    #[test]
+    fn generations_one_through_three_have_runnable_machine_graphs() {
+        for &platform in TARGET_PLATFORMS {
+            let system = blueprint(platform).expect("target must have blueprint");
+            if system.generation <= 3 {
+                assert!(
+                    platform.is_launchable(),
+                    "generation {} platform {} is not launchable",
+                    system.generation,
+                    platform as u32
+                );
+            }
+        }
+        assert_eq!(
+            blueprint(PlatformId::Intellivision)
+                .unwrap()
+                .required_resources,
+            BIOS_FIRMWARE
         );
     }
 

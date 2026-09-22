@@ -16,6 +16,25 @@ pub const R2: u64 = 1 << 13;
 pub const L3: u64 = 1 << 14;
 pub const R3: u64 = 1 << 15;
 
+pub const KEYPAD_0: u64 = 1 << 16;
+pub const KEYPAD_1: u64 = 1 << 17;
+pub const KEYPAD_2: u64 = 1 << 18;
+pub const KEYPAD_3: u64 = 1 << 19;
+pub const KEYPAD_4: u64 = 1 << 20;
+pub const KEYPAD_5: u64 = 1 << 21;
+pub const KEYPAD_6: u64 = 1 << 22;
+pub const KEYPAD_7: u64 = 1 << 23;
+pub const KEYPAD_8: u64 = 1 << 24;
+pub const KEYPAD_9: u64 = 1 << 25;
+pub const KEYPAD_STAR: u64 = 1 << 26;
+pub const KEYPAD_HASH: u64 = 1 << 27;
+pub const KEYPAD_CLEAR: u64 = 1 << 28;
+pub const KEYPAD_ENTER: u64 = 1 << 29;
+pub const PAUSE: u64 = 1 << 30;
+pub const RESET: u64 = 1 << 31;
+pub const POINTER_TOUCH: u64 = 1 << 32;
+pub const POINTER_CLICK: u64 = 1 << 33;
+
 pub const AXIS_LEFT_X: usize = 0;
 pub const AXIS_LEFT_Y: usize = 1;
 pub const AXIS_RIGHT_X: usize = 2;

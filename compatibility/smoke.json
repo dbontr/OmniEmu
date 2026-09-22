@@ -1,0 +1,1153 @@
+{
+  "schema": "omniemu-compatibility/1",
+  "cases": [
+    {
+      "name": "Magnavox Odyssey built-in smoke",
+      "platform": 1,
+      "supportAtLeast": 2,
+      "frames": 8,
+      "determinism": {
+        "replayFrames": 3
+      },
+      "expect": {
+        "video": {
+          "width": 320,
+          "height": 240,
+          "nonzero": true
+        },
+        "audio": {
+          "maxSamples": 0
+        }
+      }
+    },
+    {
+      "name": "Home Pong built-in smoke",
+      "platform": 2,
+      "supportAtLeast": 2,
+      "frames": 8,
+      "input": [
+        {
+          "buttons": "0x20",
+          "axes": [
+            12345,
+            0,
+            0,
+            0,
+            0,
+            32767
+          ]
+        }
+      ],
+      "determinism": {
+        "replayFrames": 3
+      },
+      "expect": {
+        "video": {
+          "width": 320,
+          "height": 240,
+          "nonzero": true
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2,
+          "minSamples": 1
+        }
+      }
+    },
+    {
+      "name": "PlayStation 2 ELF foundation smoke",
+      "platform": 51,
+      "supportAtLeast": 1,
+      "frames": 3,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "ps2-elf-loop",
+          "label": "ps2-elf-loop"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 640,
+          "height": 448
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2
+        }
+      }
+    },
+    {
+      "name": "GameCube DOL + IPL foundation smoke",
+      "platform": 52,
+      "supportAtLeast": 1,
+      "frames": 3,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "ppc-dol-loop",
+          "label": "ppc-dol-loop"
+        },
+        {
+          "kind": "bios",
+          "fixture": "gamecube-ipl",
+          "label": "gamecube-ipl"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 640,
+          "height": 480
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2
+        }
+      }
+    },
+    {
+      "name": "Xbox XBE foundation smoke",
+      "platform": 53,
+      "supportAtLeast": 1,
+      "frames": 3,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "xbox-xbe-loop",
+          "label": "xbox-xbe-loop"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 640,
+          "height": 480
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2
+        },
+        "persistent": [
+          {
+            "kind": "storage",
+            "slot": 0,
+            "length": 256
+          }
+        ]
+      }
+    },
+    {
+      "name": "Xbox 360 PowerPC64 foundation smoke",
+      "platform": 60,
+      "supportAtLeast": 1,
+      "frames": 3,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "ppc64-elf-loop",
+          "label": "ppc64-elf-loop"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 1280,
+          "height": 720
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2
+        }
+      }
+    },
+    {
+      "name": "PlayStation 3 PowerPC64 foundation smoke",
+      "platform": 61,
+      "supportAtLeast": 1,
+      "frames": 3,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "ppc64-elf-loop",
+          "label": "ppc64-elf-loop"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 1280,
+          "height": 720
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2
+        }
+      }
+    },
+    {
+      "name": "Wii DOL foundation smoke",
+      "platform": 62,
+      "supportAtLeast": 1,
+      "frames": 3,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "ppc-dol-loop",
+          "label": "ppc-dol-loop"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 640,
+          "height": 480
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2
+        }
+      }
+    },
+    {
+      "name": "Wii U PowerPC foundation smoke",
+      "platform": 70,
+      "supportAtLeast": 1,
+      "frames": 3,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "ppc32-elf-loop",
+          "label": "ppc32-elf-loop"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 1280,
+          "height": 720
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2
+        }
+      }
+    },
+    {
+      "name": "Switch NRO foundation smoke",
+      "platform": 71,
+      "supportAtLeast": 1,
+      "frames": 3,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "switch-nro-loop",
+          "label": "switch-nro-loop"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 1280,
+          "height": 720
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2
+        }
+      }
+    },
+    {
+      "name": "NES NROM compatibility smoke",
+      "platform": 20,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "nes-nrom",
+          "label": "NES NROM"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 256,
+          "height": 240,
+          "nonzero": true
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2
+        },
+        "persistent": [
+          {
+            "kind": "storage",
+            "slot": 0,
+            "length": 8192
+          }
+        ]
+      }
+    },
+    {
+      "name": "Master System Mode 4 compatibility smoke",
+      "platform": 21,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "master-system-cart",
+          "label": "Master System cartridge"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 256,
+          "height": 192,
+          "nonzero": true
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2
+        }
+      }
+    },
+    {
+      "name": "ColecoVision cartridge compatibility smoke",
+      "platform": 12,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "coleco-cart",
+          "label": "ColecoVision cartridge"
+        },
+        {
+          "kind": "bios",
+          "fixture": "coleco-bios",
+          "label": "ColecoVision BIOS"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 256,
+          "height": 192,
+          "nonzero": true
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2
+        }
+      }
+    },
+    {
+      "name": "Intellivision cartridge compatibility smoke",
+      "platform": 13,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "intellivision-cart",
+          "label": "Intellivision cartridge"
+        },
+        {
+          "kind": "bios",
+          "fixture": "intellivision-exec",
+          "label": "Intellivision EXEC"
+        },
+        {
+          "kind": "firmware",
+          "fixture": "intellivision-grom",
+          "label": "Intellivision GROM"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 320,
+          "height": 192
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2,
+          "minSamples": 1
+        }
+      }
+    },
+    {
+      "name": "Sega CD BIOS and disc compatibility smoke",
+      "platform": 32,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "bios",
+          "fixture": "sega-cd-bios",
+          "label": "Sega CD BIOS"
+        },
+        {
+          "kind": "disc",
+          "fixture": "sega-cd-disc",
+          "label": "Sega CD ISO",
+          "streaming": false
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 320,
+          "height": 224
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2,
+          "minSamples": 1
+        },
+        "persistent": [
+          {
+            "kind": "storage",
+            "slot": 0,
+            "length": 8192
+          }
+        ]
+      }
+    },
+    {
+      "name": "Atari 2600 cartridge compatibility smoke",
+      "platform": 10,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "atari2600-cart",
+          "label": "Atari 2600 cartridge"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 160,
+          "height": 192,
+          "nonzero": true
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2,
+          "minSamples": 1
+        }
+      }
+    },
+    {
+      "name": "Atari 5200 cartridge compatibility smoke",
+      "platform": 11,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "atari5200-cart",
+          "label": "Atari 5200 cartridge"
+        },
+        {
+          "kind": "bios",
+          "fixture": "atari5200-bios",
+          "label": "Atari 5200 BIOS"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 320,
+          "height": 192,
+          "nonzero": true
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2,
+          "minSamples": 1
+        }
+      }
+    },
+    {
+      "name": "Atari 7800 cartridge compatibility smoke",
+      "platform": 22,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "atari7800-cart",
+          "label": "Atari 7800 cartridge"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 320,
+          "height": 240,
+          "nonzero": true
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2,
+          "minSamples": 1
+        }
+      }
+    },
+    {
+      "name": "SNES LoROM compatibility smoke",
+      "platform": 30,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "snes-cart",
+          "label": "SNES LoROM cartridge"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 256,
+          "height": 224,
+          "nonzero": true
+        },
+        "audio": {
+          "rate": 32000,
+          "channels": 2,
+          "minSamples": 1
+        }
+      }
+    },
+    {
+      "name": "Genesis cartridge compatibility smoke",
+      "platform": 31,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "genesis-cart",
+          "label": "Genesis cartridge"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 320,
+          "height": 224
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2,
+          "minSamples": 1
+        }
+      }
+    },
+    {
+      "name": "Genesis Super Street Fighter II mapper compatibility smoke",
+      "platform": 31,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "genesis-ssf2-cart",
+          "label": "Genesis 5 MiB SSF2 cartridge"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 320,
+          "height": 224,
+          "nonzero": true
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2,
+          "minSamples": 1
+        }
+      }
+    },
+    {
+      "name": "Sega 32X cartridge compatibility smoke",
+      "platform": 33,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "sega32x-cart",
+          "label": "Sega 32X cartridge"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 320,
+          "height": 224,
+          "nonzero": true
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2,
+          "minSamples": 1
+        }
+      }
+    },
+    {
+      "name": "PC Engine HuCard compatibility smoke",
+      "platform": 34,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "pc-engine-cart",
+          "label": "PC Engine HuCard"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 256,
+          "height": 240,
+          "nonzero": true
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2,
+          "minSamples": 1
+        }
+      }
+    },
+    {
+      "name": "PC Engine Street Fighter II large-HuCard compatibility smoke",
+      "platform": 34,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "pc-engine-sf2-cart",
+          "label": "PC Engine 2.5 MiB banked HuCard"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 256,
+          "height": 240,
+          "nonzero": true
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2,
+          "minSamples": 1
+        }
+      }
+    },
+    {
+      "name": "SuperGrafx HuCard compatibility smoke",
+      "platform": 36,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "pc-engine-cart",
+          "label": "SuperGrafx HuCard"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 256,
+          "height": 240,
+          "nonzero": true
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2,
+          "minSamples": 1
+        }
+      }
+    },
+    {
+      "name": "PC Engine CD-ROM compatibility smoke",
+      "platform": 34,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "bios",
+          "fixture": "pc-engine-system-card",
+          "label": "PC Engine System Card"
+        },
+        {
+          "kind": "disc",
+          "fixture": "pc-engine-cd-disc",
+          "label": "PC Engine CD-ROM",
+          "streaming": false
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 256,
+          "height": 240,
+          "nonzero": true
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2,
+          "minSamples": 1
+        },
+        "persistent": [
+          {
+            "kind": "storage",
+            "slot": 0,
+            "length": 2048
+          }
+        ]
+      }
+    },
+    {
+      "name": "PC Engine Arcade Card compatibility smoke",
+      "platform": 34,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "bios",
+          "fixture": "pc-engine-arcade-card-system-card",
+          "label": "PC Engine Arcade Card probe System Card"
+        },
+        {
+          "kind": "disc",
+          "fixture": "pc-engine-cd-disc",
+          "label": "PC Engine Arcade Card CD-ROM",
+          "streaming": false
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 256,
+          "height": 240,
+          "nonzero": true
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2,
+          "minSamples": 1
+        },
+        "persistent": [
+          {
+            "kind": "storage",
+            "slot": 0,
+            "length": 2048
+          }
+        ]
+      }
+    },
+    {
+      "name": "PC Engine multitrack CUE compatibility smoke",
+      "platform": 34,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "bios",
+          "fixture": "pc-engine-system-card",
+          "label": "PC Engine System Card"
+        },
+        {
+          "kind": "disc",
+          "fixture": "pc-engine-cd-cue",
+          "label": "PC Engine multitrack CUE",
+          "streaming": false
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 256,
+          "height": 240,
+          "nonzero": true
+        },
+        "audio": {
+          "rate": 48000,
+          "channels": 2,
+          "minSamples": 1
+        },
+        "persistent": [
+          {
+            "kind": "storage",
+            "slot": 0,
+            "length": 2048
+          }
+        ]
+      }
+    },
+    {
+      "name": "Neo Geo NEO1 compatibility smoke",
+      "platform": 35,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "neo-geo-cart",
+          "label": "Neo Geo NEO1 cartridge"
+        },
+        {
+          "kind": "bios",
+          "fixture": "neo-geo-bios",
+          "label": "Neo Geo BIOS"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 320,
+          "height": 224,
+          "nonzero": true
+        },
+        "audio": {
+          "channels": 2,
+          "minSamples": 1
+        },
+        "persistent": [
+          {
+            "kind": "storage",
+            "slot": 0,
+            "length": 65536
+          },
+          {
+            "kind": "memoryCard",
+            "slot": 0,
+            "length": 2048
+          }
+        ]
+      }
+    },
+    {
+      "name": "PlayStation BIOS compatibility smoke",
+      "platform": 40,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "bios",
+          "fixture": "ps1-bios",
+          "label": "PlayStation BIOS"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 320,
+          "height": 240,
+          "nonzero": true
+        },
+        "audio": {
+          "rate": 44100,
+          "channels": 2,
+          "minSamples": 1
+        }
+      }
+    },
+    {
+      "name": "Nintendo 64 cartridge compatibility smoke",
+      "platform": 41,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "n64-cart",
+          "label": "Nintendo 64 cartridge"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 640,
+          "height": 480,
+          "nonzero": true
+        },
+        "audio": {
+          "channels": 2,
+          "minSamples": 1
+        },
+        "persistent": [
+          {
+            "kind": "storage",
+            "slot": 0,
+            "length": 131072
+          },
+          {
+            "kind": "memoryCard",
+            "slot": 0,
+            "length": 32768
+          }
+        ]
+      }
+    },
+    {
+      "name": "Saturn BIOS compatibility smoke",
+      "platform": 42,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "bios",
+          "fixture": "saturn-bios",
+          "label": "Saturn BIOS"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 320,
+          "height": 224
+        },
+        "audio": {
+          "rate": 44100,
+          "channels": 2,
+          "minSamples": 1
+        },
+        "persistent": [
+          {
+            "kind": "storage",
+            "slot": 0,
+            "length": 32768
+          }
+        ]
+      }
+    },
+    {
+      "name": "Atari Jaguar cartridge compatibility smoke",
+      "platform": 43,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "game",
+          "fixture": "jaguar-cart",
+          "label": "Atari Jaguar cartridge"
+        },
+        {
+          "kind": "bios",
+          "fixture": "jaguar-bios",
+          "label": "Atari Jaguar BIOS"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 320,
+          "height": 240,
+          "nonzero": true
+        },
+        "audio": {
+          "channels": 2,
+          "minSamples": 1
+        },
+        "persistent": [
+          {
+            "kind": "storage",
+            "slot": 0,
+            "length": 128
+          }
+        ]
+      }
+    },
+    {
+      "name": "3DO BIOS compatibility smoke",
+      "platform": 44,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "bios",
+          "fixture": "3do-bios",
+          "label": "3DO BIOS"
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 640,
+          "height": 480
+        },
+        "audio": {
+          "rate": 44100,
+          "channels": 2,
+          "minSamples": 1
+        },
+        "persistent": [
+          {
+            "kind": "storage",
+            "slot": 0,
+            "length": 32768
+          }
+        ]
+      }
+    },
+    {
+      "name": "Dreamcast BIOS and disc compatibility smoke",
+      "platform": 50,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "bios",
+          "fixture": "dreamcast-bios",
+          "label": "Dreamcast BIOS"
+        },
+        {
+          "kind": "disc",
+          "fixture": "dreamcast-disc",
+          "label": "Dreamcast disc",
+          "streaming": false
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 640,
+          "height": 480
+        },
+        "audio": {
+          "rate": 44100,
+          "channels": 2,
+          "minSamples": 1
+        },
+        "persistent": [
+          {
+            "kind": "storage",
+            "slot": 0,
+            "length": 131072
+          }
+        ]
+      }
+    },
+    {
+      "name": "Dreamcast multitrack CUE compatibility smoke",
+      "platform": 50,
+      "supportAtLeast": 1,
+      "frames": 2,
+      "resources": [
+        {
+          "kind": "bios",
+          "fixture": "dreamcast-bios",
+          "label": "Dreamcast BIOS"
+        },
+        {
+          "kind": "disc",
+          "fixture": "dreamcast-cue",
+          "label": "Dreamcast multitrack CUE",
+          "streaming": false
+        }
+      ],
+      "determinism": {
+        "replayFrames": 2
+      },
+      "expect": {
+        "video": {
+          "width": 640,
+          "height": 480
+        },
+        "audio": {
+          "rate": 44100,
+          "channels": 2,
+          "minSamples": 1
+        },
+        "persistent": [
+          {
+            "kind": "storage",
+            "slot": 0,
+            "length": 131072
+          }
+        ]
+      }
+    }
+  ]
+}

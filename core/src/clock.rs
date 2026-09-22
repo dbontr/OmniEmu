@@ -56,6 +56,15 @@ impl ClockDomain {
     pub fn phase(&self) -> (u128, u128) {
         (self.phase, self.ratio_den)
     }
+
+    pub fn restore(&mut self, phase: u128, cycles: u64) -> Result<(), String> {
+        if phase >= self.ratio_den {
+            return Err("clock-domain phase is outside its ratio denominator".into());
+        }
+        self.phase = phase;
+        self.cycles = cycles;
+        Ok(())
+    }
 }
 
 fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
@@ -77,6 +86,25 @@ mod tests {
         assert_eq!(ppu.advance(1000), 3000);
         assert_eq!(ppu.advance(1), 3);
         assert_eq!(ppu.cycles(), 3003);
+    }
+
+    #[test]
+    fn restored_clock_domain_preserves_exact_future_schedule() {
+        let master = ClockRate::rational(5_992, 100);
+        let device = ClockRate::hz(894_886);
+        let mut original = ClockDomain::new(master, device);
+        for _ in 0..137 {
+            original.advance(1);
+        }
+        let (phase, _) = original.phase();
+        let cycles = original.cycles();
+        let mut restored = ClockDomain::new(master, device);
+        restored.restore(phase, cycles).unwrap();
+        for _ in 0..1_000 {
+            assert_eq!(restored.advance(1), original.advance(1));
+        }
+        assert_eq!(restored.cycles(), original.cycles());
+        assert_eq!(restored.phase(), original.phase());
     }
 
     #[test]

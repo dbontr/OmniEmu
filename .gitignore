@@ -27,4 +27,5 @@ dist-ssr
 .edge-live/
 core/target/
 public/omnicore.wasm
+compatibility/last-report.json
 .edge-*/

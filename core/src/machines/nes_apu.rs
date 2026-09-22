@@ -1,7 +1,7 @@
 use crate::kernel::AudioBuffer;
 use crate::state::{StateReader, StateWriter};
 
-const CPU_HZ: u64 = 1_789_773;
+const NTSC_CPU_HZ: u64 = 1_789_773;
 const SAMPLE_RATE: u32 = 48_000;
 const LENGTH_TABLE: [u8; 32] = [
     10, 254, 20, 2, 40, 4, 80, 6, 160, 8, 60, 10, 14, 12, 26, 14, 12, 16, 24, 18, 48, 20, 96, 22,
@@ -122,6 +122,9 @@ impl Pulse {
         }
     }
     fn target_period(&self) -> u16 {
+        if self.sweep_negate && self.sweep_shift == 0 {
+            return 0;
+        }
         let delta = self.timer_period >> self.sweep_shift;
         if self.sweep_negate {
             self.timer_period
@@ -132,7 +135,7 @@ impl Pulse {
         }
     }
     fn sweep_muted(&self) -> bool {
-        self.timer_period < 8 || (self.sweep_shift != 0 && self.target_period() > 0x07ff)
+        self.timer_period < 8 || self.target_period() > 0x07ff
     }
     fn quarter_frame(&mut self) {
         self.envelope.quarter_frame();
@@ -205,7 +208,7 @@ impl Triangle {
     fn tick_timer(&mut self) {
         if self.timer == 0 {
             self.timer = self.timer_period;
-            if self.length != 0 && self.linear_counter != 0 && self.timer_period > 1 {
+            if self.length != 0 && self.linear_counter != 0 {
                 self.sequence = (self.sequence + 1) & 31;
             }
         } else {
@@ -228,11 +231,7 @@ impl Triangle {
         }
     }
     fn output(&self) -> u8 {
-        if !self.enabled || self.length == 0 || self.linear_counter == 0 {
-            0
-        } else {
-            TRIANGLE_TABLE[self.sequence as usize]
-        }
+        TRIANGLE_TABLE[self.sequence as usize]
     }
     fn active(&self) -> bool {
         self.length != 0
@@ -264,8 +263,11 @@ impl Default for Noise {
     }
 }
 
-const NOISE_PERIOD: [u16; 16] = [
+const NOISE_PERIOD_NTSC: [u16; 16] = [
     4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068,
+];
+const NOISE_PERIOD_PAL: [u16; 16] = [
+    4, 8, 14, 30, 60, 88, 118, 148, 188, 236, 354, 472, 708, 944, 1890, 3778,
 ];
 impl Noise {
     fn write_control(&mut self, value: u8) {
@@ -287,9 +289,14 @@ impl Noise {
             self.length = 0;
         }
     }
-    fn tick_timer(&mut self) {
+    fn tick_timer(&mut self, pal: bool) {
         if self.timer == 0 {
-            self.timer = NOISE_PERIOD[self.period_index as usize];
+            let periods = if pal {
+                &NOISE_PERIOD_PAL
+            } else {
+                &NOISE_PERIOD_NTSC
+            };
+            self.timer = periods[self.period_index as usize].saturating_sub(1);
             let tap = if self.mode { 6 } else { 1 };
             let feedback = (self.shift & 1) ^ ((self.shift >> tap) & 1);
             self.shift = (self.shift >> 1) | (feedback << 14);
@@ -316,8 +323,11 @@ impl Noise {
         self.length != 0
     }
 }
-const DMC_RATE: [u16; 16] = [
+const DMC_RATE_NTSC: [u16; 16] = [
     428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54,
+];
+const DMC_RATE_PAL: [u16; 16] = [
+    398, 354, 316, 298, 276, 236, 210, 198, 176, 148, 132, 118, 98, 78, 66, 50,
 ];
 
 #[derive(Debug, Clone)]
@@ -338,6 +348,8 @@ struct Dmc {
     silence: bool,
     irq_pending: bool,
     fetch_pending: bool,
+    fetch_delay: u8,
+    fetch_cycles: u8,
 }
 
 impl Default for Dmc {
@@ -347,7 +359,7 @@ impl Default for Dmc {
             irq_enabled: false,
             loop_flag: false,
             rate_index: 0,
-            timer: DMC_RATE[0],
+            timer: DMC_RATE_NTSC[0],
             output_level: 0,
             sample_address: 0xc000,
             sample_length: 1,
@@ -359,6 +371,8 @@ impl Default for Dmc {
             silence: true,
             irq_pending: false,
             fetch_pending: false,
+            fetch_delay: 0,
+            fetch_cycles: 0,
         }
     }
 }
@@ -381,23 +395,44 @@ impl Dmc {
     fn write_length(&mut self, value: u8) {
         self.sample_length = (value as u16) * 16 + 1;
     }
-    fn set_enabled(&mut self, enabled: bool) {
+    fn set_enabled(&mut self, enabled: bool, cpu_cycle: u64) {
         self.enabled = enabled;
         self.irq_pending = false;
         if !enabled {
             self.bytes_remaining = 0;
             self.fetch_pending = false;
+            self.fetch_delay = 0;
+            self.fetch_cycles = 0;
         } else if self.bytes_remaining == 0 {
             self.restart_sample();
+            if self.sample_buffer.is_none() && !self.fetch_pending {
+                self.fetch_delay = if cpu_cycle & 1 == 0 { 2 } else { 3 };
+                self.fetch_cycles = 3;
+            }
         }
     }
     fn restart_sample(&mut self) {
         self.current_address = self.sample_address;
         self.bytes_remaining = self.sample_length;
     }
-    fn tick(&mut self) {
+    fn schedule_reload_fetch(&mut self) {
+        if self.enabled
+            && self.bytes_remaining != 0
+            && self.sample_buffer.is_none()
+            && !self.fetch_pending
+            && self.fetch_cycles == 0
+        {
+            self.fetch_delay = 0;
+            self.fetch_cycles = 4;
+        }
+    }
+    fn tick(&mut self, pal: bool) {
+        if self.fetch_delay > 0 {
+            self.fetch_delay -= 1;
+        }
         if self.timer == 0 {
-            self.timer = DMC_RATE[self.rate_index as usize].saturating_sub(1);
+            let rates = if pal { &DMC_RATE_PAL } else { &DMC_RATE_NTSC };
+            self.timer = rates[self.rate_index as usize].saturating_sub(1);
             if !self.silence {
                 if self.shift_register & 1 != 0 {
                     if self.output_level <= 125 {
@@ -416,6 +451,7 @@ impl Dmc {
                 if let Some(sample) = self.sample_buffer.take() {
                     self.shift_register = sample;
                     self.silence = false;
+                    self.schedule_reload_fetch();
                 } else {
                     self.silence = true;
                 }
@@ -425,16 +461,20 @@ impl Dmc {
         }
     }
 
-    fn take_fetch_request(&mut self) -> Option<u16> {
+    fn take_fetch_request(&mut self) -> Option<(u16, u8)> {
         if !self.enabled
             || self.fetch_pending
+            || self.fetch_delay != 0
+            || self.fetch_cycles == 0
             || self.sample_buffer.is_some()
             || self.bytes_remaining == 0
         {
             return None;
         }
         self.fetch_pending = true;
-        Some(self.current_address)
+        let cycles = self.fetch_cycles;
+        self.fetch_cycles = 0;
+        Some((self.current_address, cycles))
     }
 
     fn supply_byte(&mut self, value: u8) {
@@ -479,6 +519,8 @@ impl Dmc {
         out.u8(self.silence as u8);
         out.u8(self.irq_pending as u8);
         out.u8(self.fetch_pending as u8);
+        out.u8(self.fetch_delay);
+        out.u8(self.fetch_cycles);
     }
     fn load(input: &mut StateReader<'_>) -> Result<Self, String> {
         let enabled = input.u8()? != 0;
@@ -498,6 +540,8 @@ impl Dmc {
         let silence = input.u8()? != 0;
         let irq_pending = input.u8()? != 0;
         let fetch_pending = input.u8()? != 0;
+        let fetch_delay = input.u8()?.min(3);
+        let fetch_cycles = input.u8()?.min(4);
         Ok(Self {
             enabled,
             irq_enabled,
@@ -515,7 +559,36 @@ impl Dmc {
             silence,
             irq_pending,
             fetch_pending,
+            fetch_delay,
+            fetch_cycles,
         })
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct HighPassFilter {
+    previous_input: f32,
+    previous_output: f32,
+}
+
+impl HighPassFilter {
+    fn process(&mut self, input: f32, alpha: f32) -> f32 {
+        let output = alpha * (self.previous_output + input - self.previous_input);
+        self.previous_input = input;
+        self.previous_output = output;
+        output
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct LowPassFilter {
+    output: f32,
+}
+
+impl LowPassFilter {
+    fn process(&mut self, input: f32, alpha: f32) -> f32 {
+        self.output += alpha * (input - self.output);
+        self.output
     }
 }
 
@@ -530,38 +603,73 @@ pub struct Apu {
     five_step: bool,
     irq_inhibit: bool,
     frame_irq: bool,
+    frame_write_value: Option<u8>,
+    frame_write_delay: u8,
+    block_frame_counter_tick: u8,
     cpu_cycle: u64,
     sample_phase: u64,
+    cpu_hz: u64,
+    pal: bool,
+    high_pass_90_alpha: f32,
+    high_pass_440_alpha: f32,
+    low_pass_14k_alpha: f32,
+    high_pass_90: HighPassFilter,
+    high_pass_440: HighPassFilter,
+    low_pass_14k: LowPassFilter,
     samples: Vec<f32>,
 }
 
 impl Default for Apu {
     fn default() -> Self {
+        Self::new(NTSC_CPU_HZ, false)
+    }
+}
+
+impl Apu {
+    pub fn new(cpu_hz: u64, pal: bool) -> Self {
+        let cpu_hz_f32 = cpu_hz as f32;
+        let high_pass_90_alpha = cpu_hz_f32 / (cpu_hz_f32 + core::f32::consts::TAU * 90.0);
+        let high_pass_440_alpha = cpu_hz_f32 / (cpu_hz_f32 + core::f32::consts::TAU * 440.0);
+        let low_pass_14k_alpha =
+            (core::f32::consts::TAU * 14_000.0) / (cpu_hz_f32 + core::f32::consts::TAU * 14_000.0);
+        let mut dmc = Dmc::default();
+        if pal {
+            dmc.timer = DMC_RATE_PAL[0];
+        }
         Self {
             pulse1: Pulse::new(true),
             pulse2: Pulse::new(false),
             triangle: Triangle::default(),
             noise: Noise::default(),
-            dmc: Dmc::default(),
+            dmc,
             frame_cycle: 0,
             five_step: false,
             irq_inhibit: false,
             frame_irq: false,
+            frame_write_value: None,
+            frame_write_delay: 0,
+            block_frame_counter_tick: 0,
             cpu_cycle: 0,
             sample_phase: 0,
+            cpu_hz,
+            pal,
+            high_pass_90_alpha,
+            high_pass_440_alpha,
+            low_pass_14k_alpha,
+            high_pass_90: HighPassFilter::default(),
+            high_pass_440: HighPassFilter::default(),
+            low_pass_14k: LowPassFilter::default(),
             samples: Vec::with_capacity(1024),
         }
     }
-}
 
-impl Apu {
     pub fn reset(&mut self) {
-        *self = Self::default();
+        *self = Self::new(self.cpu_hz, self.pal);
     }
     pub fn irq_pending(&self) -> bool {
         self.frame_irq || self.dmc.irq_pending
     }
-    pub fn take_dmc_fetch_request(&mut self) -> Option<u16> {
+    pub fn take_dmc_fetch_request(&mut self) -> Option<(u16, u8)> {
         self.dmc.take_fetch_request()
     }
     pub fn supply_dmc_byte(&mut self, value: u8) {
@@ -598,18 +706,14 @@ impl Apu {
         self.pulse2.set_enabled(value & 0x02 != 0);
         self.triangle.set_enabled(value & 0x04 != 0);
         self.noise.set_enabled(value & 0x08 != 0);
-        self.dmc.set_enabled(value & 0x10 != 0);
+        self.dmc.set_enabled(value & 0x10 != 0, self.cpu_cycle);
     }
     fn write_frame_counter(&mut self, value: u8) {
-        self.five_step = value & 0x80 != 0;
+        self.frame_write_value = Some(value);
+        self.frame_write_delay = if self.cpu_cycle & 1 == 0 { 3 } else { 4 };
         self.irq_inhibit = value & 0x40 != 0;
         if self.irq_inhibit {
             self.frame_irq = false;
-        }
-        self.frame_cycle = 0;
-        if self.five_step {
-            self.quarter_frame();
-            self.half_frame();
         }
     }
 
@@ -637,59 +741,123 @@ impl Apu {
         self.triangle.half_frame();
         self.noise.half_frame();
     }
+    fn clock_frame_units(&mut self, half_frame: bool) {
+        if self.block_frame_counter_tick != 0 {
+            return;
+        }
+        self.quarter_frame();
+        if half_frame {
+            self.half_frame();
+        }
+        self.block_frame_counter_tick = 2;
+    }
+
+    fn apply_pending_frame_counter_write(&mut self) {
+        let Some(value) = self.frame_write_value else {
+            return;
+        };
+        if self.frame_write_delay > 0 {
+            self.frame_write_delay -= 1;
+        }
+        if self.frame_write_delay != 0 {
+            return;
+        }
+
+        self.frame_write_value = None;
+        self.five_step = value & 0x80 != 0;
+        self.frame_cycle = 0;
+        if self.five_step {
+            self.clock_frame_units(true);
+        }
+    }
+
     fn clock_frame_counter(&mut self) {
         self.frame_cycle += 1;
         if self.five_step {
-            match self.frame_cycle {
-                7457 | 22371 => self.quarter_frame(),
-                14913 | 37281 => {
-                    self.quarter_frame();
-                    self.half_frame();
+            if self.pal {
+                match self.frame_cycle {
+                    8313 | 24939 => self.clock_frame_units(false),
+                    16627 | 41565 => self.clock_frame_units(true),
+                    _ => {}
                 }
+                if self.frame_cycle >= 41566 {
+                    self.frame_cycle = 0;
+                }
+            } else {
+                match self.frame_cycle {
+                    7457 | 22371 => self.clock_frame_units(false),
+                    14913 | 37281 => self.clock_frame_units(true),
+                    _ => {}
+                }
+                if self.frame_cycle >= 37282 {
+                    self.frame_cycle = 0;
+                }
+            }
+        } else if self.pal {
+            if matches!(self.frame_cycle, 33252..=33254) && !self.irq_inhibit {
+                self.frame_irq = true;
+            }
+            match self.frame_cycle {
+                8313 | 24939 => self.clock_frame_units(false),
+                16627 | 33253 => self.clock_frame_units(true),
                 _ => {}
             }
-            if self.frame_cycle >= 37282 {
+            if self.frame_cycle >= 33254 {
                 self.frame_cycle = 0;
             }
         } else {
+            if matches!(self.frame_cycle, 29828..=29830) && !self.irq_inhibit {
+                self.frame_irq = true;
+            }
             match self.frame_cycle {
-                7457 | 22371 => self.quarter_frame(),
-                14913 => {
-                    self.quarter_frame();
-                    self.half_frame();
-                }
-                29829 => {
-                    self.quarter_frame();
-                    self.half_frame();
-                    if !self.irq_inhibit {
-                        self.frame_irq = true;
-                    }
-                }
+                7457 | 22371 => self.clock_frame_units(false),
+                14913 | 29829 => self.clock_frame_units(true),
                 _ => {}
             }
             if self.frame_cycle >= 29830 {
                 self.frame_cycle = 0;
             }
         }
+
+        self.apply_pending_frame_counter_write();
+        if self.block_frame_counter_tick > 0 {
+            self.block_frame_counter_tick -= 1;
+        }
     }
 
+    #[cfg(test)]
     pub fn tick_cpu_cycles(&mut self, cycles: u32) {
         for _ in 0..cycles {
-            self.cpu_cycle = self.cpu_cycle.wrapping_add(1);
-            self.triangle.tick_timer();
-            self.dmc.tick();
-            if self.cpu_cycle & 1 == 0 {
-                self.pulse1.tick_timer();
-                self.pulse2.tick_timer();
-                self.noise.tick_timer();
-            }
-            self.clock_frame_counter();
-            self.sample_phase += SAMPLE_RATE as u64;
-            if self.sample_phase >= CPU_HZ {
-                self.sample_phase -= CPU_HZ;
-                self.samples.push(self.mix());
-            }
+            self.tick_cpu_cycle_with_expansion(0.0);
         }
+    }
+
+    pub fn tick_cpu_cycle_with_expansion(&mut self, expansion: f32) {
+        self.cpu_cycle = self.cpu_cycle.wrapping_add(1);
+        self.triangle.tick_timer();
+        self.noise.tick_timer(self.pal);
+        self.dmc.tick(self.pal);
+        if self.cpu_cycle & 1 == 0 {
+            self.pulse1.tick_timer();
+            self.pulse2.tick_timer();
+        }
+        self.clock_frame_counter();
+
+        let mixed = (self.mix() + expansion).clamp(-1.0, 1.0);
+        let filtered = self.filter_output(mixed).clamp(-1.0, 1.0);
+        self.sample_phase += SAMPLE_RATE as u64;
+        if self.sample_phase >= self.cpu_hz {
+            self.sample_phase -= self.cpu_hz;
+            self.samples.push(filtered);
+        }
+    }
+    fn filter_output(&mut self, input: f32) -> f32 {
+        let high_pass_90 = self.high_pass_90.process(input, self.high_pass_90_alpha);
+        let high_pass_440 = self
+            .high_pass_440
+            .process(high_pass_90, self.high_pass_440_alpha);
+        self.low_pass_14k
+            .process(high_pass_440, self.low_pass_14k_alpha)
     }
     fn mix(&self) -> f32 {
         let pulse_sum = (self.pulse1.output() + self.pulse2.output()) as f32;
@@ -707,7 +875,7 @@ impl Apu {
         } else {
             159.79 / (1.0 / tnd_input + 100.0)
         };
-        ((pulse + tnd) * 1.35).clamp(0.0, 1.0)
+        (pulse + tnd).clamp(0.0, 1.0)
     }
 
     pub fn drain_audio(&mut self, output: &mut AudioBuffer) {
@@ -717,8 +885,7 @@ impl Apu {
             return;
         }
         for sample in self.samples.drain(..) {
-            let centered = (sample - 0.25).clamp(-1.0, 1.0);
-            output.push_stereo(centered, centered);
+            output.push_stereo(sample, sample);
         }
     }
 
@@ -732,8 +899,17 @@ impl Apu {
         out.u8(self.five_step as u8);
         out.u8(self.irq_inhibit as u8);
         out.u8(self.frame_irq as u8);
+        out.u8(self.frame_write_value.unwrap_or(0));
+        out.u8(self.frame_write_value.is_some() as u8);
+        out.u8(self.frame_write_delay);
+        out.u8(self.block_frame_counter_tick);
         out.u64(self.cpu_cycle);
         out.u64(self.sample_phase);
+        out.f32(self.high_pass_90.previous_input);
+        out.f32(self.high_pass_90.previous_output);
+        out.f32(self.high_pass_440.previous_input);
+        out.f32(self.high_pass_440.previous_output);
+        out.f32(self.low_pass_14k.output);
     }
     pub fn load(&mut self, input: &mut StateReader<'_>) -> Result<(), String> {
         self.pulse1 = load_pulse(input)?;
@@ -747,8 +923,21 @@ impl Apu {
         self.five_step = input.u8()? != 0;
         self.irq_inhibit = input.u8()? != 0;
         self.frame_irq = input.u8()? != 0;
+        let frame_write_value = input.u8()?;
+        let has_frame_write = input.u8()? != 0;
+        self.frame_write_delay = input.u8()?.min(4);
+        self.block_frame_counter_tick = input.u8()?.min(2);
+        self.frame_write_value = has_frame_write.then_some(frame_write_value);
+        if !has_frame_write {
+            self.frame_write_delay = 0;
+        }
         self.cpu_cycle = input.u64()?;
         self.sample_phase = input.u64()?;
+        self.high_pass_90.previous_input = input.f32()?;
+        self.high_pass_90.previous_output = input.f32()?;
+        self.high_pass_440.previous_input = input.f32()?;
+        self.high_pass_440.previous_output = input.f32()?;
+        self.low_pass_14k.output = input.f32()?;
         self.samples.clear();
         Ok(())
     }
@@ -868,12 +1057,218 @@ mod tests {
         assert!(apu.samples.iter().any(|sample| *sample > 0.0));
     }
     #[test]
+    fn expansion_audio_changes_the_filtered_apu_waveform() {
+        let mut baseline = Apu::default();
+        let mut expanded = Apu::default();
+        for _ in 0..4_000 {
+            baseline.tick_cpu_cycle_with_expansion(0.0);
+            expanded.tick_cpu_cycle_with_expansion(-0.2);
+        }
+        assert_eq!(baseline.samples.len(), expanded.samples.len());
+        assert!(baseline
+            .samples
+            .iter()
+            .zip(&expanded.samples)
+            .any(|(left, right)| (left - right).abs() > 0.01));
+    }
+
+    #[test]
+    fn analog_output_filters_reject_dc_bias() {
+        let mut apu = Apu::default();
+        let mut output = 0.0;
+        for _ in 0..100_000 {
+            output = apu.filter_output(0.5);
+        }
+        assert!(output.abs() < 0.001);
+        assert!(apu.low_pass_14k.output.abs() < 0.001);
+    }
+
+    #[test]
+    fn nonlinear_mixer_matches_nes_dac_equations_without_extra_gain() {
+        let mut apu = Apu::default();
+        apu.triangle.sequence = 15;
+        apu.dmc.output_level = 127;
+        let tnd_input = 127.0 / 22638.0;
+        let expected_tnd = 159.79 / (1.0 / tnd_input + 100.0);
+        assert!((apu.mix() - expected_tnd).abs() < 1.0e-6);
+
+        apu.dmc.output_level = 0;
+        apu.pulse1.enabled = true;
+        apu.pulse1.length = 1;
+        apu.pulse1.timer_period = 8;
+        apu.pulse1.duty = 0;
+        apu.pulse1.sequence = 1;
+        apu.pulse1.envelope.constant = true;
+        apu.pulse1.envelope.period = 15;
+        let expected_pulse = 95.88 / (8128.0 / 15.0 + 100.0);
+        assert!((apu.mix() - expected_pulse).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn noise_period_table_counts_cpu_cycles() {
+        let mut apu = Apu::default();
+        apu.noise.period_index = 0;
+        apu.noise.timer = 0;
+        apu.noise.shift = 1;
+
+        apu.tick_cpu_cycle_with_expansion(0.0);
+        let first_shift = apu.noise.shift;
+        assert_eq!(apu.noise.timer, 3);
+        for _ in 0..3 {
+            apu.tick_cpu_cycle_with_expansion(0.0);
+            assert_eq!(apu.noise.shift, first_shift);
+        }
+        apu.tick_cpu_cycle_with_expansion(0.0);
+        assert_ne!(apu.noise.shift, first_shift);
+    }
+
+    #[test]
+    fn pulse_sweep_zero_shift_still_controls_target_overflow_muting() {
+        let mut pulse = Pulse::new(true);
+        pulse.timer_period = 0x03ff;
+        pulse.sweep_shift = 0;
+        assert_eq!(pulse.target_period(), 0x07fe);
+        assert!(!pulse.sweep_muted());
+
+        pulse.timer_period = 0x0400;
+        assert_eq!(pulse.target_period(), 0x0800);
+        assert!(pulse.sweep_muted());
+
+        for channel_one in [false, true] {
+            let mut negated = Pulse::new(channel_one);
+            negated.timer_period = 0x0600;
+            negated.sweep_negate = true;
+            negated.sweep_shift = 0;
+            assert_eq!(negated.target_period(), 0);
+            assert!(!negated.sweep_muted());
+        }
+    }
+
+    #[test]
+    fn pal_uses_regional_noise_dmc_and_frame_counter_periods() {
+        let mut apu = Apu::new(1_662_607, true);
+        apu.noise.period_index = 2;
+        apu.noise.timer = 0;
+        apu.dmc.rate_index = 0;
+        apu.dmc.timer = 0;
+        apu.tick_cpu_cycle_with_expansion(0.0);
+        assert_eq!(apu.noise.timer, 13);
+        assert_eq!(apu.dmc.timer, 397);
+
+        let mut frame = Apu::new(1_662_607, true);
+        frame.tick_cpu_cycles(33_252);
+        assert_eq!(frame.frame_cycle, 33_252);
+        assert!(frame.irq_pending());
+        assert_ne!(frame.read_status() & 0x40, 0);
+        assert!(!frame.irq_pending());
+
+        let mut five_step = Apu::new(1_662_607, true);
+        five_step.five_step = true;
+        five_step.frame_cycle = 41_564;
+        five_step.tick_cpu_cycles(1);
+        assert_eq!(five_step.frame_cycle, 41_565);
+        five_step.tick_cpu_cycles(1);
+        assert_eq!(five_step.frame_cycle, 0);
+    }
+
+    #[test]
+    fn triangle_period_zero_and_one_continue_ultrasonic_sequence() {
+        let mut period_zero = Triangle {
+            enabled: true,
+            length: 1,
+            linear_counter: 1,
+            ..Default::default()
+        };
+        period_zero.tick_timer();
+        assert_eq!(period_zero.sequence, 1);
+        period_zero.tick_timer();
+        assert_eq!(period_zero.sequence, 2);
+
+        let mut period_one = Triangle {
+            enabled: true,
+            length: 1,
+            linear_counter: 1,
+            timer_period: 1,
+            ..Default::default()
+        };
+        period_one.tick_timer();
+        assert_eq!(period_one.sequence, 1);
+        period_one.tick_timer();
+        assert_eq!(period_one.sequence, 1);
+        period_one.tick_timer();
+        assert_eq!(period_one.sequence, 2);
+    }
+
+    #[test]
+    fn triangle_holds_dac_level_when_counters_halt() {
+        let mut triangle = Triangle {
+            enabled: true,
+            length: 1,
+            linear_counter: 1,
+            timer_period: 2,
+            sequence: 6,
+            ..Default::default()
+        };
+        triangle.tick_timer();
+        let held_sequence = triangle.sequence;
+        let held_output = triangle.output();
+        triangle.set_enabled(false);
+        triangle.linear_counter = 0;
+        for _ in 0..8 {
+            triangle.tick_timer();
+        }
+        assert_eq!(triangle.sequence, held_sequence);
+        assert_eq!(triangle.output(), held_output);
+    }
+
+    #[test]
     fn frame_irq_is_reported_and_cleared_by_status_read() {
         let mut apu = Apu::default();
-        apu.tick_cpu_cycles(29_829);
-        assert!(apu.irq_pending());
-        assert_ne!(apu.read_status() & 0x40, 0);
-        assert!(!apu.irq_pending());
+        apu.tick_cpu_cycles(29_828);
+        for expected_cycle in [29_828, 29_829, 0] {
+            assert_eq!(apu.frame_cycle, expected_cycle);
+            assert!(apu.irq_pending());
+            assert_ne!(apu.read_status() & 0x40, 0);
+            assert!(!apu.irq_pending());
+            if expected_cycle != 0 {
+                apu.tick_cpu_cycles(1);
+            }
+        }
+    }
+
+    #[test]
+    fn frame_counter_write_uses_three_or_four_cycle_delay() {
+        let mut even = Apu {
+            frame_cycle: 100,
+            ..Default::default()
+        };
+        even.pulse1.enabled = true;
+        even.pulse1.length = 2;
+        even.frame_irq = true;
+        even.write_register(0x4017, 0xc0);
+        assert!(!even.frame_irq);
+        assert!(!even.five_step);
+        assert_eq!(even.frame_write_delay, 3);
+        even.tick_cpu_cycles(2);
+        assert!(!even.five_step);
+        assert_eq!(even.pulse1.length, 2);
+        even.tick_cpu_cycles(1);
+        assert!(even.five_step);
+        assert_eq!(even.frame_cycle, 0);
+        assert_eq!(even.pulse1.length, 1);
+
+        let mut odd = Apu {
+            cpu_cycle: 1,
+            frame_cycle: 200,
+            ..Default::default()
+        };
+        odd.write_register(0x4017, 0x00);
+        assert_eq!(odd.frame_write_delay, 4);
+        odd.tick_cpu_cycles(3);
+        assert_eq!(odd.frame_cycle, 203);
+        odd.tick_cpu_cycles(1);
+        assert_eq!(odd.frame_cycle, 0);
+        assert!(!odd.five_step);
     }
 
     #[test]
@@ -884,6 +1279,8 @@ mod tests {
         apu.write_register(0x4002, 0x41);
         apu.write_register(0x4003, 0x18);
         apu.tick_cpu_cycles(12_345);
+        apu.write_register(0x4017, 0x80);
+        apu.tick_cpu_cycles(1);
         let mut writer = StateWriter::new(PlatformId::Nes, 99);
         apu.save(&mut writer);
         let bytes = writer.finish();
@@ -894,6 +1291,32 @@ mod tests {
         assert_eq!(restored.cpu_cycle, apu.cpu_cycle);
         assert_eq!(restored.pulse1.sequence, apu.pulse1.sequence);
         assert_eq!(restored.pulse1.length, apu.pulse1.length);
+        assert_eq!(restored.frame_write_value, apu.frame_write_value);
+        assert_eq!(restored.frame_write_delay, apu.frame_write_delay);
+        assert_eq!(
+            restored.block_frame_counter_tick,
+            apu.block_frame_counter_tick
+        );
+        assert_eq!(
+            restored.high_pass_90.previous_output.to_bits(),
+            apu.high_pass_90.previous_output.to_bits()
+        );
+        assert_eq!(
+            restored.high_pass_440.previous_output.to_bits(),
+            apu.high_pass_440.previous_output.to_bits()
+        );
+        assert_eq!(
+            restored.low_pass_14k.output.to_bits(),
+            apu.low_pass_14k.output.to_bits()
+        );
+
+        apu.samples.clear();
+        restored.samples.clear();
+        for _ in 0..4_096 {
+            apu.tick_cpu_cycle_with_expansion(0.05);
+            restored.tick_cpu_cycle_with_expansion(0.05);
+        }
+        assert_eq!(restored.samples, apu.samples);
     }
     #[test]
     fn dmc_requests_sample_memory_and_raises_terminal_irq() {
@@ -902,7 +1325,11 @@ mod tests {
         apu.write_register(0x4012, 0xff);
         apu.write_register(0x4013, 0x00);
         apu.write_register(0x4015, 0x10);
-        assert_eq!(apu.take_dmc_fetch_request(), Some(0xffc0));
+        assert_eq!(apu.take_dmc_fetch_request(), None);
+        apu.tick_cpu_cycles(1);
+        assert_eq!(apu.take_dmc_fetch_request(), None);
+        apu.tick_cpu_cycles(1);
+        assert_eq!(apu.take_dmc_fetch_request(), Some((0xffc0, 3)));
         apu.supply_dmc_byte(0xa5);
         assert!(apu.irq_pending());
         let status = apu.read_status();
@@ -911,5 +1338,21 @@ mod tests {
         assert!(apu.irq_pending());
         apu.write_register(0x4015, 0x00);
         assert!(!apu.irq_pending());
+    }
+
+    #[test]
+    fn dmc_reload_uses_four_cycle_dma_after_sample_buffer_empties() {
+        let mut apu = Apu::default();
+        apu.write_register(0x4012, 0x00);
+        apu.write_register(0x4013, 0x01);
+        apu.write_register(0x4015, 0x10);
+        apu.tick_cpu_cycles(2);
+        assert_eq!(apu.take_dmc_fetch_request(), Some((0xc000, 3)));
+        apu.supply_dmc_byte(0x5a);
+
+        apu.dmc.timer = 0;
+        apu.dmc.bits_remaining = 1;
+        apu.tick_cpu_cycles(1);
+        assert_eq!(apu.take_dmc_fetch_request(), Some((0xc001, 4)));
     }
 }

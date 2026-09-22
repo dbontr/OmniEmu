@@ -118,7 +118,7 @@ impl SmpBus {
     }
 
     fn tick(&mut self, cycles: u32) {
-        self.dsp.tick(&self.ram, cycles);
+        self.dsp.tick(&mut self.ram, cycles);
         self.timers[0].tick(cycles, 128);
         self.timers[1].tick(cycles, 128);
         self.timers[2].tick(cycles, 16);

@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Mutex;
 
 use crate::resources::ResourceBlob;
 
@@ -72,6 +73,104 @@ impl<'a, T: RandomAccessMedia + ?Sized> BlockReader<'a, T> {
             .map_err(|_| "block tail is too large".to_string())?;
         self.source.read_at(offset, &mut output[..available])?;
         output[available..].fill(0);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct PageCacheState {
+    pages: BTreeMap<u64, Vec<u8>>,
+    order: VecDeque<u64>,
+}
+
+pub struct PagedMedia<T: RandomAccessMedia> {
+    source: T,
+    page_size: usize,
+    max_pages: usize,
+    cache: Mutex<PageCacheState>,
+}
+
+impl<T: RandomAccessMedia> PagedMedia<T> {
+    pub fn new(source: T, page_size: usize, max_pages: usize) -> Result<Self, String> {
+        if page_size == 0 || max_pages == 0 {
+            return Err("media page size and cache capacity must be non-zero".into());
+        }
+        Ok(Self {
+            source,
+            page_size,
+            max_pages,
+            cache: Mutex::new(PageCacheState {
+                pages: BTreeMap::new(),
+                order: VecDeque::new(),
+            }),
+        })
+    }
+
+    pub fn cached_pages(&self) -> usize {
+        self.cache.lock().unwrap().pages.len()
+    }
+
+    fn touch(state: &mut PageCacheState, page: u64) {
+        if let Some(index) = state.order.iter().position(|candidate| *candidate == page) {
+            state.order.remove(index);
+        }
+        state.order.push_back(page);
+    }
+
+    fn ensure_page(&self, page: u64, state: &mut PageCacheState) -> Result<(), String> {
+        if state.pages.contains_key(&page) {
+            Self::touch(state, page);
+            return Ok(());
+        }
+        let start = page
+            .checked_mul(self.page_size as u64)
+            .ok_or_else(|| "media page offset overflow".to_string())?;
+        if start >= self.source.len() {
+            return Err("media page is out of range".into());
+        }
+        let available = usize::try_from((self.source.len() - start).min(self.page_size as u64))
+            .map_err(|_| "media page length overflow".to_string())?;
+        let mut bytes = vec![0; self.page_size];
+        self.source.read_at(start, &mut bytes[..available])?;
+        while state.pages.len() >= self.max_pages {
+            if let Some(evicted) = state.order.pop_front() {
+                state.pages.remove(&evicted);
+            }
+        }
+        state.pages.insert(page, bytes);
+        Self::touch(state, page);
+        Ok(())
+    }
+}
+
+impl<T: RandomAccessMedia> RandomAccessMedia for PagedMedia<T> {
+    fn len(&self) -> u64 {
+        self.source.len()
+    }
+
+    fn read_at(&self, offset: u64, output: &mut [u8]) -> Result<(), String> {
+        let end = offset
+            .checked_add(output.len() as u64)
+            .ok_or_else(|| "paged media read overflow".to_string())?;
+        if end > self.source.len() {
+            return Err("paged media read exceeds source length".into());
+        }
+        let mut state = self.cache.lock().unwrap();
+        let mut cursor = 0usize;
+        while cursor < output.len() {
+            let absolute = offset + cursor as u64;
+            let page = absolute / self.page_size as u64;
+            let page_offset = (absolute % self.page_size as u64) as usize;
+            let count = (self.page_size - page_offset).min(output.len() - cursor);
+            self.ensure_page(page, &mut state)?;
+            let bytes = state
+                .pages
+                .get(&page)
+                .ok_or_else(|| "media page disappeared from cache".to_string())?;
+            output[cursor..cursor + count]
+                .copy_from_slice(&bytes[page_offset..page_offset + count]);
+            cursor += count;
+        }
         Ok(())
     }
 }
@@ -162,5 +261,36 @@ mod tests {
         assert_eq!(output, payload);
         storage.write_block(9_999_999, &[0; 512]).unwrap();
         assert_eq!(storage.allocated_blocks(), 0);
+    }
+
+    struct PatternMedia {
+        len: u64,
+    }
+
+    impl RandomAccessMedia for PatternMedia {
+        fn len(&self) -> u64 {
+            self.len
+        }
+
+        fn read_at(&self, offset: u64, output: &mut [u8]) -> Result<(), String> {
+            for (index, byte) in output.iter_mut().enumerate() {
+                *byte = offset.wrapping_add(index as u64) as u8;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn paged_media_bounds_cache_while_serving_cross_page_reads() {
+        let media = PagedMedia::new(PatternMedia { len: 1 << 40 }, 16, 2).unwrap();
+        let mut output = [0u8; 24];
+        media.read_at(8, &mut output).unwrap();
+        assert_eq!(output[0], 8);
+        assert_eq!(output[23], 31);
+        assert_eq!(media.cached_pages(), 2);
+        media.read_at(40, &mut output).unwrap();
+        assert_eq!(output[0], 40);
+        assert_eq!(output[23], 63);
+        assert_eq!(media.cached_pages(), 2);
     }
 }
