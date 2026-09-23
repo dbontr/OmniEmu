@@ -1463,6 +1463,15 @@ impl PowerPc750 {
             });
         }
 
+        if value.is_finite() && value.abs() > f64::from(f32::MAX) {
+            return match (self.fpscr & 3, value.is_sign_negative()) {
+                (0, false) | (2, false) => f32::INFINITY,
+                (0, true) | (3, true) => f32::NEG_INFINITY,
+                (_, false) => f32::MAX,
+                (_, true) => -f32::MAX,
+            };
+        }
+
         let nearest = value as f32;
         if value.is_nan() || value.is_infinite() || f64::from(nearest) == value {
             return nearest;
@@ -1502,6 +1511,34 @@ impl PowerPc750 {
         } else {
             rounded
         }
+    }
+
+    fn update_single_rounding_flags(&mut self, exact: f64, rounded: f32) {
+        self.clear_fifr();
+        if !exact.is_finite() {
+            return;
+        }
+
+        let overflow = exact.abs() > f64::from(f32::MAX);
+        let rounded64 = f64::from(rounded);
+        let inexact = overflow || rounded64 != exact;
+        let tiny = exact != 0.0 && exact.abs() < f64::from(f32::MIN_POSITIVE);
+        let underflow = tiny && inexact;
+
+        if overflow {
+            self.set_fp_exception(FPSCR_OX);
+        }
+        if underflow {
+            self.set_fp_exception(FPSCR_UX);
+        }
+        if inexact {
+            self.set_fp_exception(FPSCR_XX);
+            self.fpscr |= FPSCR_FI;
+            if !overflow && rounded64.abs() > exact.abs() {
+                self.fpscr |= FPSCR_FR;
+            }
+        }
+        self.update_fp_exception_summary();
     }
 
     fn set_paired_single(&mut self, index: usize, first: f32, second: f32) {
@@ -2294,41 +2331,41 @@ impl PowerPc750 {
         let a = f64::from_bits(self.fpr[fa]);
         let b = b_full;
         let c = f64::from_bits(self.fpr[fc]);
-        let result = match xo {
+        let (exact, result) = match xo {
             18 => {
                 let value = self.float_div(a, b);
                 if self.exception_raised {
                     return;
                 }
-                self.force_single(value)
+                (value, self.force_single(value))
             }
             20 => {
                 let result = self.fp_sub_result(a, b);
                 if self.trap_invalid_if_enabled(result.invalid) {
                     return;
                 }
-                self.force_single(result.value)
+                (result.value, self.force_single(result.value))
             }
             21 => {
                 let result = self.fp_add_result(a, b);
                 if self.trap_invalid_if_enabled(result.invalid) {
                     return;
                 }
-                self.force_single(result.value)
+                (result.value, self.force_single(result.value))
             }
             22 => {
                 let value = self.float_sqrt(b);
                 if self.exception_raised {
                     return;
                 }
-                self.force_single(value)
+                (value, self.force_single(value))
             }
             25 => {
                 let result = self.fp_single_mul_result(a, c);
                 if self.trap_invalid_if_enabled(result.invalid) {
                     return;
                 }
-                self.force_single(result.value)
+                (result.value, self.force_single(result.value))
             }
             28..=31 => {
                 let subtract = matches!(xo, 28 | 30);
@@ -2341,13 +2378,14 @@ impl PowerPc750 {
                 } else {
                     result.value
                 };
-                self.force_single(value)
+                (value, self.force_single(value))
             }
             _ => {
                 self.take_exception(PowerPcException::Program, self.pc.wrapping_sub(4));
                 return;
             }
         };
+        self.update_single_rounding_flags(exact, result);
         self.set_paired_single(fd, result, result);
         self.float_record_single(instruction, result);
     }
@@ -2394,8 +2432,9 @@ impl PowerPc750 {
                 self.set_cr_field(field, nibble);
             }
             12 => {
-                let result = b as f32;
-                self.set_paired(fd, f64::from(result), f64::from(result));
+                let result = self.force_single(b);
+                self.update_single_rounding_flags(b, result);
+                self.set_paired_single(fd, result, result);
                 self.float_record_single(instruction, result);
             }
             14 | 15 => {
@@ -2404,10 +2443,10 @@ impl PowerPc750 {
                 } else {
                     self.round_fpscr(b)
                 };
-                let word = if rounded.is_finite()
+                let valid = rounded.is_finite()
                     && rounded >= f64::from(i32::MIN)
-                    && rounded < 2_147_483_648.0
-                {
+                    && rounded < 2_147_483_648.0;
+                let word = if valid {
                     rounded as i32
                 } else {
                     self.set_fp_exception(FPSCR_VXCVI);
@@ -2422,6 +2461,17 @@ impl PowerPc750 {
                         i32::MAX
                     }
                 };
+                if valid {
+                    self.clear_fifr();
+                    if rounded != b {
+                        self.set_fp_exception(FPSCR_XX);
+                        self.fpscr |= FPSCR_FI;
+                        if rounded.abs() > b.abs() {
+                            self.fpscr |= FPSCR_FR;
+                        }
+                        self.update_fp_exception_summary();
+                    }
+                }
                 self.fpr[fd] = u64::from(word as u32);
                 self.record_fp_rc(instruction);
             }
@@ -3322,6 +3372,88 @@ mod tests {
             force_25_bit(force25_tie).to_bits(),
             1.0f64.to_bits() | (1 << 28)
         );
+    }
+
+    #[test]
+    fn gekko_single_rounding_sets_overflow_underflow_inexact_and_fraction_flags() {
+        let mut cpu = PowerPc750::new();
+        let overflow = f64::from(f32::MAX) * 2.0;
+
+        cpu.fpscr = 1;
+        let rounded = cpu.force_single(overflow);
+        assert_eq!(rounded, f32::MAX);
+        cpu.update_single_rounding_flags(overflow, rounded);
+        assert_ne!(cpu.fpscr & FPSCR_OX, 0);
+        assert_ne!(cpu.fpscr & FPSCR_XX, 0);
+        assert_ne!(cpu.fpscr & FPSCR_FI, 0);
+        assert_eq!(cpu.fpscr & FPSCR_FR, 0);
+
+        cpu.fpscr = 2;
+        assert_eq!(cpu.force_single(overflow), f32::INFINITY);
+        assert_eq!(cpu.force_single(-overflow), -f32::MAX);
+
+        cpu.fpscr = 0;
+        let tiny_down = 2.0f64.powi(-150);
+        let rounded = cpu.force_single(tiny_down);
+        assert_eq!(rounded.to_bits(), 0);
+        cpu.update_single_rounding_flags(tiny_down, rounded);
+        assert_ne!(cpu.fpscr & FPSCR_UX, 0);
+        assert_ne!(cpu.fpscr & FPSCR_XX, 0);
+        assert_ne!(cpu.fpscr & FPSCR_FI, 0);
+        assert_eq!(cpu.fpscr & FPSCR_FR, 0);
+
+        cpu.fpscr = 0;
+        let tiny_up = 3.0 * 2.0f64.powi(-150);
+        let rounded = cpu.force_single(tiny_up);
+        assert_eq!(rounded.to_bits(), 2);
+        cpu.update_single_rounding_flags(tiny_up, rounded);
+        assert_ne!(cpu.fpscr & FPSCR_UX, 0);
+        assert_ne!(cpu.fpscr & FPSCR_XX, 0);
+        assert_ne!(cpu.fpscr & FPSCR_FI, 0);
+        assert_ne!(cpu.fpscr & FPSCR_FR, 0);
+    }
+
+    #[test]
+    fn gekko_frsp_and_integer_conversion_update_rounding_flags() {
+        let mut bus = TestBus::new();
+        let mut cpu = PowerPc750::new();
+        cpu.reset_to(0x100);
+        cpu.msr |= MSR_FP;
+        let halfway = 1.0 + 2.0f64.powi(-24);
+
+        cpu.fpr[1] = halfway.to_bits();
+        cpu.execute(&mut bus, fp_a(63, 2, 0, 1, 0, 12), 0x100);
+        assert_eq!(cpu.paired(2), (1.0, 1.0));
+        assert_ne!(cpu.fpscr & FPSCR_XX, 0);
+        assert_ne!(cpu.fpscr & FPSCR_FI, 0);
+        assert_eq!(cpu.fpscr & FPSCR_FR, 0);
+
+        cpu.fpscr = 2;
+        cpu.fpr[1] = halfway.to_bits();
+        cpu.execute(&mut bus, fp_a(63, 2, 0, 1, 0, 12), 0x104);
+        assert_eq!(
+            f64::from_bits(cpu.fpr[2]) as f32,
+            f32::from_bits(0x3f80_0001)
+        );
+        assert_ne!(cpu.fpscr & FPSCR_XX, 0);
+        assert_ne!(cpu.fpscr & FPSCR_FI, 0);
+        assert_ne!(cpu.fpscr & FPSCR_FR, 0);
+
+        cpu.fpscr = 0;
+        cpu.fpr[1] = 1.25f64.to_bits();
+        cpu.execute(&mut bus, fp_a(63, 2, 0, 1, 0, 15), 0x108);
+        assert_eq!(cpu.fpr[2] as u32, 1);
+        assert_ne!(cpu.fpscr & FPSCR_XX, 0);
+        assert_ne!(cpu.fpscr & FPSCR_FI, 0);
+        assert_eq!(cpu.fpscr & FPSCR_FR, 0);
+
+        cpu.fpscr = 0;
+        cpu.fpr[1] = 1.75f64.to_bits();
+        cpu.execute(&mut bus, fp_a(63, 2, 0, 1, 0, 14), 0x10c);
+        assert_eq!(cpu.fpr[2] as u32, 2);
+        assert_ne!(cpu.fpscr & FPSCR_XX, 0);
+        assert_ne!(cpu.fpscr & FPSCR_FI, 0);
+        assert_ne!(cpu.fpscr & FPSCR_FR, 0);
     }
 
     #[test]
