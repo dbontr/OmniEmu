@@ -18,10 +18,39 @@ const MSR_RI: u32 = 0x0000_0002;
 const MSR_LE: u32 = 0x0000_0001;
 
 const FPSCR_FX: u32 = 1 << 31;
+const FPSCR_FEX: u32 = 1 << 30;
 const FPSCR_VX: u32 = 1 << 29;
+const FPSCR_OX: u32 = 1 << 28;
+const FPSCR_UX: u32 = 1 << 27;
 const FPSCR_ZX: u32 = 1 << 26;
+const FPSCR_XX: u32 = 1 << 25;
+const FPSCR_VXSNAN: u32 = 1 << 24;
+const FPSCR_VXISI: u32 = 1 << 23;
+const FPSCR_VXIDI: u32 = 1 << 22;
+const FPSCR_VXZDZ: u32 = 1 << 21;
+const FPSCR_VXIMZ: u32 = 1 << 20;
+const FPSCR_VXVC: u32 = 1 << 19;
+const FPSCR_FR: u32 = 1 << 18;
+const FPSCR_FI: u32 = 1 << 17;
+const FPSCR_FPRF_MASK: u32 = 0x1f << 12;
+const FPSCR_FPCC_MASK: u32 = 0x0f << 12;
+const FPSCR_VXSOFT: u32 = 1 << 10;
+const FPSCR_VXSQRT: u32 = 1 << 9;
+const FPSCR_VXCVI: u32 = 1 << 8;
 const FPSCR_VE: u32 = 1 << 7;
+const FPSCR_OE: u32 = 1 << 6;
+const FPSCR_UE: u32 = 1 << 5;
 const FPSCR_ZE: u32 = 1 << 4;
+const FPSCR_XE: u32 = 1 << 3;
+const FPSCR_VX_ANY: u32 = FPSCR_VXSNAN
+    | FPSCR_VXISI
+    | FPSCR_VXIDI
+    | FPSCR_VXZDZ
+    | FPSCR_VXIMZ
+    | FPSCR_VXVC
+    | FPSCR_VXSOFT
+    | FPSCR_VXSQRT
+    | FPSCR_VXCVI;
 
 const DOUBLE_SIGN: u64 = 1 << 63;
 const DOUBLE_EXP: u64 = 0x7ff << 52;
@@ -108,6 +137,70 @@ fn is_signaling_nan(value: f64) -> bool {
 
 fn quiet_nan(value: f64) -> f64 {
     f64::from_bits(value.to_bits() | DOUBLE_QBIT)
+}
+
+fn classify_f64(value: f64) -> u32 {
+    let bits = value.to_bits();
+    let sign = bits & DOUBLE_SIGN != 0;
+    let exponent = bits & DOUBLE_EXP;
+    let fraction = bits & DOUBLE_FRAC;
+    if exponent == DOUBLE_EXP {
+        if fraction != 0 {
+            0x11
+        } else if sign {
+            0x09
+        } else {
+            0x05
+        }
+    } else if exponent == 0 {
+        if fraction == 0 {
+            if sign {
+                0x12
+            } else {
+                0x02
+            }
+        } else if sign {
+            0x18
+        } else {
+            0x14
+        }
+    } else if sign {
+        0x08
+    } else {
+        0x04
+    }
+}
+
+fn classify_f32(value: f32) -> u32 {
+    let bits = value.to_bits();
+    let sign = bits >> 31 != 0;
+    let exponent = bits & 0x7f80_0000;
+    let fraction = bits & 0x007f_ffff;
+    if exponent == 0x7f80_0000 {
+        if fraction != 0 {
+            0x11
+        } else if sign {
+            0x09
+        } else {
+            0x05
+        }
+    } else if exponent == 0 {
+        if fraction == 0 {
+            if sign {
+                0x12
+            } else {
+                0x02
+            }
+        } else if sign {
+            0x18
+        } else {
+            0x14
+        }
+    } else if sign {
+        0x08
+    } else {
+        0x04
+    }
 }
 
 fn gekko_reciprocal_estimate(value: f64) -> f64 {
@@ -1278,10 +1371,56 @@ impl PowerPc750 {
         self.paired1[index & 31] = second;
     }
 
-    fn paired_record(&mut self, instruction: u32) {
+    fn update_fp_exception_summary(&mut self) {
+        if self.fpscr & FPSCR_VX_ANY != 0 {
+            self.fpscr |= FPSCR_VX;
+        } else {
+            self.fpscr &= !FPSCR_VX;
+        }
+        let enabled = (self.fpscr & FPSCR_VX != 0 && self.fpscr & FPSCR_VE != 0)
+            || (self.fpscr & FPSCR_OX != 0 && self.fpscr & FPSCR_OE != 0)
+            || (self.fpscr & FPSCR_UX != 0 && self.fpscr & FPSCR_UE != 0)
+            || (self.fpscr & FPSCR_ZX != 0 && self.fpscr & FPSCR_ZE != 0)
+            || (self.fpscr & FPSCR_XX != 0 && self.fpscr & FPSCR_XE != 0);
+        if enabled {
+            self.fpscr |= FPSCR_FEX;
+        } else {
+            self.fpscr &= !FPSCR_FEX;
+        }
+    }
+
+    fn set_fp_exception(&mut self, mask: u32) {
+        if self.fpscr & mask != mask {
+            self.fpscr |= FPSCR_FX;
+        }
+        self.fpscr |= mask;
+        self.update_fp_exception_summary();
+    }
+
+    fn clear_fifr(&mut self) {
+        self.fpscr &= !(FPSCR_FR | FPSCR_FI);
+    }
+
+    fn update_fprf_double(&mut self, value: f64) {
+        self.fpscr = (self.fpscr & !FPSCR_FPRF_MASK) | (classify_f64(value) << 12);
+    }
+
+    fn update_fprf_single(&mut self, value: f32) {
+        self.fpscr = (self.fpscr & !FPSCR_FPRF_MASK) | (classify_f32(value) << 12);
+    }
+
+    fn update_fpcc(&mut self, value: u32) {
+        self.fpscr = (self.fpscr & !FPSCR_FPCC_MASK) | ((value & 0xf) << 12);
+    }
+
+    fn record_fp_rc(&mut self, instruction: u32) {
         if instruction & 1 != 0 {
             self.set_cr_field(1, (self.fpscr >> 28) & 0xf);
         }
+    }
+
+    fn paired_record(&mut self, instruction: u32) {
+        self.record_fp_rc(instruction);
     }
 
     fn quant_scale(scale: u32, load: bool) -> f64 {
@@ -1517,8 +1656,12 @@ impl PowerPc750 {
         let (b0, b1) = self.paired(Self::rb(instruction));
         let (a, b) = if lane == 0 { (a0, b0) } else { (a1, b1) };
         let nibble = if a.is_nan() || b.is_nan() {
-            if ordered {
-                self.fpscr |= FPSCR_FX | FPSCR_VX;
+            let signaling = is_signaling_nan(a) || is_signaling_nan(b);
+            if signaling {
+                self.set_fp_exception(FPSCR_VXSNAN);
+            }
+            if ordered && (!signaling || self.fpscr & FPSCR_VE == 0) {
+                self.set_fp_exception(FPSCR_VXVC);
             }
             0x1
         } else if a < b {
@@ -1528,6 +1671,7 @@ impl PowerPc750 {
         } else {
             0x2
         };
+        self.update_fpcc(nibble);
         self.set_cr_field(field, nibble);
     }
 
@@ -1602,20 +1746,32 @@ impl PowerPc750 {
             ),
             24 => {
                 if b0 == 0.0 || b1 == 0.0 {
-                    self.fpscr |= FPSCR_FX | FPSCR_ZX;
+                    self.set_fp_exception(FPSCR_ZX);
+                    self.clear_fifr();
+                }
+                if b0.is_nan() || b0.is_infinite() || b1.is_nan() || b1.is_infinite() {
+                    self.clear_fifr();
                 }
                 if is_signaling_nan(b0) || is_signaling_nan(b1) {
-                    self.fpscr |= FPSCR_FX | FPSCR_VX;
+                    self.set_fp_exception(FPSCR_VXSNAN);
                 }
                 (gekko_reciprocal_estimate(b0), gekko_reciprocal_estimate(b1))
             }
             25 => (a0 * c0, a1 * c1),
             26 => {
                 if b0 == 0.0 || b1 == 0.0 {
-                    self.fpscr |= FPSCR_FX | FPSCR_ZX;
+                    self.set_fp_exception(FPSCR_ZX);
+                    self.clear_fifr();
                 }
-                if b0 < 0.0 || b1 < 0.0 || is_signaling_nan(b0) || is_signaling_nan(b1) {
-                    self.fpscr |= FPSCR_FX | FPSCR_VX;
+                if b0 < 0.0 || b1 < 0.0 {
+                    self.set_fp_exception(FPSCR_VXSQRT);
+                    self.clear_fifr();
+                }
+                if b0.is_nan() || b0.is_infinite() || b1.is_nan() || b1.is_infinite() {
+                    self.clear_fifr();
+                }
+                if is_signaling_nan(b0) || is_signaling_nan(b1) {
+                    self.set_fp_exception(FPSCR_VXSNAN);
                 }
                 (
                     gekko_reciprocal_sqrt_estimate(b0),
@@ -1632,6 +1788,10 @@ impl PowerPc750 {
             }
         };
         self.set_paired(fd, pair.0, pair.1);
+        if sub5 != 23 {
+            let reported = if sub5 == 11 { pair.1 } else { pair.0 };
+            self.update_fprf_single(reported as f32);
+        }
         self.paired_record(instruction);
     }
 
@@ -1647,21 +1807,25 @@ impl PowerPc750 {
         let b_full = f64::from_bits(self.fpr[fb]);
         if xo == 24 {
             if b_full == 0.0 {
-                self.fpscr |= FPSCR_FX | FPSCR_ZX;
+                self.set_fp_exception(FPSCR_ZX);
+                self.clear_fifr();
                 if self.fpscr & FPSCR_ZE != 0 {
                     self.take_exception(PowerPcException::Program, self.pc.wrapping_sub(4));
                     return;
                 }
             } else if is_signaling_nan(b_full) {
-                self.fpscr |= FPSCR_FX | FPSCR_VX;
+                self.set_fp_exception(FPSCR_VXSNAN);
+                self.clear_fifr();
                 if self.fpscr & FPSCR_VE != 0 {
                     self.take_exception(PowerPcException::Program, self.pc.wrapping_sub(4));
                     return;
                 }
+            } else if b_full.is_nan() || b_full.is_infinite() {
+                self.clear_fifr();
             }
             let result = gekko_reciprocal_estimate(b_full);
             self.set_paired_raw(fd, result.to_bits(), result.to_bits());
-            self.float_record(instruction, result);
+            self.float_record_single(instruction, result as f32);
             return;
         }
 
@@ -1683,8 +1847,11 @@ impl PowerPc750 {
                 return;
             }
         };
+        if self.exception_raised {
+            return;
+        }
         self.set_paired(fd, f64::from(result), f64::from(result));
-        self.float_record(instruction, f64::from(result));
+        self.float_record_single(instruction, result);
     }
 
     fn execute_float_double(&mut self, instruction: u32) {
@@ -1695,16 +1862,27 @@ impl PowerPc750 {
         let fa = Self::ra(instruction);
         let fb = Self::rb(instruction);
         let fc = ((instruction >> 6) & 31) as usize;
-        let xo = (instruction >> 1) & 0x3ff;
+        let xo10 = (instruction >> 1) & 0x3ff;
+        let xo5 = xo10 & 0x1f;
+        let xo = if matches!(xo5, 18 | 20 | 21 | 23 | 25 | 28 | 29 | 30 | 31) {
+            xo5
+        } else {
+            xo10
+        };
         let a = f64::from_bits(self.fpr[fa]);
         let b = f64::from_bits(self.fpr[fb]);
         let c = f64::from_bits(self.fpr[fc]);
         match xo {
             0 | 32 => {
                 let field = ((instruction >> 23) & 7) as usize;
+                let ordered = xo == 32;
                 let nibble = if a.is_nan() || b.is_nan() {
-                    if xo == 32 {
-                        self.fpscr |= FPSCR_FX | FPSCR_VX;
+                    let signaling = is_signaling_nan(a) || is_signaling_nan(b);
+                    if signaling {
+                        self.set_fp_exception(FPSCR_VXSNAN);
+                    }
+                    if ordered && (!signaling || self.fpscr & FPSCR_VE == 0) {
+                        self.set_fp_exception(FPSCR_VXVC);
                     }
                     0x1
                 } else if a < b {
@@ -1714,12 +1892,13 @@ impl PowerPc750 {
                 } else {
                     0x2
                 };
+                self.update_fpcc(nibble);
                 self.set_cr_field(field, nibble);
             }
             12 => {
-                let result = f64::from(b as f32);
-                self.set_paired(fd, result, result);
-                self.float_record(instruction, result);
+                let result = b as f32;
+                self.set_paired(fd, f64::from(result), f64::from(result));
+                self.float_record_single(instruction, result);
             }
             14 | 15 => {
                 let rounded = if xo == 15 {
@@ -1733,81 +1912,122 @@ impl PowerPc750 {
                 {
                     rounded as i32
                 } else {
-                    self.fpscr |= FPSCR_FX | FPSCR_VX;
-                    i32::MIN
+                    self.set_fp_exception(FPSCR_VXCVI);
+                    self.clear_fifr();
+                    if self.fpscr & FPSCR_VE != 0 {
+                        self.take_exception(PowerPcException::Program, self.pc.wrapping_sub(4));
+                        return;
+                    }
+                    if b.is_nan() || b.is_sign_negative() {
+                        i32::MIN
+                    } else {
+                        i32::MAX
+                    }
                 };
                 self.fpr[fd] = u64::from(word as u32);
+                self.record_fp_rc(instruction);
             }
             18 => {
-                self.fpr[fd] = self.float_div(a, b).to_bits();
-                self.float_record(instruction, f64::from_bits(self.fpr[fd]));
+                let result = self.float_div(a, b);
+                if self.exception_raised {
+                    return;
+                }
+                self.fpr[fd] = result.to_bits();
+                self.float_record_double(instruction, result);
             }
             20 => {
                 self.fpr[fd] = (a - b).to_bits();
-                self.float_record(instruction, a - b);
+                self.float_record_double(instruction, a - b);
             }
             21 => {
                 self.fpr[fd] = (a + b).to_bits();
-                self.float_record(instruction, a + b);
+                self.float_record_double(instruction, a + b);
             }
             22 => {
                 let result = self.float_sqrt(b);
+                if self.exception_raised {
+                    return;
+                }
                 self.fpr[fd] = result.to_bits();
-                self.float_record(instruction, result);
+                self.float_record_double(instruction, result);
             }
             23 => {
                 let result = if a >= 0.0 { c } else { b };
                 self.fpr[fd] = result.to_bits();
-                self.float_record(instruction, result);
+                self.record_fp_rc(instruction);
             }
             25 => {
                 let result = a * c;
                 self.fpr[fd] = result.to_bits();
-                self.float_record(instruction, result);
+                self.float_record_double(instruction, result);
             }
             26 => {
                 if b == 0.0 {
-                    self.fpscr |= FPSCR_FX | FPSCR_ZX;
+                    self.set_fp_exception(FPSCR_ZX);
+                    self.clear_fifr();
                     if self.fpscr & FPSCR_ZE != 0 {
                         self.take_exception(PowerPcException::Program, self.pc.wrapping_sub(4));
                         return;
                     }
-                } else if is_signaling_nan(b) || b < 0.0 {
-                    self.fpscr |= FPSCR_FX | FPSCR_VX;
-                    if self.fpscr & FPSCR_VE != 0 {
+                } else {
+                    if is_signaling_nan(b) {
+                        self.set_fp_exception(FPSCR_VXSNAN);
+                    }
+                    if b < 0.0 {
+                        self.set_fp_exception(FPSCR_VXSQRT);
+                    }
+                    if b < 0.0 || b.is_nan() || b.is_infinite() {
+                        self.clear_fifr();
+                    }
+                    if self.fpscr & FPSCR_VE != 0 && (is_signaling_nan(b) || b < 0.0) {
                         self.take_exception(PowerPcException::Program, self.pc.wrapping_sub(4));
                         return;
                     }
                 }
                 let result = gekko_reciprocal_sqrt_estimate(b);
                 self.fpr[fd] = result.to_bits();
-                self.float_record(instruction, result);
+                self.float_record_double(instruction, result);
             }
             28 => {
                 let result = a * c - b;
                 self.fpr[fd] = result.to_bits();
-                self.float_record(instruction, result);
+                self.float_record_double(instruction, result);
             }
             29 => {
                 let result = a * c + b;
                 self.fpr[fd] = result.to_bits();
-                self.float_record(instruction, result);
+                self.float_record_double(instruction, result);
             }
             30 => {
                 let result = -(a * c - b);
                 self.fpr[fd] = result.to_bits();
-                self.float_record(instruction, result);
+                self.float_record_double(instruction, result);
             }
             31 => {
                 let result = -(a * c + b);
                 self.fpr[fd] = result.to_bits();
-                self.float_record(instruction, result);
+                self.float_record_double(instruction, result);
             }
-            40 => self.fpr[fd] = (-b).to_bits(),
-            72 => self.fpr[fd] = self.fpr[fb],
-            136 => self.fpr[fd] = (-b.abs()).to_bits(),
-            264 => self.fpr[fd] = b.abs().to_bits(),
-            583 => self.fpr[fd] = u64::from(self.fpscr),
+            40 => {
+                self.fpr[fd] = (-b).to_bits();
+                self.record_fp_rc(instruction);
+            }
+            72 => {
+                self.fpr[fd] = self.fpr[fb];
+                self.record_fp_rc(instruction);
+            }
+            136 => {
+                self.fpr[fd] = (-b.abs()).to_bits();
+                self.record_fp_rc(instruction);
+            }
+            264 => {
+                self.fpr[fd] = b.abs().to_bits();
+                self.record_fp_rc(instruction);
+            }
+            583 => {
+                self.fpr[fd] = u64::from(self.fpscr);
+                self.record_fp_rc(instruction);
+            }
             711 => {
                 let mask = ((instruction >> 17) & 0xff) as u8;
                 let source = self.fpr[fb] as u32;
@@ -1817,6 +2037,8 @@ impl PowerPc750 {
                         self.fpscr = (self.fpscr & !(0xf << shift)) | (source & (0xf << shift));
                     }
                 }
+                self.update_fp_exception_summary();
+                self.record_fp_rc(instruction);
             }
             _ => self.take_exception(PowerPcException::Program, self.pc.wrapping_sub(4)),
         }
@@ -1837,22 +2059,73 @@ impl PowerPc750 {
     fn float_div<T: Into<f64>>(&mut self, left: T, right: T) -> f64 {
         let left = left.into();
         let right = right.into();
-        if right == 0.0 && left != 0.0 && left.is_finite() {
-            self.fpscr |= FPSCR_FX | FPSCR_ZX;
-            if self.fpscr & FPSCR_ZE != 0 {
+        let signaling = is_signaling_nan(left) || is_signaling_nan(right);
+        if signaling {
+            self.set_fp_exception(FPSCR_VXSNAN);
+            self.clear_fifr();
+            if self.fpscr & FPSCR_VE != 0 {
+                self.take_exception(PowerPcException::Program, self.pc.wrapping_sub(4));
+                return f64::from_bits(CANONICAL_QNAN);
+            }
+        }
+        if left.is_nan() {
+            self.clear_fifr();
+            return quiet_nan(left);
+        }
+        if right.is_nan() {
+            self.clear_fifr();
+            return quiet_nan(right);
+        }
+        if right == 0.0 {
+            if left == 0.0 {
+                self.set_fp_exception(FPSCR_VXZDZ);
+                self.clear_fifr();
+                if self.fpscr & FPSCR_VE != 0 {
+                    self.take_exception(PowerPcException::Program, self.pc.wrapping_sub(4));
+                }
+                return f64::from_bits(CANONICAL_QNAN);
+            }
+            if left.is_finite() {
+                self.set_fp_exception(FPSCR_ZX);
+                if self.fpscr & FPSCR_ZE != 0 {
+                    self.take_exception(PowerPcException::Program, self.pc.wrapping_sub(4));
+                }
+            }
+            return left / right;
+        }
+        if left.is_infinite() && right.is_infinite() {
+            self.set_fp_exception(FPSCR_VXIDI);
+            self.clear_fifr();
+            if self.fpscr & FPSCR_VE != 0 {
                 self.take_exception(PowerPcException::Program, self.pc.wrapping_sub(4));
             }
+            return f64::from_bits(CANONICAL_QNAN);
         }
         left / right
     }
 
     fn float_sqrt<T: Into<f64>>(&mut self, value: T) -> f64 {
         let value = value.into();
+        if is_signaling_nan(value) {
+            self.set_fp_exception(FPSCR_VXSNAN);
+            self.clear_fifr();
+            if self.fpscr & FPSCR_VE != 0 {
+                self.take_exception(PowerPcException::Program, self.pc.wrapping_sub(4));
+                return f64::from_bits(CANONICAL_QNAN);
+            }
+            return quiet_nan(value);
+        }
+        if value.is_nan() {
+            self.clear_fifr();
+            return quiet_nan(value);
+        }
         if value < 0.0 {
-            self.fpscr |= FPSCR_FX | FPSCR_VX;
+            self.set_fp_exception(FPSCR_VXSQRT);
+            self.clear_fifr();
             if self.fpscr & FPSCR_VE != 0 {
                 self.take_exception(PowerPcException::Program, self.pc.wrapping_sub(4));
             }
+            return f64::from_bits(CANONICAL_QNAN);
         }
         value.sqrt()
     }
@@ -1866,19 +2139,14 @@ impl PowerPc750 {
         }
     }
 
-    fn float_record(&mut self, instruction: u32, value: f64) {
-        if instruction & 1 != 0 {
-            let nibble = if value.is_nan() {
-                0x1
-            } else if value < 0.0 {
-                0x8
-            } else if value > 0.0 {
-                0x4
-            } else {
-                0x2
-            };
-            self.set_cr_field(1, nibble);
-        }
+    fn float_record_double(&mut self, instruction: u32, value: f64) {
+        self.update_fprf_double(value);
+        self.record_fp_rc(instruction);
+    }
+
+    fn float_record_single(&mut self, instruction: u32, value: f32) {
+        self.update_fprf_single(value);
+        self.record_fp_rc(instruction);
     }
 
     fn aligned(&mut self, address: u32, width: u32, write: bool) -> bool {
@@ -2160,6 +2428,14 @@ mod tests {
             | (xo << 1)
     }
 
+    fn fp_compare(field: u8, fa: u8, fb: u8, ordered: bool) -> u32 {
+        (63 << 26)
+            | (u32::from(field & 7) << 23)
+            | (u32::from(fa) << 16)
+            | (u32::from(fb) << 11)
+            | ((u32::from(ordered) * 32) << 1)
+    }
+
     #[test]
     fn integer_branch_memory_and_condition_register_execute() {
         let mut bus = TestBus::new();
@@ -2409,6 +2685,152 @@ mod tests {
         assert_ne!(cpu.fpscr & (FPSCR_FX | FPSCR_VX), 0);
         assert_eq!(cpu.srr0, 0x100);
         assert_eq!(cpu.pc & 0xffff, 0x0700);
+    }
+
+    #[test]
+    fn gekko_fprf_classification_and_rc_follow_fpscr() {
+        assert_eq!(classify_f64(f64::NAN), 0x11);
+        assert_eq!(classify_f64(f64::NEG_INFINITY), 0x09);
+        assert_eq!(classify_f64(-1.0), 0x08);
+        assert_eq!(classify_f64(f64::from_bits(DOUBLE_SIGN | 1)), 0x18);
+        assert_eq!(classify_f64(-0.0), 0x12);
+        assert_eq!(classify_f64(0.0), 0x02);
+        assert_eq!(classify_f64(f64::from_bits(1)), 0x14);
+        assert_eq!(classify_f64(1.0), 0x04);
+        assert_eq!(classify_f64(f64::INFINITY), 0x05);
+        assert_eq!(classify_f32(f32::from_bits(1)), 0x14);
+
+        let mut bus = TestBus::new();
+        let mut cpu = PowerPc750::new();
+        cpu.reset_to(0x100);
+        cpu.msr |= MSR_FP;
+        cpu.fpscr = FPSCR_OX;
+        cpu.fpr[1] = 1.0f64.to_bits();
+        cpu.fpr[2] = 2.0f64.to_bits();
+        cpu.execute(&mut bus, fp_a(63, 3, 1, 2, 0, 21) | 1, 0x100);
+        assert_eq!(f64::from_bits(cpu.fpr[3]), 3.0);
+        assert_eq!((cpu.fpscr & FPSCR_FPRF_MASK) >> 12, 0x04);
+        assert_eq!((cpu.cr >> 24) & 0xf, 0x1);
+
+        cpu.fpscr = FPSCR_OX | (0x18 << 12);
+        cpu.fpr[1] = 1.0f64.to_bits();
+        cpu.fpr[2] = 5.0f64.to_bits();
+        cpu.fpr[4] = 7.0f64.to_bits();
+        cpu.execute(&mut bus, fp_a(63, 3, 1, 2, 4, 23) | 1, 0x104);
+        assert_eq!(f64::from_bits(cpu.fpr[3]), 7.0);
+        assert_eq!((cpu.fpscr & FPSCR_FPRF_MASK) >> 12, 0x18);
+        assert_eq!((cpu.cr >> 24) & 0xf, 0x1);
+    }
+
+    #[test]
+    fn gekko_float_compares_distinguish_quiet_and_signaling_nan() {
+        let qnan = f64::from_bits(0x7ff8_0000_0000_0123);
+        let snan = f64::from_bits(0x7ff0_0000_0000_0123);
+        let mut bus = TestBus::new();
+
+        let mut unordered_quiet = PowerPc750::new();
+        unordered_quiet.reset_to(0x100);
+        unordered_quiet.msr |= MSR_FP;
+        unordered_quiet.fpr[1] = qnan.to_bits();
+        unordered_quiet.fpr[2] = 1.0f64.to_bits();
+        unordered_quiet.execute(&mut bus, fp_compare(3, 1, 2, false), 0x100);
+        assert_eq!((unordered_quiet.cr >> 16) & 0xf, 0x1);
+        assert_eq!((unordered_quiet.fpscr & FPSCR_FPCC_MASK) >> 12, 0x1);
+        assert_eq!(unordered_quiet.fpscr & FPSCR_VX_ANY, 0);
+
+        let mut unordered_signal = PowerPc750::new();
+        unordered_signal.reset_to(0x100);
+        unordered_signal.msr |= MSR_FP;
+        unordered_signal.fpr[1] = snan.to_bits();
+        unordered_signal.fpr[2] = 1.0f64.to_bits();
+        unordered_signal.execute(&mut bus, fp_compare(2, 1, 2, false), 0x100);
+        assert_ne!(unordered_signal.fpscr & FPSCR_VXSNAN, 0);
+        assert_eq!(unordered_signal.fpscr & FPSCR_VXVC, 0);
+        assert_eq!(unordered_signal.fpscr & FPSCR_FEX, 0);
+        assert_ne!(unordered_signal.fpscr & (FPSCR_FX | FPSCR_VX), 0);
+
+        let mut ordered_quiet = PowerPc750::new();
+        ordered_quiet.reset_to(0x100);
+        ordered_quiet.msr |= MSR_FP;
+        ordered_quiet.fpr[1] = qnan.to_bits();
+        ordered_quiet.fpr[2] = 1.0f64.to_bits();
+        ordered_quiet.execute(&mut bus, fp_compare(1, 1, 2, true), 0x100);
+        assert_ne!(ordered_quiet.fpscr & FPSCR_VXVC, 0);
+        assert_eq!(ordered_quiet.fpscr & FPSCR_VXSNAN, 0);
+
+        let mut ordered_signal_enabled = PowerPc750::new();
+        ordered_signal_enabled.reset_to(0x100);
+        ordered_signal_enabled.msr |= MSR_FP;
+        ordered_signal_enabled.fpscr = FPSCR_VE;
+        ordered_signal_enabled.fpr[1] = snan.to_bits();
+        ordered_signal_enabled.fpr[2] = 1.0f64.to_bits();
+        ordered_signal_enabled.execute(&mut bus, fp_compare(4, 1, 2, true), 0x100);
+        assert_ne!(ordered_signal_enabled.fpscr & FPSCR_VXSNAN, 0);
+        assert_eq!(ordered_signal_enabled.fpscr & FPSCR_VXVC, 0);
+        assert_ne!(ordered_signal_enabled.fpscr & FPSCR_FEX, 0);
+    }
+
+    #[test]
+    fn gekko_enabled_divide_and_sqrt_exceptions_preserve_destination() {
+        let mut bus = TestBus::new();
+
+        let mut invalid_divide = PowerPc750::new();
+        invalid_divide.reset_to(0x100);
+        invalid_divide.msr |= MSR_FP;
+        invalid_divide.fpscr = FPSCR_VE;
+        invalid_divide.fpr[1] = 0.0f64.to_bits();
+        invalid_divide.fpr[2] = 0.0f64.to_bits();
+        invalid_divide.fpr[3] = 0x0123_4567_89ab_cdef;
+        invalid_divide.pc = 0x104;
+        invalid_divide.execute(&mut bus, fp_a(63, 3, 1, 2, 0, 18), 0x100);
+        assert_eq!(invalid_divide.fpr[3], 0x0123_4567_89ab_cdef);
+        assert_ne!(invalid_divide.fpscr & FPSCR_VXZDZ, 0);
+        assert_ne!(invalid_divide.fpscr & FPSCR_FEX, 0);
+        assert_eq!(invalid_divide.pc & 0xffff, 0x0700);
+
+        let mut zero_divide = PowerPc750::new();
+        zero_divide.reset_to(0x100);
+        zero_divide.msr |= MSR_FP;
+        zero_divide.fpscr = FPSCR_ZE;
+        zero_divide.fpr[1] = 1.0f64.to_bits();
+        zero_divide.fpr[2] = 0.0f64.to_bits();
+        zero_divide.fpr[3] = 0xfedc_ba98_7654_3210;
+        zero_divide.pc = 0x104;
+        zero_divide.execute(&mut bus, fp_a(63, 3, 1, 2, 0, 18), 0x100);
+        assert_eq!(zero_divide.fpr[3], 0xfedc_ba98_7654_3210);
+        assert_ne!(zero_divide.fpscr & FPSCR_ZX, 0);
+        assert_ne!(zero_divide.fpscr & FPSCR_FEX, 0);
+
+        let mut invalid_sqrt = PowerPc750::new();
+        invalid_sqrt.reset_to(0x100);
+        invalid_sqrt.msr |= MSR_FP;
+        invalid_sqrt.fpscr = FPSCR_VE;
+        invalid_sqrt.fpr[2] = (-1.0f64).to_bits();
+        invalid_sqrt.fpr[3] = 0xaaaa_bbbb_cccc_dddd;
+        invalid_sqrt.pc = 0x104;
+        invalid_sqrt.execute(&mut bus, fp_a(63, 3, 0, 2, 0, 22), 0x100);
+        assert_eq!(invalid_sqrt.fpr[3], 0xaaaa_bbbb_cccc_dddd);
+        assert_ne!(invalid_sqrt.fpscr & FPSCR_VXSQRT, 0);
+        assert_ne!(invalid_sqrt.fpscr & FPSCR_FEX, 0);
+    }
+
+    #[test]
+    fn gekko_integer_conversion_saturates_and_sets_vxcvi() {
+        let mut bus = TestBus::new();
+        let mut cpu = PowerPc750::new();
+        cpu.reset_to(0x100);
+        cpu.msr |= MSR_FP;
+
+        cpu.fpr[1] = f64::INFINITY.to_bits();
+        cpu.execute(&mut bus, fp_a(63, 2, 0, 1, 0, 15), 0x100);
+        assert_eq!(cpu.fpr[2] as u32, i32::MAX as u32);
+        assert_ne!(cpu.fpscr & FPSCR_VXCVI, 0);
+
+        cpu.fpscr = 0;
+        cpu.fpr[1] = f64::NEG_INFINITY.to_bits();
+        cpu.execute(&mut bus, fp_a(63, 2, 0, 1, 0, 15), 0x104);
+        assert_eq!(cpu.fpr[2] as u32, i32::MIN as u32);
+        assert_ne!(cpu.fpscr & FPSCR_VXCVI, 0);
     }
 
     #[test]
