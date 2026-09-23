@@ -1499,22 +1499,18 @@ impl GameCubeBoard {
         }
     }
 
-    fn gx_wrap_texture_coordinate(coordinate: f32, size: usize, mode: u32) -> usize {
-        if size == 0 || !coordinate.is_finite() {
+    fn gx_wrap_texture_texel(mut texel: i32, size: usize, mode: u32) -> usize {
+        if size == 0 {
             return 0;
         }
-        let texel = (coordinate * size as f32).floor() as i64;
-        let size = size as i64;
+        let size = size as i32;
         match mode & 3 {
-            1 => texel.rem_euclid(size) as usize,
+            1 => (texel & (size - 1)) as usize,
             2 => {
-                let period = size.saturating_mul(2);
-                let mirrored = texel.rem_euclid(period);
-                if mirrored >= size {
-                    (period - 1 - mirrored) as usize
-                } else {
-                    mirrored as usize
+                if texel & size != 0 {
+                    texel = !texel;
                 }
+                (texel & (size - 1)) as usize
             }
             _ => texel.clamp(0, size - 1) as usize,
         }
@@ -1725,14 +1721,57 @@ impl GameCubeBoard {
         }
     }
 
-    fn gx_texture0_sample(&self, coordinate: [f32; 2]) -> Option<[u8; 4]> {
+    fn gx_texture0_sample(&self, coordinate: [f32; 2], linear: bool) -> Option<[u8; 4]> {
+        if !coordinate.iter().all(|value| value.is_finite()) {
+            return None;
+        }
         let image = self.gx.bp_regs[0x88];
         let width = (image & 0x3ff) as usize + 1;
         let height = ((image >> 10) & 0x3ff) as usize + 1;
         let mode = self.gx.bp_regs[0x80];
-        let s = Self::gx_wrap_texture_coordinate(coordinate[0], width, mode & 3);
-        let t = Self::gx_wrap_texture_coordinate(coordinate[1], height, (mode >> 2) & 3);
-        self.gx_texture0_texel(s, t)
+        let fixed_s = (coordinate[0] * width as f32 * 128.0) as i32;
+        let fixed_t = (coordinate[1] * height as f32 * 128.0) as i32;
+
+        if !linear {
+            let s = Self::gx_wrap_texture_texel(fixed_s >> 7, width, mode & 3);
+            let t = Self::gx_wrap_texture_texel(fixed_t >> 7, height, (mode >> 2) & 3);
+            return self.gx_texture0_texel(s, t);
+        }
+
+        let fixed_s = fixed_s - 64;
+        let fixed_t = fixed_t - 64;
+        let s0 = fixed_s >> 7;
+        let t0 = fixed_t >> 7;
+        let s1 = s0 + 1;
+        let t1 = t0 + 1;
+        let fract_s = (fixed_s & 0x7f) as u32;
+        let fract_t = (fixed_t & 0x7f) as u32;
+        let s0 = Self::gx_wrap_texture_texel(s0, width, mode & 3);
+        let s1 = Self::gx_wrap_texture_texel(s1, width, mode & 3);
+        let t0 = Self::gx_wrap_texture_texel(t0, height, (mode >> 2) & 3);
+        let t1 = Self::gx_wrap_texture_texel(t1, height, (mode >> 2) & 3);
+        let samples = [
+            self.gx_texture0_texel(s0, t0)?,
+            self.gx_texture0_texel(s1, t0)?,
+            self.gx_texture0_texel(s0, t1)?,
+            self.gx_texture0_texel(s1, t1)?,
+        ];
+        let weights = [
+            (128 - fract_s) * (128 - fract_t),
+            fract_s * (128 - fract_t),
+            (128 - fract_s) * fract_t,
+            fract_s * fract_t,
+        ];
+        let mut output = [0u8; 4];
+        for channel in 0..4 {
+            let value = samples
+                .iter()
+                .zip(weights)
+                .map(|(sample, weight)| u32::from(sample[channel]) * weight)
+                .sum::<u32>();
+            output[channel] = (value >> 14) as u8;
+        }
+        Some(output)
     }
 
     fn gx_modulate_texture(color: [u8; 4], texel: [u8; 4]) -> [u8; 4] {
@@ -1877,6 +1916,73 @@ impl GameCubeBoard {
         (x - a.x) * (b.y - a.y) - (y - a.y) * (b.x - a.x)
     }
 
+    fn gx_perspective_texcoord(
+        vertices: [GxScreenVertex; 3],
+        weights: [f32; 3],
+    ) -> Option<[f32; 2]> {
+        let perspective = [
+            weights[0] / vertices[0].clip_w,
+            weights[1] / vertices[1].clip_w,
+            weights[2] / vertices[2].clip_w,
+        ];
+        let divisor = perspective.iter().sum::<f32>();
+        if !divisor.is_finite() || divisor.abs() < f32::EPSILON {
+            return None;
+        }
+        Some([
+            (perspective[0] * vertices[0].tex0[0]
+                + perspective[1] * vertices[1].tex0[0]
+                + perspective[2] * vertices[2].tex0[0])
+                / divisor,
+            (perspective[0] * vertices[0].tex0[1]
+                + perspective[1] * vertices[1].tex0[1]
+                + perspective[2] * vertices[2].tex0[1])
+                / divisor,
+        ])
+    }
+
+    fn gx_line_texcoord(a: GxScreenVertex, b: GxScreenVertex, t: f32) -> Option<[f32; 2]> {
+        let qa = (1.0 - t) / a.clip_w;
+        let qb = t / b.clip_w;
+        let divisor = qa + qb;
+        if !divisor.is_finite() || divisor.abs() < f32::EPSILON {
+            return None;
+        }
+        Some([
+            (qa * a.tex0[0] + qb * b.tex0[0]) / divisor,
+            (qa * a.tex0[1] + qb * b.tex0[1]) / divisor,
+        ])
+    }
+
+    fn gx_triangle_weights(vertices: [GxScreenVertex; 3], area: f32, x: f32, y: f32) -> [f32; 3] {
+        [
+            Self::gx_edge(vertices[1], vertices[2], x, y) / area,
+            Self::gx_edge(vertices[2], vertices[0], x, y) / area,
+            Self::gx_edge(vertices[0], vertices[1], x, y) / area,
+        ]
+    }
+
+    fn gx_texture0_linear_filter(&self, dudx: f32, dvdx: f32, dudy: f32, dvdy: f32) -> bool {
+        let mode = self.gx.bp_regs[0x80];
+        let (s_delta, t_delta) = if mode & (1 << 8) != 0 {
+            (dudx + dudy, dvdx + dvdy)
+        } else {
+            (dudx.max(dudy), dvdx.max(dvdy))
+        };
+        let delta = s_delta.max(t_delta);
+        let bias = (((mode >> 9) & 0xff) as u8 as i8) as f32 / 32.0;
+        let lod = if delta > 0.0 {
+            delta.log2() + bias
+        } else {
+            f32::NEG_INFINITY
+        };
+        if lod > 0.0 {
+            mode & (1 << 7) != 0
+        } else {
+            mode & (1 << 4) != 0
+        }
+    }
+
     fn gx_is_backface(&self, vertices: [GxScreenVertex; 3]) -> bool {
         let [v0, v1, v2] = vertices;
         let normal_z = (v0.clip_x * v2.clip_w - v2.clip_x * v0.clip_w) * v1.clip_y
@@ -1952,24 +2058,28 @@ impl GameCubeBoard {
                     *value = interpolated.round().clamp(0.0, 255.0) as u8;
                 }
                 if vertices.iter().all(|vertex| vertex.has_tex0) {
-                    let perspective = [
-                        weights[0] / vertices[0].clip_w,
-                        weights[1] / vertices[1].clip_w,
-                        weights[2] / vertices[2].clip_w,
-                    ];
-                    let divisor = perspective.iter().sum::<f32>();
-                    if divisor.is_finite() && divisor.abs() >= f32::EPSILON {
-                        let coordinate = [
-                            (perspective[0] * vertices[0].tex0[0]
-                                + perspective[1] * vertices[1].tex0[0]
-                                + perspective[2] * vertices[2].tex0[0])
-                                / divisor,
-                            (perspective[0] * vertices[0].tex0[1]
-                                + perspective[1] * vertices[1].tex0[1]
-                                + perspective[2] * vertices[2].tex0[1])
-                                / divisor,
-                        ];
-                        if let Some(texel) = self.gx_texture0_sample(coordinate) {
+                    if let Some(coordinate) = Self::gx_perspective_texcoord(vertices, weights) {
+                        let image = self.gx.bp_regs[0x88];
+                        let width = (image & 0x3ff) as f32 + 1.0;
+                        let height = ((image >> 10) & 0x3ff) as f32 + 1.0;
+                        let weights_x =
+                            Self::gx_triangle_weights(vertices, area, sample_x + 1.0, sample_y);
+                        let weights_y =
+                            Self::gx_triangle_weights(vertices, area, sample_x, sample_y + 1.0);
+                        let linear = match (
+                            Self::gx_perspective_texcoord(vertices, weights_x),
+                            Self::gx_perspective_texcoord(vertices, weights_y),
+                        ) {
+                            (Some(coordinate_x), Some(coordinate_y)) => self
+                                .gx_texture0_linear_filter(
+                                    (coordinate_x[0] - coordinate[0]).abs() * width,
+                                    (coordinate_x[1] - coordinate[1]).abs() * height,
+                                    (coordinate_y[0] - coordinate[0]).abs() * width,
+                                    (coordinate_y[1] - coordinate[1]).abs() * height,
+                                ),
+                            _ => self.gx.bp_regs[0x80] & (1 << 4) != 0,
+                        };
+                        if let Some(texel) = self.gx_texture0_sample(coordinate, linear) {
                             color = Self::gx_modulate_texture(color, texel);
                         }
                     }
@@ -1996,15 +2106,26 @@ impl GameCubeBoard {
                     .clamp(0.0, 255.0) as u8;
             }
             if a.has_tex0 && b.has_tex0 {
-                let qa = (1.0 - t) / a.clip_w;
-                let qb = t / b.clip_w;
-                let divisor = qa + qb;
-                if divisor.is_finite() && divisor.abs() >= f32::EPSILON {
-                    let coordinate = [
-                        (qa * a.tex0[0] + qb * b.tex0[0]) / divisor,
-                        (qa * a.tex0[1] + qb * b.tex0[1]) / divisor,
-                    ];
-                    if let Some(texel) = self.gx_texture0_sample(coordinate) {
+                if let Some(coordinate) = Self::gx_line_texcoord(a, b, t) {
+                    let neighbor_t = if step < steps {
+                        (step + 1) as f32 / steps as f32
+                    } else {
+                        step.saturating_sub(1) as f32 / steps as f32
+                    };
+                    let linear = if let Some(neighbor) = Self::gx_line_texcoord(a, b, neighbor_t) {
+                        let image = self.gx.bp_regs[0x88];
+                        let width = (image & 0x3ff) as f32 + 1.0;
+                        let height = ((image >> 10) & 0x3ff) as f32 + 1.0;
+                        self.gx_texture0_linear_filter(
+                            (neighbor[0] - coordinate[0]).abs() * width,
+                            (neighbor[1] - coordinate[1]).abs() * height,
+                            0.0,
+                            0.0,
+                        )
+                    } else {
+                        self.gx.bp_regs[0x80] & (1 << 4) != 0
+                    };
+                    if let Some(texel) = self.gx_texture0_sample(coordinate, linear) {
                         color = Self::gx_modulate_texture(color, texel);
                     }
                 }
@@ -2021,7 +2142,8 @@ impl GameCubeBoard {
     fn gx_draw_point(&mut self, vertex: GxScreenVertex) {
         let mut color = vertex.color;
         if vertex.has_tex0 {
-            if let Some(texel) = self.gx_texture0_sample(vertex.tex0) {
+            let linear = self.gx.bp_regs[0x80] & (1 << 4) != 0;
+            if let Some(texel) = self.gx_texture0_sample(vertex.tex0, linear) {
                 color = Self::gx_modulate_texture(color, texel);
             }
         }
@@ -4011,11 +4133,40 @@ mod tests {
         board.mem1[base as usize + 7] = 0x77;
         assert_eq!(board.gx_texture0_texel(1, 0), Some([0x35; 4]));
         board.gx.bp_regs[0x80] = 1;
-        assert_eq!(board.gx_texture0_sample([1.125, 0.0]), Some([0x35; 4]));
+        assert_eq!(
+            board.gx_texture0_sample([1.125, 0.0], false),
+            Some([0x35; 4])
+        );
         board.gx.bp_regs[0x80] = 2;
-        assert_eq!(board.gx_texture0_sample([1.125, 0.0]), Some([0x66; 4]));
+        assert_eq!(
+            board.gx_texture0_sample([1.125, 0.0], false),
+            Some([0x66; 4])
+        );
         board.gx.bp_regs[0x80] = 0;
-        assert_eq!(board.gx_texture0_sample([1.125, 0.0]), Some([0x77; 4]));
+        assert_eq!(
+            board.gx_texture0_sample([1.125, 0.0], false),
+            Some([0x77; 4])
+        );
+
+        board.mem1[base as usize..base as usize + 64].fill(0);
+        configure_texture0(&mut board, base, 6, 4, 1, 1);
+        board.mem1[base as usize + 1] = 0x11;
+        board.mem1[base as usize + 4] = 0x44;
+        board.mem1[base as usize + 5] = 0x55;
+        assert_eq!(
+            board.gx_texture0_sample([1.125, 0.0], false),
+            Some([0x44; 4])
+        );
+        board.gx.bp_regs[0x80] = 2;
+        assert_eq!(
+            board.gx_texture0_sample([1.125, 0.0], false),
+            Some([0x11; 4])
+        );
+        board.gx.bp_regs[0x80] = 0;
+        assert_eq!(
+            board.gx_texture0_sample([1.125, 0.0], false),
+            Some([0x55; 4])
+        );
 
         board.mem1[base as usize..base as usize + 64].fill(0);
         configure_texture0(&mut board, base, 8, 4, 2, 0);
@@ -4061,6 +4212,40 @@ mod tests {
         assert_eq!(board.gx_texture0_texel(1, 0), Some([0, 0, 0xff, 0xff]));
         assert_eq!(board.gx_texture0_texel(2, 0), Some([159, 0, 95, 0xff]));
         assert_eq!(board.gx_texture0_texel(3, 0), Some([95, 0, 159, 0xff]));
+    }
+
+    #[test]
+    fn gx_linear_texture_filter_uses_texel_centers_and_lod_filter_selection() {
+        let mut board = idle_board();
+        let base = 0x6800u32;
+        configure_texture0(&mut board, base, 2, 2, 4, 1 << 4);
+        let base = base as usize;
+        board.mem1[base..base + 2].copy_from_slice(&0xf800u16.to_be_bytes());
+        board.mem1[base + 2..base + 4].copy_from_slice(&0x07e0u16.to_be_bytes());
+        board.mem1[base + 8..base + 10].copy_from_slice(&0x001fu16.to_be_bytes());
+        board.mem1[base + 10..base + 12].copy_from_slice(&0xffffu16.to_be_bytes());
+
+        assert_eq!(
+            board.gx_texture0_sample([0.25, 0.25], true),
+            Some([0xff, 0, 0, 0xff])
+        );
+        assert_eq!(
+            board.gx_texture0_sample([0.5, 0.5], true),
+            Some([0x7f, 0x7f, 0x7f, 0xff])
+        );
+        assert_eq!(
+            board.gx_texture0_sample([0.5, 0.5], false),
+            Some([0xff, 0xff, 0xff, 0xff])
+        );
+
+        assert!(board.gx_texture0_linear_filter(0.5, 0.0, 0.0, 0.0));
+        assert!(!board.gx_texture0_linear_filter(2.0, 0.0, 0.0, 0.0));
+        board.gx.bp_regs[0x80] |= 1 << 7;
+        assert!(board.gx_texture0_linear_filter(2.0, 0.0, 0.0, 0.0));
+        board.gx.bp_regs[0x80] = (1 << 4) | (64 << 9);
+        assert!(!board.gx_texture0_linear_filter(0.5, 0.0, 0.0, 0.0));
+        board.gx.bp_regs[0x80] = (1 << 7) | (64 << 9);
+        assert!(board.gx_texture0_linear_filter(0.5, 0.0, 0.0, 0.0));
     }
 
     #[test]
