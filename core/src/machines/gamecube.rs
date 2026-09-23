@@ -9,7 +9,7 @@ use crate::platform::PlatformId;
 use crate::resources::{ResourceBlob, ResourceKind};
 use crate::state::{StateReader, StateWriter};
 
-const STATE_VERSION: u32 = 5;
+const STATE_VERSION: u32 = 6;
 const MEM1_SIZE: usize = 24 * 1024 * 1024;
 const ARAM_SIZE: usize = 16 * 1024 * 1024;
 const EFB_SIZE: usize = 2 * 1024 * 1024;
@@ -18,6 +18,9 @@ const MMIO_SIZE: usize = 0x1_0000;
 const FRAME_RATE: u64 = 60;
 const CPU_STEPS_PER_FRAME: u64 = 250_000;
 const AUDIO_RATE: u32 = 48_000;
+const AUDIO_SAMPLES_PER_FRAME: u32 = AUDIO_RATE / FRAME_RATE as u32;
+const DTK_BLOCK_BYTES: u64 = 32;
+const DTK_SAMPLES_PER_BLOCK: u32 = 28;
 const VIDEO_WIDTH: u32 = 640;
 const VIDEO_HEIGHT: u32 = 480;
 
@@ -42,6 +45,16 @@ const DI_DMA_LENGTH: usize = 0x6018;
 const DI_DMA_CONTROL: usize = 0x601c;
 const DI_IMMEDIATE: usize = 0x6020;
 const DI_CONFIG: usize = 0x6024;
+const DI_ERROR_NONE: u32 = 0x00000;
+const DI_ERROR_MOTOR_STOPPED: u32 = 0x20400;
+const DI_ERROR_NO_DISC_ID: u32 = 0x20401;
+const DI_ERROR_MEDIUM_NOT_PRESENT: u32 = 0x23a00;
+const DI_ERROR_INVALID_COMMAND: u32 = 0x52000;
+const DI_ERROR_NO_AUDIO_BUFFER: u32 = 0x52001;
+const DI_ERROR_BLOCK_OOB: u32 = 0x52100;
+const DI_ERROR_INVALID_AUDIO_COMMAND: u32 = 0x52401;
+const DI_ERROR_INVALID_PERIOD: u32 = 0x52402;
+const DI_ERROR_MEDIUM_CHANGED: u32 = 0x62800;
 
 const DSP_CONTROL: usize = 0x500a;
 const AR_DMA_MMADDR_H: usize = 0x5020;
@@ -141,8 +154,12 @@ fn read_resource_u32(image: &ResourceBlob, offset: u64) -> Result<u32, String> {
     Ok(u32::from_be_bytes(bytes))
 }
 
+fn is_disc_image(image: &ResourceBlob) -> Result<bool, String> {
+    Ok(image.len() >= 0x424 && read_resource_u32(image, 0x1c)? == DISC_MAGIC)
+}
+
 fn locate_dol(image: &ResourceBlob) -> Result<u64, String> {
-    if image.len() >= 0x424 && read_resource_u32(image, 0x1c)? == DISC_MAGIC {
+    if is_disc_image(image)? {
         return Ok(u64::from(read_resource_u32(image, 0x420)?));
     }
     Ok(0)
@@ -196,6 +213,57 @@ struct AudioDma {
     blocks: u16,
     remaining: u16,
     enabled: bool,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DiDriveState {
+    Ready = 0,
+    ReadyNoReadsMade = 1,
+    CoverOpened = 2,
+    DiscChangeDetected = 3,
+    NoMediumPresent = 4,
+    MotorStopped = 5,
+    #[default]
+    DiscIdNotRead = 6,
+}
+
+impl DiDriveState {
+    fn error_state(self) -> u32 {
+        match self {
+            Self::Ready | Self::ReadyNoReadsMade => 0,
+            _ => u32::from(self as u8) - 1,
+        }
+    }
+
+    fn from_u8(value: u8) -> Result<Self, String> {
+        match value {
+            0 => Ok(Self::Ready),
+            1 => Ok(Self::ReadyNoReadsMade),
+            2 => Ok(Self::CoverOpened),
+            3 => Ok(Self::DiscChangeDetected),
+            4 => Ok(Self::NoMediumPresent),
+            5 => Ok(Self::MotorStopped),
+            6 => Ok(Self::DiscIdNotRead),
+            _ => Err(format!("GameCube DI state has invalid drive state {value}")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct DiState {
+    drive_state: DiDriveState,
+    error: u32,
+    enable_dtk: bool,
+    dtk_buffer_length: u8,
+    dtk_sample_remainder: u8,
+    stream: bool,
+    stop_at_track_end: bool,
+    audio_position: u64,
+    current_start: u64,
+    current_length: u32,
+    next_start: u64,
+    next_length: u32,
 }
 
 fn descramble_ipl_code(bytes: &mut [u8]) {
@@ -336,6 +404,7 @@ struct GameCubeBoard {
     memory_cards: [Box<[u8]>; 2],
     input: InputState,
     audio_dma: AudioDma,
+    di: DiState,
     exi: ExiState,
     video: VideoBuffer,
     frame_counter: u64,
@@ -366,12 +435,14 @@ impl GameCubeBoard {
             ],
             input: InputState::default(),
             audio_dma: AudioDma::default(),
+            di: DiState::default(),
             exi: ExiState::default(),
             video: VideoBuffer::new(VIDEO_WIDTH, VIDEO_HEIGHT),
             frame_counter: 0,
         };
         board.reset_mmio();
         board.initialize_low_memory();
+        board.initialize_hle_boot_state()?;
         Ok((board, entry))
     }
 
@@ -381,12 +452,39 @@ impl GameCubeBoard {
         self.write_mem_u32(0x0000_00fc, 486_000_000);
     }
 
+    fn initialize_hle_boot_state(&mut self) -> Result<(), String> {
+        if !is_disc_image(&self.disc)? {
+            self.di.drive_state = DiDriveState::CoverOpened;
+            return Ok(());
+        }
+
+        let mut disc_id = [0u8; 0x20];
+        self.disc.read(0, &mut disc_id)?;
+        self.mem1[..disc_id.len()].copy_from_slice(&disc_id);
+        let streaming = disc_id[8] != 0;
+        let streaming_size = if streaming {
+            let configured = disc_id[9] & 0x0f;
+            if configured == 0 {
+                10
+            } else {
+                configured
+            }
+        } else {
+            0
+        };
+        self.di.drive_state = DiDriveState::Ready;
+        self.di.enable_dtk = streaming;
+        self.di.dtk_buffer_length = streaming_size;
+        Ok(())
+    }
+
     fn reset_mmio(&mut self) {
         self.mmio.fill(0);
         self.mmio_write_u32_raw(DI_COVER, 0);
         self.mmio_write_u32_raw(DI_CONFIG, 1);
         self.mmio_write_u16_raw(VI_CONTROL, 1);
         self.audio_dma = AudioDma::default();
+        self.di = DiState::default();
         let ipl = self.exi.ipl.clone();
         self.exi = ExiState::default();
         self.exi.ipl = ipl;
@@ -926,6 +1024,25 @@ impl GameCubeBoard {
         self.mmio[SI_IO_BUFFER..SI_IO_BUFFER + origin.len()].copy_from_slice(&origin);
     }
 
+    fn fail_di(&mut self, error: u32) {
+        self.di.error = error;
+        self.finish_di(false);
+    }
+
+    fn check_di_read_preconditions(&mut self) -> bool {
+        let error = match self.di.drive_state {
+            DiDriveState::Ready | DiDriveState::ReadyNoReadsMade => return true,
+            DiDriveState::DiscIdNotRead => DI_ERROR_NO_DISC_ID,
+            DiDriveState::MotorStopped => DI_ERROR_MOTOR_STOPPED,
+            DiDriveState::CoverOpened | DiDriveState::NoMediumPresent => {
+                DI_ERROR_MEDIUM_NOT_PRESENT
+            }
+            DiDriveState::DiscChangeDetected => DI_ERROR_MEDIUM_CHANGED,
+        };
+        self.di.error = error;
+        false
+    }
+
     fn finish_di(&mut self, success: bool) {
         let mut control = self.mmio_read_u32_raw(DI_DMA_CONTROL);
         control &= !1;
@@ -933,12 +1050,14 @@ impl GameCubeBoard {
         let mut status = self.mmio_read_u32_raw(DI_STATUS);
         if success {
             status |= 1 << 4;
-            self.set_pi_cause(PI_INT_DI, status & (1 << 3) != 0);
         } else {
             status |= 1 << 2;
-            self.set_pi_cause(PI_INT_DI, status & (1 << 1) != 0);
         }
         self.mmio_write_u32_raw(DI_STATUS, status);
+        let pending = (status & (1 << 2) != 0 && status & (1 << 1) != 0)
+            || (status & (1 << 4) != 0 && status & (1 << 3) != 0)
+            || (status & (1 << 6) != 0 && status & (1 << 5) != 0);
+        self.set_pi_cause(PI_INT_DI, pending);
     }
 
     fn service_di(&mut self) {
@@ -949,25 +1068,31 @@ impl GameCubeBoard {
         let command = (command0 >> 24) as u8;
         match command {
             0x12 => self.di_inquiry(),
-            0xa8 if command0 as u8 == 0 => self.di_read(),
-            0xab | 0xe1 | 0xe3 | 0xe4 => self.finish_di(true),
-            0xe0 | 0xe2 => {
-                self.mmio_write_u32_raw(DI_IMMEDIATE, 0);
-                self.finish_di(true);
-            }
-            _ => self.finish_di(false),
+            0xa8 => match command0 as u8 {
+                0x00 => self.di_read(),
+                0x40 => self.di_read_disc_id(),
+                _ => self.fail_di(DI_ERROR_INVALID_COMMAND),
+            },
+            0xab => self.di_seek(),
+            0xe0 => self.di_request_error(),
+            0xe1 => self.di_audio_stream(),
+            0xe2 => self.di_audio_status(),
+            0xe3 => self.di_stop_motor(),
+            0xe4 => self.di_audio_buffer_config(),
+            _ => self.fail_di(DI_ERROR_INVALID_COMMAND),
         }
     }
     fn di_inquiry(&mut self) {
         let address = self.mmio_read_u32_raw(DI_DMA_ADDRESS);
-        let length = self.mmio_read_u32_raw(DI_DMA_LENGTH).min(12) as usize;
+        let length = self.mmio_read_u32_raw(DI_DMA_LENGTH).min(0x20) as usize;
         let Ok(range) = memory_range(address, length) else {
-            self.finish_di(false);
+            self.fail_di(DI_ERROR_INVALID_COMMAND);
             return;
         };
-        let response = [
+        let mut response = [0u8; 0x20];
+        response[..12].copy_from_slice(&[
             0x00, 0x00, 0x00, 0x02, 0x20, 0x06, 0x05, 0x26, 0x41, 0x00, 0x00, 0x00,
-        ];
+        ]);
         self.mem1[range].copy_from_slice(&response[..length]);
         self.mmio_write_u32_raw(DI_DMA_ADDRESS, address.wrapping_add(length as u32));
         self.mmio_write_u32_raw(DI_DMA_LENGTH, 0);
@@ -975,6 +1100,10 @@ impl GameCubeBoard {
     }
 
     fn di_read(&mut self) {
+        if !self.check_di_read_preconditions() {
+            self.finish_di(false);
+            return;
+        }
         let dvd_offset = u64::from(self.mmio_read_u32_raw(DI_COMMAND_1)) << 2;
         let requested = self.mmio_read_u32_raw(DI_COMMAND_2);
         let dma_length = self.mmio_read_u32_raw(DI_DMA_LENGTH);
@@ -984,19 +1113,197 @@ impl GameCubeBoard {
             .checked_add(length as u64)
             .is_none_or(|end| end > self.disc.len())
         {
-            self.finish_di(false);
+            self.fail_di(DI_ERROR_BLOCK_OOB);
             return;
         }
         let Ok(range) = memory_range(address, length) else {
-            self.finish_di(false);
+            self.fail_di(DI_ERROR_INVALID_COMMAND);
             return;
         };
         if self.disc.read(dvd_offset, &mut self.mem1[range]).is_err() {
             return;
         }
+        if self.di.drive_state == DiDriveState::ReadyNoReadsMade {
+            self.di.drive_state = DiDriveState::Ready;
+        }
         self.mmio_write_u32_raw(DI_DMA_ADDRESS, address.wrapping_add(length as u32));
         self.mmio_write_u32_raw(DI_DMA_LENGTH, 0);
         self.finish_di(true);
+    }
+
+    fn di_read_disc_id(&mut self) {
+        match self.di.drive_state {
+            DiDriveState::MotorStopped => {
+                self.fail_di(DI_ERROR_MOTOR_STOPPED);
+                return;
+            }
+            DiDriveState::CoverOpened | DiDriveState::NoMediumPresent => {
+                self.fail_di(DI_ERROR_MEDIUM_NOT_PRESENT);
+                return;
+            }
+            DiDriveState::DiscChangeDetected => {
+                self.fail_di(DI_ERROR_MEDIUM_CHANGED);
+                return;
+            }
+            DiDriveState::Ready | DiDriveState::ReadyNoReadsMade | DiDriveState::DiscIdNotRead => {}
+        }
+
+        let address = self.mmio_read_u32_raw(DI_DMA_ADDRESS);
+        let length = self.mmio_read_u32_raw(DI_DMA_LENGTH).min(0x20) as usize;
+        let Ok(range) = memory_range(address, length) else {
+            self.fail_di(DI_ERROR_INVALID_COMMAND);
+            return;
+        };
+        if self.disc.read(0, &mut self.mem1[range]).is_err() {
+            return;
+        }
+
+        self.di.drive_state = match self.di.drive_state {
+            DiDriveState::DiscIdNotRead => DiDriveState::ReadyNoReadsMade,
+            DiDriveState::ReadyNoReadsMade => DiDriveState::Ready,
+            state => state,
+        };
+        self.mmio_write_u32_raw(DI_DMA_ADDRESS, address.wrapping_add(length as u32));
+        self.mmio_write_u32_raw(DI_DMA_LENGTH, 0);
+        self.finish_di(true);
+    }
+
+    fn di_seek(&mut self) {
+        if !self.check_di_read_preconditions() {
+            self.finish_di(false);
+            return;
+        }
+        if self.di.drive_state == DiDriveState::ReadyNoReadsMade {
+            self.di.drive_state = DiDriveState::Ready;
+        }
+        self.finish_di(true);
+    }
+
+    fn di_request_error(&mut self) {
+        let result = (self.di.drive_state.error_state() << 24) | self.di.error;
+        self.mmio_write_u32_raw(DI_IMMEDIATE, result);
+        self.di.error = DI_ERROR_NONE;
+        self.finish_di(true);
+    }
+
+    fn di_audio_stream(&mut self) {
+        if !self.check_di_read_preconditions() {
+            self.finish_di(false);
+            return;
+        }
+        if !self.di.enable_dtk {
+            self.fail_di(DI_ERROR_NO_AUDIO_BUFFER);
+            return;
+        }
+        if self.di.drive_state == DiDriveState::ReadyNoReadsMade {
+            self.di.drive_state = DiDriveState::Ready;
+        }
+
+        match (self.mmio_read_u32_raw(DI_COMMAND_0) >> 16) & 0xff {
+            0 => {
+                let start = u64::from(self.mmio_read_u32_raw(DI_COMMAND_1)) << 2;
+                let length = self.mmio_read_u32_raw(DI_COMMAND_2);
+                if start == 0 && length == 0 {
+                    self.di.stop_at_track_end = true;
+                } else if !self.di.stop_at_track_end {
+                    self.di.next_start = start;
+                    self.di.next_length = length;
+                    if !self.di.stream {
+                        self.di.current_start = start;
+                        self.di.current_length = length;
+                        self.di.audio_position = start;
+                        self.di.dtk_sample_remainder = 0;
+                        self.di.stream = true;
+                    }
+                }
+                self.finish_di(true);
+            }
+            1 => {
+                self.di.stop_at_track_end = false;
+                self.di.stream = false;
+                self.di.dtk_sample_remainder = 0;
+                self.finish_di(true);
+            }
+            _ => self.fail_di(DI_ERROR_INVALID_AUDIO_COMMAND),
+        }
+    }
+
+    fn di_audio_status(&mut self) {
+        if !self.check_di_read_preconditions() {
+            self.finish_di(false);
+            return;
+        }
+        if !self.di.enable_dtk {
+            self.fail_di(DI_ERROR_NO_AUDIO_BUFFER);
+            return;
+        }
+
+        let value = match (self.mmio_read_u32_raw(DI_COMMAND_0) >> 16) & 0xff {
+            0 => u32::from(self.di.stream),
+            1 => ((self.di.audio_position & !0x7fff) >> 2) as u32,
+            2 => (self.di.current_start >> 2) as u32,
+            3 => self.di.current_length,
+            _ => {
+                self.fail_di(DI_ERROR_INVALID_AUDIO_COMMAND);
+                return;
+            }
+        };
+        self.mmio_write_u32_raw(DI_IMMEDIATE, value);
+        self.finish_di(true);
+    }
+
+    fn di_stop_motor(&mut self) {
+        self.di.stream = false;
+        self.di.stop_at_track_end = false;
+        self.di.dtk_sample_remainder = 0;
+        self.di.drive_state = DiDriveState::MotorStopped;
+        self.finish_di(true);
+    }
+
+    fn di_audio_buffer_config(&mut self) {
+        if !self.check_di_read_preconditions() {
+            self.finish_di(false);
+            return;
+        }
+        if self.di.drive_state == DiDriveState::Ready {
+            self.fail_di(DI_ERROR_INVALID_PERIOD);
+            return;
+        }
+
+        let command = self.mmio_read_u32_raw(DI_COMMAND_0);
+        self.di.enable_dtk = command & (1 << 16) != 0;
+        self.di.dtk_buffer_length = (command & 0x0f) as u8;
+        if !self.di.enable_dtk {
+            self.di.stream = false;
+            self.di.stop_at_track_end = false;
+            self.di.dtk_sample_remainder = 0;
+        }
+        self.finish_di(true);
+    }
+
+    fn advance_dtk_stream(&mut self, samples: u32) {
+        if !self.di.stream {
+            return;
+        }
+
+        let total_samples = u32::from(self.di.dtk_sample_remainder).saturating_add(samples);
+        let blocks = total_samples / DTK_SAMPLES_PER_BLOCK;
+        self.di.dtk_sample_remainder = (total_samples % DTK_SAMPLES_PER_BLOCK) as u8;
+
+        for _ in 0..blocks {
+            if self.di.audio_position >= self.di.current_start + u64::from(self.di.current_length) {
+                self.di.audio_position = self.di.next_start;
+                self.di.current_start = self.di.next_start;
+                self.di.current_length = self.di.next_length;
+                if self.di.stop_at_track_end {
+                    self.di.stop_at_track_end = false;
+                    self.di.stream = false;
+                    self.di.dtk_sample_remainder = 0;
+                    break;
+                }
+            }
+            self.di.audio_position = self.di.audio_position.saturating_add(DTK_BLOCK_BYTES);
+        }
     }
 
     fn service_aram_dma(&mut self) {
@@ -1155,6 +1462,7 @@ impl GameCubeBoard {
 
     fn end_frame(&mut self, audio: &mut AudioBuffer) {
         self.service_di();
+        self.advance_dtk_stream(AUDIO_SAMPLES_PER_FRAME);
         self.present_video();
         self.render_audio(audio);
         self.raise_vi_retrace();
@@ -1311,6 +1619,7 @@ impl GameCubeBoard {
         let entry = load_dol(&self.disc, &mut self.mem1)?;
         self.reset_mmio();
         self.initialize_low_memory();
+        self.initialize_hle_boot_state()?;
         self.input = InputState::default();
         self.frame_counter = 0;
         self.video.clear([0, 0, 0, 255]);
@@ -1367,6 +1676,18 @@ impl GameCubeBoard {
         out.u16(self.audio_dma.blocks);
         out.u16(self.audio_dma.remaining);
         out.u8(u8::from(self.audio_dma.enabled));
+        out.u8(self.di.drive_state as u8);
+        out.u32(self.di.error);
+        out.u8(u8::from(self.di.enable_dtk));
+        out.u8(self.di.dtk_buffer_length);
+        out.u8(self.di.dtk_sample_remainder);
+        out.u8(u8::from(self.di.stream));
+        out.u8(u8::from(self.di.stop_at_track_end));
+        out.u64(self.di.audio_position);
+        out.u64(self.di.current_start);
+        out.u32(self.di.current_length);
+        out.u64(self.di.next_start);
+        out.u32(self.di.next_length);
         Self::save_exi_channel(&self.exi.channel0, out);
         Self::save_exi_channel(&self.exi.channel1, out);
         out.u32(self.exi.ipl.command);
@@ -1389,6 +1710,18 @@ impl GameCubeBoard {
         self.audio_dma.blocks = input.u16()?;
         self.audio_dma.remaining = input.u16()?;
         self.audio_dma.enabled = input.u8()? != 0;
+        self.di.drive_state = DiDriveState::from_u8(input.u8()?)?;
+        self.di.error = input.u32()?;
+        self.di.enable_dtk = input.u8()? != 0;
+        self.di.dtk_buffer_length = input.u8()? & 0x0f;
+        self.di.dtk_sample_remainder = input.u8()? % DTK_SAMPLES_PER_BLOCK as u8;
+        self.di.stream = input.u8()? != 0;
+        self.di.stop_at_track_end = input.u8()? != 0;
+        self.di.audio_position = input.u64()?;
+        self.di.current_start = input.u64()?;
+        self.di.current_length = input.u32()?;
+        self.di.next_start = input.u64()?;
+        self.di.next_length = input.u32()?;
         Self::load_exi_channel(&mut self.exi.channel0, input, "EXI channel 0")?;
         Self::load_exi_channel(&mut self.exi.channel1, input, "EXI channel 1")?;
         self.exi.ipl.command = input.u32()?;
@@ -1862,6 +2195,26 @@ mod tests {
         ((address & 0x01ff_ffff) << 6) | if write { 1 << 31 } else { 0 }
     }
 
+    fn run_di_command(
+        board: &mut GameCubeBoard,
+        command0: u32,
+        command1: u32,
+        command2: u32,
+        address: u32,
+        length: u32,
+    ) {
+        board.mmio_write_u32_raw(DI_COMMAND_0, command0);
+        board.mmio_write_u32_raw(DI_COMMAND_1, command1);
+        board.mmio_write_u32_raw(DI_COMMAND_2, command2);
+        board.mmio_write_u32_raw(DI_DMA_ADDRESS, address);
+        board.mmio_write_u32_raw(DI_DMA_LENGTH, length);
+        board.write_mmio32(DI_DMA_CONTROL, 1);
+    }
+
+    fn clear_di_completion(board: &mut GameCubeBoard) {
+        board.write_di_status((1 << 2) | (1 << 4));
+    }
+
     #[test]
     fn exi_ipl_reads_descrambled_user_rom_and_font_regions() {
         let mut raw_ipl = vec![0; EXI_IPL_ROM_SIZE];
@@ -2045,6 +2398,150 @@ mod tests {
     }
 
     #[test]
+    fn hle_disc_boot_recreates_bs2_disc_id_and_dtk_state() {
+        let mut full = disc_bytes(&[0x4800_0000]);
+        full[..6].copy_from_slice(b"GM8E01");
+        full[8] = 1;
+        full[9] = 0;
+        let expected_id = full[..0x20].to_vec();
+        let (mut board, _) = GameCubeBoard::new(ResourceBlob::from_bytes(&full)).unwrap();
+
+        assert_eq!(&board.mem1[..0x20], expected_id.as_slice());
+        assert_eq!(board.di.drive_state, DiDriveState::Ready);
+        assert!(board.di.enable_dtk);
+        assert_eq!(board.di.dtk_buffer_length, 10);
+
+        board.reset().unwrap();
+        assert_eq!(&board.mem1[..0x20], expected_id.as_slice());
+        assert_eq!(board.di.drive_state, DiDriveState::Ready);
+        assert!(board.di.enable_dtk);
+        assert_eq!(board.di.dtk_buffer_length, 10);
+
+        let (raw_board, _) =
+            GameCubeBoard::new(ResourceBlob::from_bytes(&dol_bytes(&[0x4800_0000]))).unwrap();
+        assert_eq!(raw_board.di.drive_state, DiDriveState::CoverOpened);
+        assert!(!raw_board.di.enable_dtk);
+    }
+
+    #[test]
+    fn dvd_dtk_position_advances_in_adpcm_blocks_and_promotes_queued_track() {
+        let full = disc_bytes(&[0x4800_0000]);
+        let (mut board, _) = GameCubeBoard::new(ResourceBlob::from_bytes(&full)).unwrap();
+        board.di.enable_dtk = true;
+        board.di.stream = true;
+        board.di.current_start = 0x1000;
+        board.di.current_length = 0x40;
+        board.di.next_start = 0x2000;
+        board.di.next_length = 0x40;
+        board.di.audio_position = 0x1000;
+
+        board.advance_dtk_stream(DTK_SAMPLES_PER_BLOCK - 1);
+        assert_eq!(board.di.audio_position, 0x1000);
+        assert_eq!(board.di.dtk_sample_remainder, 27);
+        board.advance_dtk_stream(1);
+        assert_eq!(board.di.audio_position, 0x1020);
+        assert_eq!(board.di.dtk_sample_remainder, 0);
+
+        board.advance_dtk_stream(DTK_SAMPLES_PER_BLOCK);
+        assert_eq!(board.di.audio_position, 0x1040);
+        board.advance_dtk_stream(DTK_SAMPLES_PER_BLOCK);
+        assert_eq!(board.di.current_start, 0x2000);
+        assert_eq!(board.di.audio_position, 0x2020);
+
+        board.di.audio_position = 0x2040;
+        board.di.stop_at_track_end = true;
+        board.advance_dtk_stream(DTK_SAMPLES_PER_BLOCK);
+        assert!(!board.di.stream);
+        assert!(!board.di.stop_at_track_end);
+        assert_eq!(board.di.audio_position, 0x2000);
+        assert_eq!(board.di.dtk_sample_remainder, 0);
+    }
+
+    #[test]
+    fn dvd_drive_requires_disc_id_and_reports_packed_error_state() {
+        let full = disc_bytes(&[0x4800_0000]);
+        let expected_id = full[..0x20].to_vec();
+        let (mut board, _) = GameCubeBoard::new(ResourceBlob::from_bytes(&full)).unwrap();
+        board.reset_mmio();
+
+        run_di_command(&mut board, 0xa800_0000, 0, 4, 0x1000, 4);
+        assert_ne!(board.mmio_read_u32_raw(DI_STATUS) & (1 << 2), 0);
+        assert_eq!(board.di.error, DI_ERROR_NO_DISC_ID);
+        assert_eq!(board.di.drive_state, DiDriveState::DiscIdNotRead);
+
+        run_di_command(&mut board, 0xe000_0000, 0, 0, 0, 0);
+        assert_eq!(board.mmio_read_u32_raw(DI_IMMEDIATE), 0x0502_0401);
+        assert_eq!(board.di.error, DI_ERROR_NONE);
+        assert_ne!(board.mmio_read_u32_raw(DI_STATUS) & (1 << 2), 0);
+        assert_ne!(board.mmio_read_u32_raw(DI_STATUS) & (1 << 4), 0);
+
+        clear_di_completion(&mut board);
+        run_di_command(&mut board, 0xa800_0040, 0, 0, 0x1000, 0x20);
+        assert_eq!(&board.mem1[0x1000..0x1020], expected_id.as_slice());
+        assert_eq!(board.di.drive_state, DiDriveState::ReadyNoReadsMade);
+        assert_eq!(board.mmio_read_u32_raw(DI_DMA_LENGTH), 0);
+        assert_ne!(board.mmio_read_u32_raw(DI_STATUS) & (1 << 4), 0);
+
+        clear_di_completion(&mut board);
+        run_di_command(&mut board, 0xa800_0040, 0, 0, 0x1040, 0x20);
+        assert_eq!(board.di.drive_state, DiDriveState::Ready);
+    }
+
+    #[test]
+    fn dvd_dtk_configuration_stream_status_and_period_rules_are_stateful() {
+        let full = disc_bytes(&[0x4800_0000]);
+        let (mut board, _) = GameCubeBoard::new(ResourceBlob::from_bytes(&full)).unwrap();
+        board.reset_mmio();
+
+        run_di_command(&mut board, 0xe401_000a, 0, 0, 0, 0);
+        assert_eq!(board.di.error, DI_ERROR_NO_DISC_ID);
+        clear_di_completion(&mut board);
+
+        run_di_command(&mut board, 0xa800_0040, 0, 0, 0x1000, 0x20);
+        assert_eq!(board.di.drive_state, DiDriveState::ReadyNoReadsMade);
+        clear_di_completion(&mut board);
+
+        run_di_command(&mut board, 0xe401_000a, 0, 0, 0, 0);
+        assert!(board.di.enable_dtk);
+        assert_eq!(board.di.dtk_buffer_length, 10);
+        clear_di_completion(&mut board);
+
+        run_di_command(&mut board, 0xe100_0000, 0x800, 0x4000, 0, 0);
+        assert!(board.di.stream);
+        assert_eq!(board.di.current_start, 0x2000);
+        assert_eq!(board.di.current_length, 0x4000);
+        assert_eq!(board.di.audio_position, 0x2000);
+
+        for (command, expected) in [
+            (0xe200_0000, 1),
+            (0xe201_0000, 0),
+            (0xe202_0000, 0x800),
+            (0xe203_0000, 0x4000),
+        ] {
+            clear_di_completion(&mut board);
+            run_di_command(&mut board, command, 0, 0, 0, 0);
+            assert_eq!(board.mmio_read_u32_raw(DI_IMMEDIATE), expected);
+        }
+
+        clear_di_completion(&mut board);
+        run_di_command(&mut board, 0xe401_0000, 0, 0, 0, 0);
+        assert_eq!(board.di.error, DI_ERROR_INVALID_PERIOD);
+        run_di_command(&mut board, 0xe000_0000, 0, 0, 0, 0);
+        assert_eq!(
+            board.mmio_read_u32_raw(DI_IMMEDIATE),
+            DI_ERROR_INVALID_PERIOD
+        );
+
+        clear_di_completion(&mut board);
+        run_di_command(&mut board, 0xe300_0000, 0, 0, 0, 0);
+        assert_eq!(board.di.drive_state, DiDriveState::MotorStopped);
+        assert!(!board.di.stream);
+        clear_di_completion(&mut board);
+        run_di_command(&mut board, 0xe000_0000, 0, 0, 0, 0);
+        assert_eq!(board.mmio_read_u32_raw(DI_IMMEDIATE), 0x0400_0000);
+    }
+
+    #[test]
     fn dvd_dma_requests_missing_range_then_resumes_after_hydration() {
         let mut full = disc_bytes(&[0x4800_0000]);
         let payload: Vec<u8> = (0..32u8).collect();
@@ -2052,6 +2549,7 @@ mod tests {
         let mut sparse = ResourceBlob::streaming(full.len() as u64, 2).unwrap();
         sparse.write(0, &full[..0x700]).unwrap();
         let (mut board, _) = GameCubeBoard::new(sparse).unwrap();
+        board.di.drive_state = DiDriveState::Ready;
         board.write_di_status(1 << 3);
         board.mmio_write_u32_raw(DI_COMMAND_0, 0xa800_0000);
         board.mmio_write_u32_raw(DI_COMMAND_1, 0x1000 >> 2);
@@ -2127,6 +2625,14 @@ mod tests {
         machine.board.mem1[0x6000..0x6004].copy_from_slice(&0x1234_5678u32.to_be_bytes());
         machine.board.exi.channel1.imm_data = 0x89ab_cdef;
         machine.board.exi.channel1.card.address = 0x2468;
+        machine.board.di.drive_state = DiDriveState::Ready;
+        machine.board.di.enable_dtk = true;
+        machine.board.di.dtk_buffer_length = 10;
+        machine.board.di.dtk_sample_remainder = 17;
+        machine.board.di.stream = true;
+        machine.board.di.audio_position = 0x1234_8000;
+        machine.board.di.current_start = 0x1234_0000;
+        machine.board.di.current_length = 0x4000;
 
         let card_a = vec![0x3c; MEMORY_CARD_SIZE];
         let card_b = vec![0xa7; MEMORY_CARD_SIZE];
@@ -2150,6 +2656,14 @@ mod tests {
         assert_eq!(restored.board.read32(0x8000_6000), 0x1234_5678);
         assert_eq!(restored.board.exi.channel1.imm_data, 0x89ab_cdef);
         assert_eq!(restored.board.exi.channel1.card.address, 0x2468);
+        assert_eq!(restored.board.di.drive_state, DiDriveState::Ready);
+        assert!(restored.board.di.enable_dtk);
+        assert_eq!(restored.board.di.dtk_buffer_length, 10);
+        assert_eq!(restored.board.di.dtk_sample_remainder, 17);
+        assert!(restored.board.di.stream);
+        assert_eq!(restored.board.di.audio_position, 0x1234_8000);
+        assert_eq!(restored.board.di.current_start, 0x1234_0000);
+        assert_eq!(restored.board.di.current_length, 0x4000);
 
         let mut card_a_out = vec![0; MEMORY_CARD_SIZE];
         let mut card_b_out = vec![0; MEMORY_CARD_SIZE];
