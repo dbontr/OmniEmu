@@ -9,7 +9,7 @@ use crate::platform::PlatformId;
 use crate::resources::{ResourceBlob, ResourceKind};
 use crate::state::{StateReader, StateWriter};
 
-const STATE_VERSION: u32 = 7;
+const STATE_VERSION: u32 = 8;
 const MEM1_SIZE: usize = 24 * 1024 * 1024;
 const ARAM_SIZE: usize = 16 * 1024 * 1024;
 const EFB_SIZE: usize = 2 * 1024 * 1024;
@@ -392,10 +392,19 @@ struct ExiChannelState {
 }
 
 #[derive(Clone, Default)]
+struct ExiAd16State {
+    command: u8,
+    position: u32,
+    register: [u8; 4],
+}
+
+#[derive(Clone, Default)]
 struct ExiState {
     channel0: ExiChannelState,
     channel1: ExiChannelState,
+    channel2: ExiChannelState,
     ipl: ExiIplState,
+    ad16: ExiAd16State,
 }
 
 struct GameCubeBoard {
@@ -494,6 +503,7 @@ impl GameCubeBoard {
         self.exi.ipl = ipl;
         self.exi.channel0.status = EXI_STATUS_EXTINT | EXI_STATUS_EXT;
         self.exi.channel1.status = EXI_STATUS_EXTINT | EXI_STATUS_EXT | (1 << 7);
+        self.exi.channel2.status = EXI_STATUS_EXTINT | EXI_STATUS_EXT;
     }
 
     fn write_mem_u32(&mut self, address: u32, value: u32) {
@@ -676,10 +686,42 @@ impl GameCubeBoard {
         }
     }
 
+    fn exi_ad16_select(&mut self) {
+        self.exi.ad16.command = 0;
+        self.exi.ad16.position = 0;
+    }
+
+    fn exi_ad16_transfer_byte(&mut self, input: u8) -> u8 {
+        let position = self.exi.ad16.position;
+        let mut output = 0xff;
+        if position == 0 {
+            self.exi.ad16.command = input;
+        } else {
+            match self.exi.ad16.command {
+                0x00 => {
+                    self.exi.ad16.register = [0x04, 0x12, 0x00, 0x00];
+                    if (2..=5).contains(&position) {
+                        output = self.exi.ad16.register[(position - 2) as usize];
+                    }
+                }
+                0xa0 if position <= 4 => {
+                    self.exi.ad16.register[(position - 1) as usize] = input;
+                }
+                0xa2 if position <= 4 => {
+                    output = self.exi.ad16.register[(position - 1) as usize];
+                }
+                _ => {}
+            }
+        }
+        self.exi.ad16.position = position.wrapping_add(1);
+        output
+    }
+
     fn exi_channel(&self, channel: usize) -> &ExiChannelState {
         match channel {
             0 => &self.exi.channel0,
             1 => &self.exi.channel1,
+            2 => &self.exi.channel2,
             _ => unreachable!("GameCube EXI channel {channel} is not modeled"),
         }
     }
@@ -688,6 +730,7 @@ impl GameCubeBoard {
         match channel {
             0 => &mut self.exi.channel0,
             1 => &mut self.exi.channel1,
+            2 => &mut self.exi.channel2,
             _ => unreachable!("GameCube EXI channel {channel} is not modeled"),
         }
     }
@@ -709,6 +752,7 @@ impl GameCubeBoard {
                 &mut self.memory_cards[1],
                 input,
             ),
+            (2, 1) => self.exi_ad16_transfer_byte(input),
             _ => 0xff,
         }
     }
@@ -740,13 +784,17 @@ impl GameCubeBoard {
                 state.status |= EXI_STATUS_EXIINT;
             }
         }
-        let active = [self.exi.channel0.status, self.exi.channel1.status]
-            .into_iter()
-            .any(|status| {
-                status & EXI_STATUS_EXIINT != 0 && status & EXI_STATUS_EXIINTMASK != 0
-                    || status & EXI_STATUS_TCINT != 0 && status & EXI_STATUS_TCINTMASK != 0
-                    || status & EXI_STATUS_EXTINT != 0 && status & EXI_STATUS_EXTINTMASK != 0
-            });
+        let active = [
+            self.exi.channel0.status,
+            self.exi.channel1.status,
+            self.exi.channel2.status,
+        ]
+        .into_iter()
+        .any(|status| {
+            status & EXI_STATUS_EXIINT != 0 && status & EXI_STATUS_EXIINTMASK != 0
+                || status & EXI_STATUS_TCINT != 0 && status & EXI_STATUS_TCINTMASK != 0
+                || status & EXI_STATUS_EXTINT != 0 && status & EXI_STATUS_EXTINTMASK != 0
+        });
         self.set_pi_cause(PI_INT_EXI, active);
     }
 
@@ -807,6 +855,9 @@ impl GameCubeBoard {
         if channel == 0 && previous_select != 2 && selected == 2 {
             self.exi_ipl_select();
         }
+        if channel == 2 && previous_select != 1 && selected == 1 {
+            self.exi_ad16_select();
+        }
         self.refresh_exi_interrupt();
     }
 
@@ -824,7 +875,7 @@ impl GameCubeBoard {
             return;
         };
         let count = (dma_length as usize).min(self.mem1.len().saturating_sub(start));
-        if self.exi_chip_select(channel) == 1 && card_command == 0x52 {
+        if channel < 2 && self.exi_chip_select(channel) == 1 && card_command == 0x52 {
             let address = card_address as usize;
             for index in 0..count {
                 self.mem1[start + index] =
@@ -851,7 +902,7 @@ impl GameCubeBoard {
             return;
         };
         let count = (dma_length as usize).min(self.mem1.len().saturating_sub(start));
-        if self.exi_chip_select(channel) == 1 && card_command == 0xf2 {
+        if channel < 2 && self.exi_chip_select(channel) == 1 && card_command == 0xf2 {
             let address = card_address as usize;
             for index in 0..count {
                 self.memory_cards[channel][(address + index) & (MEMORY_CARD_SIZE - 1)] =
@@ -1636,7 +1687,7 @@ impl GameCubeBoard {
     fn decode_exi_register(offset: usize) -> Option<(usize, usize)> {
         let relative = offset.checked_sub(EXI_STATUS)?;
         let channel = relative / EXI_CHANNEL_STRIDE;
-        if channel > 1 {
+        if channel > 2 {
             return None;
         }
         let register = EXI_STATUS + relative % EXI_CHANNEL_STRIDE;
@@ -1784,6 +1835,10 @@ impl GameCubeBoard {
         out.u32(self.di.next_length);
         Self::save_exi_channel(&self.exi.channel0, out);
         Self::save_exi_channel(&self.exi.channel1, out);
+        Self::save_exi_channel(&self.exi.channel2, out);
+        out.u8(self.exi.ad16.command);
+        out.u32(self.exi.ad16.position);
+        out.blob(&self.exi.ad16.register);
         out.u32(self.exi.ipl.command);
         out.u8(self.exi.ipl.command_bytes);
         out.u32(self.exi.ipl.cursor);
@@ -1822,6 +1877,10 @@ impl GameCubeBoard {
         self.di.next_length = input.u32()?;
         Self::load_exi_channel(&mut self.exi.channel0, input, "EXI channel 0")?;
         Self::load_exi_channel(&mut self.exi.channel1, input, "EXI channel 1")?;
+        Self::load_exi_channel(&mut self.exi.channel2, input, "EXI channel 2")?;
+        self.exi.ad16.command = input.u8()?;
+        self.exi.ad16.position = input.u32()?;
+        Self::load_blob(input, &mut self.exi.ad16.register, "EXI AD16 register")?;
         self.exi.ipl.command = input.u32()?;
         self.exi.ipl.command_bytes = input.u8()?.min(4);
         self.exi.ipl.cursor = input.u32()?;
@@ -2496,6 +2555,45 @@ mod tests {
     }
 
     #[test]
+    fn exi_ad16_channel_two_reports_id_round_trips_register_and_interrupts() {
+        let mut board = idle_board();
+        let channel = 2;
+        board.write_mmio32(
+            exi_register(channel, EXI_STATUS),
+            (1 << 7) | EXI_STATUS_TCINTMASK,
+        );
+        assert_ne!(
+            board.read_mmio32(exi_register(channel, EXI_STATUS)) & EXI_STATUS_EXT,
+            0
+        );
+
+        exi_imm_write_channel(&mut board, channel, 0, 2);
+        assert_eq!(exi_imm_read_channel(&mut board, channel, 4), 0x0412_0000);
+        assert_ne!(
+            board.read_mmio32(exi_register(channel, EXI_STATUS)) & EXI_STATUS_TCINT,
+            0
+        );
+        assert_ne!(board.mmio_read_u32_raw(PI_CAUSE) & PI_INT_EXI, 0);
+
+        board.write_mmio32(exi_register(channel, EXI_STATUS), EXI_STATUS_TCINT);
+        board.write_mmio32(
+            exi_register(channel, EXI_STATUS),
+            (1 << 7) | EXI_STATUS_TCINTMASK,
+        );
+        exi_imm_write_channel(&mut board, channel, 0xa000_0000, 1);
+        exi_imm_write_channel(&mut board, channel, 0x1234_5678, 4);
+
+        board.write_mmio32(exi_register(channel, EXI_STATUS), 0);
+        board.write_mmio32(
+            exi_register(channel, EXI_STATUS),
+            (1 << 7) | EXI_STATUS_TCINTMASK,
+        );
+        exi_imm_write_channel(&mut board, channel, 0xa200_0000, 1);
+        assert_eq!(exi_imm_read_channel(&mut board, channel, 4), 0x1234_5678);
+        assert_eq!(board.exi.ad16.register, 0x1234_5678u32.to_be_bytes());
+    }
+
+    #[test]
     fn hle_disc_boot_recreates_bs2_disc_id_and_dtk_state() {
         let mut full = disc_bytes(&[0x4800_0000]);
         full[..6].copy_from_slice(b"GM8E01");
@@ -2787,6 +2885,10 @@ mod tests {
         machine.board.mem1[0x6000..0x6004].copy_from_slice(&0x1234_5678u32.to_be_bytes());
         machine.board.exi.channel1.imm_data = 0x89ab_cdef;
         machine.board.exi.channel1.card.address = 0x2468;
+        machine.board.exi.channel2.imm_data = 0x0bad_f00d;
+        machine.board.exi.ad16.command = 0xa2;
+        machine.board.exi.ad16.position = 3;
+        machine.board.exi.ad16.register = 0x1357_9bdfu32.to_be_bytes();
         machine.board.di.drive_state = DiDriveState::Ready;
         machine.board.di.enable_dtk = true;
         machine.board.di.dtk_buffer_length = 10;
@@ -2822,6 +2924,13 @@ mod tests {
         assert_eq!(restored.board.read32(0x8000_6000), 0x1234_5678);
         assert_eq!(restored.board.exi.channel1.imm_data, 0x89ab_cdef);
         assert_eq!(restored.board.exi.channel1.card.address, 0x2468);
+        assert_eq!(restored.board.exi.channel2.imm_data, 0x0bad_f00d);
+        assert_eq!(restored.board.exi.ad16.command, 0xa2);
+        assert_eq!(restored.board.exi.ad16.position, 3);
+        assert_eq!(
+            restored.board.exi.ad16.register,
+            0x1357_9bdfu32.to_be_bytes()
+        );
         assert_eq!(restored.board.di.drive_state, DiDriveState::Ready);
         assert!(restored.board.di.enable_dtk);
         assert_eq!(restored.board.di.dtk_buffer_length, 10);
