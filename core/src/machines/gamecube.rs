@@ -9,7 +9,7 @@ use crate::platform::PlatformId;
 use crate::resources::{ResourceBlob, ResourceKind};
 use crate::state::{StateReader, StateWriter};
 
-const STATE_VERSION: u32 = 10;
+const STATE_VERSION: u32 = 11;
 const MEM1_SIZE: usize = 24 * 1024 * 1024;
 const ARAM_SIZE: usize = 16 * 1024 * 1024;
 const EFB_SIZE: usize = 2 * 1024 * 1024;
@@ -34,6 +34,7 @@ const GX_XF_REGISTER_COUNT: usize = 0x1058;
 const GX_EFB_WIDTH: usize = 640;
 const GX_EFB_HEIGHT: usize = 528;
 const GX_EFB_COLOR_BYTES: usize = GX_EFB_WIDTH * GX_EFB_HEIGHT * 4;
+const GX_EFB_DEPTH_BYTES: usize = GX_EFB_WIDTH * GX_EFB_HEIGHT * 3;
 const PI_CAUSE: usize = 0x3000;
 const PI_MASK: usize = 0x3004;
 const PI_INT_DI: u32 = 0x0004;
@@ -429,6 +430,10 @@ struct GxVertex {
 struct GxScreenVertex {
     x: f32,
     y: f32,
+    z: f32,
+    clip_x: f32,
+    clip_y: f32,
+    clip_w: f32,
     color: [u8; 4],
 }
 
@@ -437,6 +442,7 @@ struct GxState {
     cp_regs: [u32; 0x100],
     bp_regs: [u32; 0x100],
     xf_regs: Box<[u32]>,
+    depth: Box<[u8]>,
     fifo: Vec<u8>,
     commands_processed: u64,
     primitives_processed: u64,
@@ -449,6 +455,7 @@ impl Default for GxState {
             cp_regs: [0; 0x100],
             bp_regs: [0; 0x100],
             xf_regs: vec![0; GX_XF_REGISTER_COUNT].into_boxed_slice(),
+            depth: vec![0xff; GX_EFB_DEPTH_BYTES].into_boxed_slice(),
             fifo: Vec::new(),
             commands_processed: 0,
             primitives_processed: 0,
@@ -1350,12 +1357,17 @@ impl GameCubeBoard {
             clip_x * inv_w * self.gx_xf_f32(0x101a) + self.gx_xf_f32(0x101d) - viewport_offset_x;
         let screen_y =
             clip_y * inv_w * self.gx_xf_f32(0x101b) + self.gx_xf_f32(0x101e) - viewport_offset_y;
-        if !screen_x.is_finite() || !screen_y.is_finite() {
+        let screen_z = clip_z * inv_w * self.gx_xf_f32(0x101c) + self.gx_xf_f32(0x101f);
+        if !screen_x.is_finite() || !screen_y.is_finite() || !screen_z.is_finite() {
             return None;
         }
         Some(GxScreenVertex {
             x: screen_x,
             y: screen_y,
+            z: screen_z,
+            clip_x,
+            clip_y,
+            clip_w,
             color: vertex.color,
         })
     }
@@ -1393,12 +1405,182 @@ impl GameCubeBoard {
         }
     }
 
+    fn gx_efb_depth(&self, x: usize, y: usize) -> u32 {
+        let offset = (y * GX_EFB_WIDTH + x) * 3;
+        (u32::from(self.gx.depth[offset]) << 16)
+            | (u32::from(self.gx.depth[offset + 1]) << 8)
+            | u32::from(self.gx.depth[offset + 2])
+    }
+
+    fn gx_write_efb_depth(&mut self, x: usize, y: usize, depth: u32) {
+        let offset = (y * GX_EFB_WIDTH + x) * 3;
+        self.gx.depth[offset] = ((depth >> 16) & 0xff) as u8;
+        self.gx.depth[offset + 1] = ((depth >> 8) & 0xff) as u8;
+        self.gx.depth[offset + 2] = (depth & 0xff) as u8;
+    }
+
+    fn gx_depth_compare(function: u32, source: u32, destination: u32) -> bool {
+        match function & 7 {
+            0 => false,
+            1 => source < destination,
+            2 => source == destination,
+            3 => source <= destination,
+            4 => source > destination,
+            5 => source != destination,
+            6 => source >= destination,
+            _ => true,
+        }
+    }
+
+    fn gx_source_factor(mode: u32, channel: usize, source: [u8; 4], destination: [u8; 4]) -> u16 {
+        let factor = match mode & 7 {
+            0 => 0,
+            1 => 0xff,
+            2 => destination[channel],
+            3 => 0xff - destination[channel],
+            4 => source[3],
+            5 => 0xff - source[3],
+            6 => destination[3],
+            _ => 0xff - destination[3],
+        };
+        let factor = u16::from(factor);
+        factor + (factor >> 7)
+    }
+
+    fn gx_destination_factor(
+        mode: u32,
+        channel: usize,
+        source: [u8; 4],
+        destination: [u8; 4],
+    ) -> u16 {
+        let factor = match mode & 7 {
+            0 => 0,
+            1 => 0xff,
+            2 => source[channel],
+            3 => 0xff - source[channel],
+            4 => source[3],
+            5 => 0xff - source[3],
+            6 => destination[3],
+            _ => 0xff - destination[3],
+        };
+        let factor = u16::from(factor);
+        factor + (factor >> 7)
+    }
+
+    fn gx_logic_channel(operation: u32, source: u8, destination: u8) -> u8 {
+        match operation & 0xf {
+            0 => 0,
+            1 => source & destination,
+            2 => source & !destination,
+            3 => source,
+            4 => !source & destination,
+            5 => destination,
+            6 => source ^ destination,
+            7 => source | destination,
+            8 => !(source | destination),
+            9 => !(source ^ destination),
+            10 => !destination,
+            11 => source | !destination,
+            12 => !source,
+            13 => !source | destination,
+            14 => !(source & destination),
+            _ => 0xff,
+        }
+    }
+
+    fn gx_write_fragment(&mut self, x: i32, y: i32, z: f32, source: [u8; 4]) {
+        if x < 0 || y < 0 || x >= GX_EFB_WIDTH as i32 || y >= GX_EFB_HEIGHT as i32 {
+            return;
+        }
+        let x = x as usize;
+        let y = y as usize;
+        let depth = z.round().clamp(0.0, 16_777_215.0) as u32;
+        let z_mode = self.gx.bp_regs[0x40];
+        let destination_depth = self.gx_efb_depth(x, y);
+        if z_mode & 1 != 0 && !Self::gx_depth_compare((z_mode >> 1) & 7, depth, destination_depth) {
+            return;
+        }
+        if z_mode & (1 << 4) != 0 {
+            self.gx_write_efb_depth(x, y, depth);
+        }
+
+        let blend_mode = self.gx.bp_regs[0x41];
+        let destination = self.gx_efb_pixel(x, y);
+        let mut result = source;
+        if blend_mode & 1 != 0 {
+            if blend_mode & (1 << 11) != 0 {
+                for channel in 0..4 {
+                    result[channel] = destination[channel].saturating_sub(source[channel]);
+                }
+            } else {
+                let destination_mode = (blend_mode >> 5) & 7;
+                let source_mode = (blend_mode >> 8) & 7;
+                for channel in 0..4 {
+                    let source_factor =
+                        Self::gx_source_factor(source_mode, channel, source, destination);
+                    let destination_factor =
+                        Self::gx_destination_factor(destination_mode, channel, source, destination);
+                    let value = (u32::from(source[channel]) * u32::from(source_factor)
+                        + u32::from(destination[channel]) * u32::from(destination_factor))
+                        >> 8;
+                    result[channel] = value.min(255) as u8;
+                }
+            }
+        } else if blend_mode & (1 << 1) != 0 {
+            let operation = (blend_mode >> 12) & 0xf;
+            for channel in 0..4 {
+                result[channel] =
+                    Self::gx_logic_channel(operation, source[channel], destination[channel]);
+            }
+        }
+
+        let constant_alpha = self.gx.bp_regs[0x42];
+        if constant_alpha & (1 << 8) != 0 {
+            result[3] = (constant_alpha & 0xff) as u8;
+        }
+        if blend_mode & (1 << 2) != 0 && self.gx.bp_regs[0x43] & 7 == 1 {
+            const DITHER: [[u16; 2]; 2] = [[0, 2], [3, 1]];
+            let adjustment = DITHER[y & 1][x & 1];
+            for value in &mut result[..3] {
+                let value_6bit = u16::from(*value) - (u16::from(*value) >> 6);
+                *value = ((value_6bit + adjustment) & 0xfc) as u8;
+            }
+        }
+
+        let color_update = blend_mode & (1 << 3) != 0;
+        let alpha_update = blend_mode & (1 << 4) != 0;
+        if color_update || alpha_update {
+            let mut output = destination;
+            if color_update {
+                output[..3].copy_from_slice(&result[..3]);
+            }
+            if alpha_update {
+                output[3] = result[3];
+            }
+            self.gx_write_efb_pixel(x as i32, y as i32, output);
+        }
+    }
+
     fn gx_edge(a: GxScreenVertex, b: GxScreenVertex, x: f32, y: f32) -> f32 {
         (x - a.x) * (b.y - a.y) - (y - a.y) * (b.x - a.x)
     }
 
+    fn gx_is_backface(&self, vertices: [GxScreenVertex; 3]) -> bool {
+        let [v0, v1, v2] = vertices;
+        let normal_z = (v0.clip_x * v2.clip_w - v2.clip_x * v0.clip_w) * v1.clip_y
+            + (v2.clip_x * v0.clip_y - v0.clip_x * v2.clip_y) * v1.clip_w
+            + (v2.clip_y * v0.clip_w - v0.clip_y * v2.clip_w) * v1.clip_x;
+        let mut backface = normal_z <= 0.0;
+        if self.gx_xf_f32(0x101b) > 0.0 {
+            backface = !backface;
+        }
+        backface
+    }
+
     fn gx_draw_triangle(&mut self, vertices: [GxScreenVertex; 3]) {
-        if (self.gx.bp_regs[0x00] >> 14) & 3 == 3 {
+        let cull_mode = (self.gx.bp_regs[0x00] >> 14) & 3;
+        let backface = self.gx_is_backface(vertices);
+        if (!backface && matches!(cull_mode, 1 | 3)) || (backface && matches!(cull_mode, 2 | 3)) {
             return;
         }
         let area = Self::gx_edge(vertices[0], vertices[1], vertices[2].x, vertices[2].y);
@@ -1457,7 +1639,10 @@ impl GameCubeBoard {
                         + weights[2] * f32::from(vertices[2].color[channel]);
                     *value = interpolated.round().clamp(0.0, 255.0) as u8;
                 }
-                self.gx_write_efb_pixel(x, y, color);
+                let depth = weights[0] * vertices[0].z
+                    + weights[1] * vertices[1].z
+                    + weights[2] * vertices[2].z;
+                self.gx_write_fragment(x, y, depth, color);
             }
         }
     }
@@ -1475,18 +1660,20 @@ impl GameCubeBoard {
                     .round()
                     .clamp(0.0, 255.0) as u8;
             }
-            self.gx_write_efb_pixel(
+            self.gx_write_fragment(
                 (a.x + dx * t).round() as i32,
                 (a.y + dy * t).round() as i32,
+                a.z + (b.z - a.z) * t,
                 color,
             );
         }
     }
 
     fn gx_draw_point(&mut self, vertex: GxScreenVertex) {
-        self.gx_write_efb_pixel(
+        self.gx_write_fragment(
             vertex.x.round() as i32,
             vertex.y.round() as i32,
+            vertex.z,
             vertex.color,
         );
     }
@@ -1583,17 +1770,34 @@ impl GameCubeBoard {
     fn gx_clear_efb_rect(&mut self, x: usize, y: usize, width: usize, height: usize) {
         let ar = self.gx.bp_regs[0x4f];
         let gb = self.gx.bp_regs[0x50];
-        let color = [
+        let clear_color = [
             (ar & 0xff) as u8,
             ((gb >> 8) & 0xff) as u8,
             (gb & 0xff) as u8,
             ((ar >> 8) & 0xff) as u8,
         ];
+        let blend_mode = self.gx.bp_regs[0x41];
+        let color_update = blend_mode & (1 << 3) != 0;
+        let alpha_update = blend_mode & (1 << 4) != 0;
+        let depth_update = self.gx.bp_regs[0x40] & (1 << 4) != 0;
+        let clear_depth = self.gx.bp_regs[0x51] & 0x00ff_ffff;
         let right = x.saturating_add(width).min(GX_EFB_WIDTH);
         let bottom = y.saturating_add(height).min(GX_EFB_HEIGHT);
         for py in y.min(GX_EFB_HEIGHT)..bottom {
             for px in x.min(GX_EFB_WIDTH)..right {
-                self.gx_write_efb_pixel(px as i32, py as i32, color);
+                if color_update || alpha_update {
+                    let mut output = self.gx_efb_pixel(px, py);
+                    if color_update {
+                        output[..3].copy_from_slice(&clear_color[..3]);
+                    }
+                    if alpha_update {
+                        output[3] = clear_color[3];
+                    }
+                    self.gx_write_efb_pixel(px as i32, py as i32, output);
+                }
+                if depth_update {
+                    self.gx_write_efb_depth(px, py, clear_depth);
+                }
             }
         }
     }
@@ -2788,6 +2992,7 @@ impl GameCubeBoard {
         for &value in &self.gx.xf_regs {
             out.u32(value);
         }
+        out.blob(&self.gx.depth);
         out.blob(&self.gx.fifo);
         out.u64(self.gx.commands_processed);
         out.u64(self.gx.primitives_processed);
@@ -2843,6 +3048,7 @@ impl GameCubeBoard {
         for value in &mut self.gx.xf_regs {
             *value = input.u32()?;
         }
+        Self::load_blob(input, &mut self.gx.depth, "GX EFB depth")?;
         let fifo = input.blob()?;
         if fifo.len() > GX_FIFO_BUFFER_LIMIT {
             return Err(format!(
@@ -3259,7 +3465,7 @@ mod tests {
             1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0,
         ];
         write_gx_bytes(board, &gx_xf_command(0, &identity.map(f32::to_bits)));
-        let viewport = [320.0f32, -240.0, 1.0, 662.0, 582.0, 0.0];
+        let viewport = [320.0f32, -240.0, 16_777_215.0, 662.0, 582.0, 0.0];
         write_gx_bytes(board, &gx_xf_command(0x101a, &viewport.map(f32::to_bits)));
         let projection = [1.0f32, 0.0, 1.0, 0.0, 1.0, 0.0];
         let mut projection_words = projection.map(f32::to_bits).to_vec();
@@ -3267,6 +3473,7 @@ mod tests {
         write_gx_bytes(board, &gx_xf_command(0x1020, &projection_words));
         write_gx_bytes(board, &gx_bp_command(0x20, 342 | (342 << 10)));
         write_gx_bytes(board, &gx_bp_command(0x21, 981 | (869 << 10)));
+        write_gx_bytes(board, &gx_bp_command(0x41, (1 << 3) | (1 << 4)));
         write_gx_bytes(board, &gx_bp_command(0x59, 171 | (171 << 10)));
     }
 
@@ -3276,6 +3483,23 @@ mod tests {
         vertex.extend_from_slice(&y.to_bits().to_be_bytes());
         vertex.extend_from_slice(&color);
         vertex
+    }
+
+    fn gx_direct_xyz_rgba_vertex(x: f32, y: f32, z: f32, color: [u8; 4]) -> Vec<u8> {
+        let mut vertex = Vec::with_capacity(16);
+        vertex.extend_from_slice(&x.to_bits().to_be_bytes());
+        vertex.extend_from_slice(&y.to_bits().to_be_bytes());
+        vertex.extend_from_slice(&z.to_bits().to_be_bytes());
+        vertex.extend_from_slice(&color);
+        vertex
+    }
+
+    fn draw_gx_xyz_triangle(board: &mut GameCubeBoard, z: f32, color: [u8; 4]) {
+        let mut primitive = vec![0x90, 0, 3];
+        for (x, y) in [(-0.5f32, -0.5f32), (0.5, -0.5), (0.0, 0.5)] {
+            primitive.extend_from_slice(&gx_direct_xyz_rgba_vertex(x, y, z, color));
+        }
+        write_gx_bytes(board, &primitive);
     }
 
     #[test]
@@ -3344,6 +3568,102 @@ mod tests {
     }
 
     #[test]
+    fn gx_depth_test_and_write_order_overlapping_primitives() {
+        let mut board = idle_board();
+        let vcd = (1 << 9) | (1 << 13);
+        let vat_a = 1 | (4 << 1) | (1 << 13) | (5 << 14);
+        configure_gx_2d(&mut board, vcd, vat_a);
+        write_gx_bytes(&mut board, &gx_bp_command(0x40, 1 | (1 << 1) | (1 << 4)));
+
+        draw_gx_xyz_triangle(&mut board, 0.75, [255, 0, 0, 255]);
+        let first_depth = board.gx_efb_depth(320, 240);
+        assert_eq!(board.gx_efb_pixel(320, 240), [255, 0, 0, 255]);
+        assert!(first_depth < 0x00ff_ffff);
+
+        draw_gx_xyz_triangle(&mut board, 0.9, [0, 255, 0, 255]);
+        assert_eq!(board.gx_efb_pixel(320, 240), [255, 0, 0, 255]);
+        assert_eq!(board.gx_efb_depth(320, 240), first_depth);
+
+        draw_gx_xyz_triangle(&mut board, 0.5, [0, 0, 255, 255]);
+        assert_eq!(board.gx_efb_pixel(320, 240), [0, 0, 255, 255]);
+        assert!(board.gx_efb_depth(320, 240) < first_depth);
+    }
+
+    #[test]
+    fn gx_cull_modes_follow_predivide_projected_facing() {
+        let mut board = idle_board();
+        let vcd = (1 << 9) | (1 << 13);
+        let vat_a = (4 << 1) | (1 << 13) | (5 << 14);
+        configure_gx_2d(&mut board, vcd, vat_a);
+
+        let draw = |board: &mut GameCubeBoard, reversed: bool, color: [u8; 4]| {
+            let points = if reversed {
+                [(-0.5f32, -0.5f32), (0.0, 0.5), (0.5, -0.5)]
+            } else {
+                [(-0.5f32, -0.5f32), (0.5, -0.5), (0.0, 0.5)]
+            };
+            let mut primitive = vec![0x90, 0, 3];
+            for (x, y) in points {
+                primitive.extend_from_slice(&gx_direct_xy_rgba_vertex(x, y, color));
+            }
+            write_gx_bytes(board, &primitive);
+        };
+
+        write_gx_bytes(&mut board, &gx_bp_command(0x00, 1 << 14));
+        draw(&mut board, false, [255, 0, 0, 255]);
+        assert_eq!(board.gx_efb_pixel(320, 240), [0, 0, 0, 0]);
+        draw(&mut board, true, [0, 255, 0, 255]);
+        assert_eq!(board.gx_efb_pixel(320, 240), [0, 255, 0, 255]);
+
+        board.efb[..GX_EFB_COLOR_BYTES].fill(0);
+        write_gx_bytes(&mut board, &gx_bp_command(0x00, 2 << 14));
+        draw(&mut board, false, [0, 0, 255, 255]);
+        assert_eq!(board.gx_efb_pixel(320, 240), [0, 0, 255, 255]);
+        board.efb[..GX_EFB_COLOR_BYTES].fill(0);
+        draw(&mut board, true, [255, 255, 0, 255]);
+        assert_eq!(board.gx_efb_pixel(320, 240), [0, 0, 0, 0]);
+
+        write_gx_bytes(&mut board, &gx_bp_command(0x00, 3 << 14));
+        draw(&mut board, false, [255, 0, 255, 255]);
+        assert_eq!(board.gx_efb_pixel(320, 240), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn gx_blend_logic_write_masks_and_constant_alpha_follow_bp_state() {
+        let mut board = idle_board();
+        let vcd = (1 << 9) | (1 << 13);
+        let vat_a = (4 << 1) | (1 << 13) | (5 << 14);
+        configure_gx_2d(&mut board, vcd, vat_a);
+
+        let draw = |board: &mut GameCubeBoard, color: [u8; 4]| {
+            let mut primitive = vec![0x90, 0, 3];
+            for (x, y) in [(-0.5f32, -0.5f32), (0.5, -0.5), (0.0, 0.5)] {
+                primitive.extend_from_slice(&gx_direct_xy_rgba_vertex(x, y, color));
+            }
+            write_gx_bytes(board, &primitive);
+        };
+
+        draw(&mut board, [255, 0, 0, 255]);
+        let alpha_blend = 1 | (1 << 3) | (1 << 4) | (5 << 5) | (4 << 8);
+        write_gx_bytes(&mut board, &gx_bp_command(0x41, alpha_blend));
+        draw(&mut board, [0, 255, 0, 128]);
+        assert_eq!(board.gx_efb_pixel(320, 240), [126, 128, 0, 191]);
+
+        write_gx_bytes(&mut board, &gx_bp_command(0x42, (1 << 8) | 77));
+        write_gx_bytes(&mut board, &gx_bp_command(0x41, 1 << 4));
+        draw(&mut board, [0, 0, 255, 200]);
+        assert_eq!(board.gx_efb_pixel(320, 240), [126, 128, 0, 77]);
+
+        write_gx_bytes(&mut board, &gx_bp_command(0x42, 0));
+        write_gx_bytes(
+            &mut board,
+            &gx_bp_command(0x41, (1 << 1) | (1 << 3) | (1 << 4) | (6 << 12)),
+        );
+        draw(&mut board, [255, 15, 240, 170]);
+        assert_eq!(board.gx_efb_pixel(320, 240), [129, 143, 240, 231]);
+    }
+
+    #[test]
     fn gx_indexed_position_and_color_arrays_feed_rasterizer() {
         let mut board = idle_board();
         let vcd = (2 << 9) | (2 << 13);
@@ -3389,9 +3709,12 @@ mod tests {
         write_gx_bytes(&mut board, &gx_bp_command(0x4e, 256));
         write_gx_bytes(&mut board, &gx_bp_command(0x4f, 0xff00));
         write_gx_bytes(&mut board, &gx_bp_command(0x50, 0));
+        write_gx_bytes(&mut board, &gx_bp_command(0x40, 1 << 4));
+        write_gx_bytes(&mut board, &gx_bp_command(0x51, 0x12_3456));
         write_gx_bytes(&mut board, &gx_bp_command(0x52, (1 << 14) | (1 << 11)));
 
         assert_eq!(board.gx_efb_pixel(320, 240), [0, 0, 0, 255]);
+        assert_eq!(board.gx_efb_depth(320, 240), 0x12_3456);
         assert_ne!(&board.mem1[0x4000..0x4004], &[0, 0, 0, 0]);
         board.write_mmio16(VI_FB_LEFT_TOP_HI, 0);
         board.write_mmio16(VI_FB_LEFT_TOP_LO, 0x4000);
@@ -3464,6 +3787,7 @@ mod tests {
         machine.board.gx.bp_regs[0x61] = 0x00ab_cdef;
         machine.board.gx.xf_regs[0x234] = 0xfeed_beef;
         machine.board.gx.xf_regs[0x1026] = 1;
+        machine.board.gx.depth[..3].copy_from_slice(&[0x12, 0x34, 0x56]);
         machine.board.gx.fifo = vec![0x08, 0x50, 0x12];
         machine.board.gx.commands_processed = 41;
         machine.board.gx.primitives_processed = 7;
@@ -3476,6 +3800,7 @@ mod tests {
         assert_eq!(restored.board.gx.bp_regs[0x61], 0x00ab_cdef);
         assert_eq!(restored.board.gx.xf_regs[0x234], 0xfeed_beef);
         assert_eq!(restored.board.gx.xf_regs[0x1026], 1);
+        assert_eq!(&restored.board.gx.depth[..3], &[0x12, 0x34, 0x56]);
         assert_eq!(restored.board.gx.fifo, vec![0x08, 0x50, 0x12]);
         assert_eq!(restored.board.gx.commands_processed, 41);
         assert_eq!(restored.board.gx.primitives_processed, 7);
