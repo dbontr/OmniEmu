@@ -424,6 +424,8 @@ struct GxVertex {
     position: [f32; 3],
     matrix_index: u8,
     color: [u8; 4],
+    tex0: [f32; 2],
+    has_tex0: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -435,6 +437,8 @@ struct GxScreenVertex {
     clip_y: f32,
     clip_w: f32,
     color: [u8; 4],
+    tex0: [f32; 2],
+    has_tex0: bool,
 }
 
 #[derive(Clone)]
@@ -1279,7 +1283,9 @@ impl GameCubeBoard {
             0 => [0xff; 4],
             1 => {
                 let end = offset.checked_add(color_size)?;
-                Self::gx_decode_color_data(data.get(offset..end)?, color_format)?
+                let value = Self::gx_decode_color_data(data.get(offset..end)?, color_format)?;
+                offset = end;
+                value
             }
             2 | 3 => {
                 let index = Self::gx_stream_index(data, &mut offset, color_descriptor)?;
@@ -1289,10 +1295,65 @@ impl GameCubeBoard {
             _ => unreachable!(),
         };
 
+        let color1_descriptor = (vcd_lo >> 15) & 3;
+        let color1_format = (vat_a >> 18) & 7;
+        let color1_size = match color1_format {
+            0 | 3 => 2,
+            1 | 4 => 3,
+            _ => 4,
+        };
+        match color1_descriptor {
+            0 => {}
+            1 => offset = offset.checked_add(color1_size)?,
+            2 | 3 => {
+                Self::gx_stream_index(data, &mut offset, color1_descriptor)?;
+            }
+            _ => unreachable!(),
+        }
+        if offset > data.len() {
+            return None;
+        }
+
+        let vcd_hi = self.gx.cp_regs[0x60];
+        let tex0_descriptor = vcd_hi & 3;
+        let tex0_components = if vat_a & (1 << 21) != 0 { 2 } else { 1 };
+        let tex0_format = (vat_a >> 22) & 7;
+        let tex0_fraction = (vat_a >> 25) & 0x1f;
+        let tex0_size = Self::gx_direct_component_size(tex0_format, tex0_components);
+        let tex0 = match tex0_descriptor {
+            0 => [0.0, 0.0],
+            1 => {
+                let end = offset.checked_add(tex0_size)?;
+                let decoded = Self::gx_decode_position_data(
+                    data.get(offset..end)?,
+                    tex0_format,
+                    tex0_fraction,
+                    byte_dequant,
+                    tex0_components,
+                )?;
+                [decoded[0], decoded[1]]
+            }
+            2 | 3 => {
+                let index = Self::gx_stream_index(data, &mut offset, tex0_descriptor)?;
+                let source = self.gx_array_data(4, index, tex0_size)?;
+                let decoded = Self::gx_decode_position_data(
+                    source,
+                    tex0_format,
+                    tex0_fraction,
+                    byte_dequant,
+                    tex0_components,
+                )?;
+                [decoded[0], decoded[1]]
+            }
+            _ => unreachable!(),
+        };
+
         Some(GxVertex {
             position,
             matrix_index,
             color,
+            tex0,
+            has_tex0: tex0_descriptor != 0,
         })
     }
 
@@ -1369,6 +1430,8 @@ impl GameCubeBoard {
             clip_y,
             clip_w,
             color: vertex.color,
+            tex0: vertex.tex0,
+            has_tex0: vertex.has_tex0,
         })
     }
 
@@ -1430,6 +1493,205 @@ impl GameCubeBoard {
             6 => source >= destination,
             _ => true,
         }
+    }
+
+    fn gx_wrap_texture_coordinate(coordinate: f32, size: usize, mode: u32) -> usize {
+        if size == 0 || !coordinate.is_finite() {
+            return 0;
+        }
+        let texel = (coordinate * size as f32).floor() as i64;
+        let size = size as i64;
+        match mode & 3 {
+            1 => texel.rem_euclid(size) as usize,
+            2 => {
+                let period = size.saturating_mul(2);
+                let mirrored = texel.rem_euclid(period);
+                if mirrored >= size {
+                    (period - 1 - mirrored) as usize
+                } else {
+                    mirrored as usize
+                }
+            }
+            _ => texel.clamp(0, size - 1) as usize,
+        }
+    }
+
+    fn gx_texture_bytes(&self, address: u32, offset: usize, len: usize) -> Option<&[u8]> {
+        let address = address.checked_add(u32::try_from(offset).ok()?)?;
+        let range = memory_range(address, len).ok()?;
+        self.mem1.get(range)
+    }
+
+    fn gx_decode_rgb565(value: u16) -> [u8; 4] {
+        [
+            Self::gx_expand_5(((value >> 11) & 0x1f) as u8),
+            Self::gx_expand_6(((value >> 5) & 0x3f) as u8),
+            Self::gx_expand_5((value & 0x1f) as u8),
+            0xff,
+        ]
+    }
+
+    fn gx_decode_rgb5a3(value: u16) -> [u8; 4] {
+        if value & 0x8000 != 0 {
+            [
+                Self::gx_expand_5(((value >> 10) & 0x1f) as u8),
+                Self::gx_expand_5(((value >> 5) & 0x1f) as u8),
+                Self::gx_expand_5((value & 0x1f) as u8),
+                0xff,
+            ]
+        } else {
+            let expand_3 = |component: u8| (component << 5) | (component << 2) | (component >> 1);
+            [
+                Self::gx_expand_4(((value >> 8) & 0xf) as u8),
+                Self::gx_expand_4(((value >> 4) & 0xf) as u8),
+                Self::gx_expand_4((value & 0xf) as u8),
+                expand_3(((value >> 12) & 7) as u8),
+            ]
+        }
+    }
+
+    fn gx_cmpr_blend(first: u8, second: u8) -> u8 {
+        ((u16::from(first) * 5 + u16::from(second) * 3) >> 3) as u8
+    }
+
+    fn gx_texture0_texel(&self, s: usize, t: usize) -> Option<[u8; 4]> {
+        let image = self.gx.bp_regs[0x88];
+        let width = (image & 0x3ff) as usize + 1;
+        let height = ((image >> 10) & 0x3ff) as usize + 1;
+        if s >= width || t >= height {
+            return None;
+        }
+        let format = (image >> 20) & 0xf;
+        let address = (self.gx.bp_regs[0x94] & 0x00ff_ffff) << 5;
+        let (block_width, block_height, block_bytes) = match format {
+            0 => (8usize, 8usize, 32usize),
+            1 | 2 => (8, 4, 32),
+            3..=5 => (4, 4, 32),
+            6 => (4, 4, 64),
+            14 => (8, 8, 32),
+            _ => return None,
+        };
+        let blocks_per_row = width.div_ceil(block_width);
+        let block = (t / block_height)
+            .checked_mul(blocks_per_row)?
+            .checked_add(s / block_width)?;
+        let block_base = block.checked_mul(block_bytes)?;
+        let local_x = s % block_width;
+        let local_y = t % block_height;
+
+        match format {
+            0 => {
+                let texel = local_y * 8 + local_x;
+                let byte = *self
+                    .gx_texture_bytes(address, block_base + texel / 2, 1)?
+                    .first()?;
+                let intensity = if texel & 1 == 0 {
+                    byte >> 4
+                } else {
+                    byte & 0xf
+                };
+                let intensity = Self::gx_expand_4(intensity);
+                Some([intensity, intensity, intensity, intensity])
+            }
+            1 => {
+                let intensity = *self
+                    .gx_texture_bytes(address, block_base + local_y * 8 + local_x, 1)?
+                    .first()?;
+                Some([intensity, intensity, intensity, intensity])
+            }
+            2 => {
+                let value = *self
+                    .gx_texture_bytes(address, block_base + local_y * 8 + local_x, 1)?
+                    .first()?;
+                let alpha = Self::gx_expand_4(value >> 4);
+                let intensity = Self::gx_expand_4(value & 0xf);
+                Some([intensity, intensity, intensity, alpha])
+            }
+            3 => {
+                let offset = block_base + (local_y * 4 + local_x) * 2;
+                let bytes = self.gx_texture_bytes(address, offset, 2)?;
+                let alpha = bytes[0];
+                let intensity = bytes[1];
+                Some([intensity, intensity, intensity, alpha])
+            }
+            4 => {
+                let offset = block_base + (local_y * 4 + local_x) * 2;
+                let value =
+                    u16::from_be_bytes(self.gx_texture_bytes(address, offset, 2)?.try_into().ok()?);
+                Some(Self::gx_decode_rgb565(value))
+            }
+            5 => {
+                let offset = block_base + (local_y * 4 + local_x) * 2;
+                let value =
+                    u16::from_be_bytes(self.gx_texture_bytes(address, offset, 2)?.try_into().ok()?);
+                Some(Self::gx_decode_rgb5a3(value))
+            }
+            6 => {
+                let texel = (local_y * 4 + local_x) * 2;
+                let ar = self.gx_texture_bytes(address, block_base + texel, 2)?;
+                let gb = self.gx_texture_bytes(address, block_base + 32 + texel, 2)?;
+                Some([ar[1], gb[0], gb[1], ar[0]])
+            }
+            14 => {
+                let sub_block = (local_y / 4) * 2 + local_x / 4;
+                let sub_base = block_base + sub_block * 8;
+                let bytes = self.gx_texture_bytes(address, sub_base, 8)?;
+                let color0 = u16::from_be_bytes([bytes[0], bytes[1]]);
+                let color1 = u16::from_be_bytes([bytes[2], bytes[3]]);
+                let first = Self::gx_decode_rgb565(color0);
+                let second = Self::gx_decode_rgb565(color1);
+                let row = bytes[4 + local_y % 4];
+                let selector = (row >> (6 - 2 * (local_x % 4))) & 3;
+                match selector {
+                    0 => Some(first),
+                    1 => Some(second),
+                    2 if color0 > color1 => Some([
+                        Self::gx_cmpr_blend(first[0], second[0]),
+                        Self::gx_cmpr_blend(first[1], second[1]),
+                        Self::gx_cmpr_blend(first[2], second[2]),
+                        0xff,
+                    ]),
+                    3 if color0 > color1 => Some([
+                        Self::gx_cmpr_blend(second[0], first[0]),
+                        Self::gx_cmpr_blend(second[1], first[1]),
+                        Self::gx_cmpr_blend(second[2], first[2]),
+                        0xff,
+                    ]),
+                    2 => Some([
+                        ((u16::from(first[0]) + u16::from(second[0])) / 2) as u8,
+                        ((u16::from(first[1]) + u16::from(second[1])) / 2) as u8,
+                        ((u16::from(first[2]) + u16::from(second[2])) / 2) as u8,
+                        0xff,
+                    ]),
+                    _ => Some([
+                        ((u16::from(first[0]) + u16::from(second[0])) / 2) as u8,
+                        ((u16::from(first[1]) + u16::from(second[1])) / 2) as u8,
+                        ((u16::from(first[2]) + u16::from(second[2])) / 2) as u8,
+                        0,
+                    ]),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn gx_texture0_sample(&self, coordinate: [f32; 2]) -> Option<[u8; 4]> {
+        let image = self.gx.bp_regs[0x88];
+        let width = (image & 0x3ff) as usize + 1;
+        let height = ((image >> 10) & 0x3ff) as usize + 1;
+        let mode = self.gx.bp_regs[0x80];
+        let s = Self::gx_wrap_texture_coordinate(coordinate[0], width, mode & 3);
+        let t = Self::gx_wrap_texture_coordinate(coordinate[1], height, (mode >> 2) & 3);
+        self.gx_texture0_texel(s, t)
+    }
+
+    fn gx_modulate_texture(color: [u8; 4], texel: [u8; 4]) -> [u8; 4] {
+        let mut output = [0u8; 4];
+        for channel in 0..4 {
+            output[channel] =
+                ((u16::from(color[channel]) * u16::from(texel[channel]) + 127) / 255) as u8;
+        }
+        output
     }
 
     fn gx_source_factor(mode: u32, channel: usize, source: [u8; 4], destination: [u8; 4]) -> u16 {
@@ -1639,6 +1901,29 @@ impl GameCubeBoard {
                         + weights[2] * f32::from(vertices[2].color[channel]);
                     *value = interpolated.round().clamp(0.0, 255.0) as u8;
                 }
+                if vertices.iter().all(|vertex| vertex.has_tex0) {
+                    let perspective = [
+                        weights[0] / vertices[0].clip_w,
+                        weights[1] / vertices[1].clip_w,
+                        weights[2] / vertices[2].clip_w,
+                    ];
+                    let divisor = perspective.iter().sum::<f32>();
+                    if divisor.is_finite() && divisor.abs() >= f32::EPSILON {
+                        let coordinate = [
+                            (perspective[0] * vertices[0].tex0[0]
+                                + perspective[1] * vertices[1].tex0[0]
+                                + perspective[2] * vertices[2].tex0[0])
+                                / divisor,
+                            (perspective[0] * vertices[0].tex0[1]
+                                + perspective[1] * vertices[1].tex0[1]
+                                + perspective[2] * vertices[2].tex0[1])
+                                / divisor,
+                        ];
+                        if let Some(texel) = self.gx_texture0_sample(coordinate) {
+                            color = Self::gx_modulate_texture(color, texel);
+                        }
+                    }
+                }
                 let depth = weights[0] * vertices[0].z
                     + weights[1] * vertices[1].z
                     + weights[2] * vertices[2].z;
@@ -1660,6 +1945,20 @@ impl GameCubeBoard {
                     .round()
                     .clamp(0.0, 255.0) as u8;
             }
+            if a.has_tex0 && b.has_tex0 {
+                let qa = (1.0 - t) / a.clip_w;
+                let qb = t / b.clip_w;
+                let divisor = qa + qb;
+                if divisor.is_finite() && divisor.abs() >= f32::EPSILON {
+                    let coordinate = [
+                        (qa * a.tex0[0] + qb * b.tex0[0]) / divisor,
+                        (qa * a.tex0[1] + qb * b.tex0[1]) / divisor,
+                    ];
+                    if let Some(texel) = self.gx_texture0_sample(coordinate) {
+                        color = Self::gx_modulate_texture(color, texel);
+                    }
+                }
+            }
             self.gx_write_fragment(
                 (a.x + dx * t).round() as i32,
                 (a.y + dy * t).round() as i32,
@@ -1670,11 +1969,17 @@ impl GameCubeBoard {
     }
 
     fn gx_draw_point(&mut self, vertex: GxScreenVertex) {
+        let mut color = vertex.color;
+        if vertex.has_tex0 {
+            if let Some(texel) = self.gx_texture0_sample(vertex.tex0) {
+                color = Self::gx_modulate_texture(color, texel);
+            }
+        }
         self.gx_write_fragment(
             vertex.x.round() as i32,
             vertex.y.round() as i32,
             vertex.z,
-            vertex.color,
+            color,
         );
     }
 
@@ -3494,6 +3799,26 @@ mod tests {
         vertex
     }
 
+    fn gx_direct_xy_rgba_st_vertex(x: f32, y: f32, color: [u8; 4], s: f32, t: f32) -> Vec<u8> {
+        let mut vertex = gx_direct_xy_rgba_vertex(x, y, color);
+        vertex.extend_from_slice(&s.to_bits().to_be_bytes());
+        vertex.extend_from_slice(&t.to_bits().to_be_bytes());
+        vertex
+    }
+
+    fn configure_texture0(
+        board: &mut GameCubeBoard,
+        address: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+        mode: u32,
+    ) {
+        board.gx.bp_regs[0x80] = mode;
+        board.gx.bp_regs[0x88] = (width - 1) | ((height - 1) << 10) | (format << 20);
+        board.gx.bp_regs[0x94] = address >> 5;
+    }
+
     fn draw_gx_xyz_triangle(board: &mut GameCubeBoard, z: f32, color: [u8; 4]) {
         let mut primitive = vec![0x90, 0, 3];
         for (x, y) in [(-0.5f32, -0.5f32), (0.5, -0.5), (0.0, 0.5)] {
@@ -3565,6 +3890,138 @@ mod tests {
         assert_eq!(board.gx_efb_pixel(0, 0), [0, 0, 0, 0]);
         assert_eq!(board.gx.primitives_processed, 1);
         assert_eq!(board.gx.vertices_processed, 3);
+    }
+
+    #[test]
+    fn gx_texcoord_zero_decodes_direct_and_indexed_streams() {
+        let mut board = idle_board();
+        let vcd = (1 << 9) | (1 << 13);
+        let vat_a = (4 << 1) | (1 << 13) | (5 << 14) | (1 << 21) | (4 << 22);
+        configure_gx_2d(&mut board, vcd, vat_a);
+        write_gx_bytes(&mut board, &gx_cp_command(0x60, 1));
+
+        let direct = gx_direct_xy_rgba_st_vertex(-0.25, 0.5, [1, 2, 3, 4], 0.125, 0.75);
+        assert_eq!(board.gx_vertex_size(0), 20);
+        let vertex = board.gx_decode_vertex(0, &direct).unwrap();
+        assert!(vertex.has_tex0);
+        assert_eq!(vertex.tex0, [0.125, 0.75]);
+
+        write_gx_bytes(&mut board, &gx_cp_command(0x60, 2));
+        write_gx_bytes(&mut board, &gx_cp_command(0xa4, 0x5200));
+        write_gx_bytes(&mut board, &gx_cp_command(0xb4, 8));
+        board.mem1[0x5208..0x520c].copy_from_slice(&0.375f32.to_bits().to_be_bytes());
+        board.mem1[0x520c..0x5210].copy_from_slice(&0.625f32.to_bits().to_be_bytes());
+        let mut indexed = gx_direct_xy_rgba_vertex(0.0, 0.0, [0xff; 4]);
+        indexed.push(1);
+        assert_eq!(board.gx_vertex_size(0), 13);
+        let vertex = board.gx_decode_vertex(0, &indexed).unwrap();
+        assert!(vertex.has_tex0);
+        assert_eq!(vertex.tex0, [0.375, 0.625]);
+    }
+
+    #[test]
+    fn gx_texture_unit_zero_decodes_native_tiles_and_wrap_modes() {
+        let mut board = idle_board();
+        let base = 0x6000u32;
+
+        configure_texture0(&mut board, base, 8, 8, 0, 0);
+        board.mem1[base as usize] = 0xa0;
+        assert_eq!(board.gx_texture0_texel(0, 0), Some([0xaa; 4]));
+
+        board.mem1[base as usize..base as usize + 64].fill(0);
+        configure_texture0(&mut board, base, 8, 4, 1, 0);
+        board.mem1[base as usize + 1] = 0x35;
+        board.mem1[base as usize + 6] = 0x66;
+        board.mem1[base as usize + 7] = 0x77;
+        assert_eq!(board.gx_texture0_texel(1, 0), Some([0x35; 4]));
+        board.gx.bp_regs[0x80] = 1;
+        assert_eq!(board.gx_texture0_sample([1.125, 0.0]), Some([0x35; 4]));
+        board.gx.bp_regs[0x80] = 2;
+        assert_eq!(board.gx_texture0_sample([1.125, 0.0]), Some([0x66; 4]));
+        board.gx.bp_regs[0x80] = 0;
+        assert_eq!(board.gx_texture0_sample([1.125, 0.0]), Some([0x77; 4]));
+
+        board.mem1[base as usize..base as usize + 64].fill(0);
+        configure_texture0(&mut board, base, 8, 4, 2, 0);
+        board.mem1[base as usize] = 0xb4;
+        assert_eq!(
+            board.gx_texture0_texel(0, 0),
+            Some([0x44, 0x44, 0x44, 0xbb])
+        );
+
+        board.mem1[base as usize..base as usize + 64].fill(0);
+        configure_texture0(&mut board, base, 4, 4, 3, 0);
+        board.mem1[base as usize..base as usize + 2].copy_from_slice(&[0x7f, 0x40]);
+        assert_eq!(
+            board.gx_texture0_texel(0, 0),
+            Some([0x40, 0x40, 0x40, 0x7f])
+        );
+
+        board.mem1[base as usize..base as usize + 64].fill(0);
+        configure_texture0(&mut board, base, 4, 4, 4, 0);
+        board.mem1[base as usize..base as usize + 2].copy_from_slice(&0xf800u16.to_be_bytes());
+        assert_eq!(board.gx_texture0_texel(0, 0), Some([0xff, 0, 0, 0xff]));
+
+        board.mem1[base as usize..base as usize + 64].fill(0);
+        configure_texture0(&mut board, base, 4, 4, 5, 0);
+        board.mem1[base as usize..base as usize + 2].copy_from_slice(&0x801fu16.to_be_bytes());
+        assert_eq!(board.gx_texture0_texel(0, 0), Some([0, 0, 0xff, 0xff]));
+
+        board.mem1[base as usize..base as usize + 64].fill(0);
+        configure_texture0(&mut board, base, 4, 4, 6, 0);
+        board.mem1[base as usize..base as usize + 2].copy_from_slice(&[0x80, 0x11]);
+        board.mem1[base as usize + 32..base as usize + 34].copy_from_slice(&[0x22, 0x33]);
+        assert_eq!(
+            board.gx_texture0_texel(0, 0),
+            Some([0x11, 0x22, 0x33, 0x80])
+        );
+
+        board.mem1[base as usize..base as usize + 64].fill(0);
+        configure_texture0(&mut board, base, 8, 8, 14, 0);
+        board.mem1[base as usize..base as usize + 2].copy_from_slice(&0xf800u16.to_be_bytes());
+        board.mem1[base as usize + 2..base as usize + 4].copy_from_slice(&0x001fu16.to_be_bytes());
+        board.mem1[base as usize + 4] = 0x1b;
+        assert_eq!(board.gx_texture0_texel(0, 0), Some([0xff, 0, 0, 0xff]));
+        assert_eq!(board.gx_texture0_texel(1, 0), Some([0, 0, 0xff, 0xff]));
+        assert_eq!(board.gx_texture0_texel(2, 0), Some([159, 0, 95, 0xff]));
+        assert_eq!(board.gx_texture0_texel(3, 0), Some([95, 0, 159, 0xff]));
+    }
+
+    #[test]
+    fn gx_textured_triangle_modulates_vertex_color_into_efb() {
+        let mut board = idle_board();
+        let vcd = (1 << 9) | (1 << 13);
+        let vat_a = (4 << 1) | (1 << 13) | (5 << 14) | (1 << 21) | (4 << 22);
+        configure_gx_2d(&mut board, vcd, vat_a);
+        write_gx_bytes(&mut board, &gx_cp_command(0x60, 1));
+
+        let texture_base = 0x6200u32;
+        for texel in board.mem1[texture_base as usize..texture_base as usize + 32]
+            .as_chunks_mut::<2>()
+            .0
+        {
+            *texel = 0xf800u16.to_be_bytes();
+        }
+        write_gx_bytes(&mut board, &gx_bp_command(0x80, 0));
+        write_gx_bytes(&mut board, &gx_bp_command(0x88, 1 | (1 << 10) | (4 << 20)));
+        write_gx_bytes(&mut board, &gx_bp_command(0x94, texture_base >> 5));
+
+        let mut primitive = vec![0x90, 0, 3];
+        for (x, y, s, t) in [
+            (-0.5f32, -0.5f32, 0.0f32, 0.0f32),
+            (0.5, -0.5, 1.0, 0.0),
+            (0.0, 0.5, 0.5, 1.0),
+        ] {
+            primitive.extend_from_slice(&gx_direct_xy_rgba_st_vertex(
+                x,
+                y,
+                [0x80, 0xff, 0xff, 0xff],
+                s,
+                t,
+            ));
+        }
+        write_gx_bytes(&mut board, &primitive);
+        assert_eq!(board.gx_efb_pixel(320, 240), [0x80, 0, 0, 0xff]);
     }
 
     #[test]
