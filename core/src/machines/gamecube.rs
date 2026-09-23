@@ -9,7 +9,7 @@ use crate::platform::PlatformId;
 use crate::resources::{ResourceBlob, ResourceKind};
 use crate::state::{StateReader, StateWriter};
 
-const STATE_VERSION: u32 = 11;
+const STATE_VERSION: u32 = 12;
 const MEM1_SIZE: usize = 24 * 1024 * 1024;
 const ARAM_SIZE: usize = 16 * 1024 * 1024;
 const EFB_SIZE: usize = 2 * 1024 * 1024;
@@ -30,6 +30,8 @@ const EFB_BASE: u32 = 0xc800_0000;
 const GX_FIFO_START: usize = 0x8000;
 const GX_FIFO_END: usize = 0x8020;
 const GX_FIFO_BUFFER_LIMIT: usize = 16 * 1024 * 1024;
+const GX_TMEM_SIZE: usize = 1024 * 1024;
+const GX_TMEM_LINE_SIZE: usize = 32;
 const GX_XF_REGISTER_COUNT: usize = 0x1058;
 const GX_EFB_WIDTH: usize = 640;
 const GX_EFB_HEIGHT: usize = 528;
@@ -447,6 +449,7 @@ struct GxState {
     bp_regs: [u32; 0x100],
     xf_regs: Box<[u32]>,
     depth: Box<[u8]>,
+    tmem: Box<[u8]>,
     fifo: Vec<u8>,
     commands_processed: u64,
     primitives_processed: u64,
@@ -460,6 +463,7 @@ impl Default for GxState {
             bp_regs: [0; 0x100],
             xf_regs: vec![0; GX_XF_REGISTER_COUNT].into_boxed_slice(),
             depth: vec![0xff; GX_EFB_DEPTH_BYTES].into_boxed_slice(),
+            tmem: vec![0; GX_TMEM_SIZE].into_boxed_slice(),
             fifo: Vec::new(),
             commands_processed: 0,
             primitives_processed: 0,
@@ -1554,6 +1558,24 @@ impl GameCubeBoard {
         ((u16::from(first) * 5 + u16::from(second) * 3) >> 3) as u8
     }
 
+    fn gx_tlut_texel(&self, index: usize) -> Option<[u8; 4]> {
+        let tlut = self.gx.bp_regs[0x98];
+        let base = ((tlut & 0x3ff) as usize) << 9;
+        let format = (tlut >> 10) & 3;
+        let offset = base.checked_add(index.checked_mul(2)?)?;
+        let bytes = self.gx.tmem.get(offset..offset + 2)?;
+        match format {
+            0 => Some([bytes[1], bytes[1], bytes[1], bytes[0]]),
+            1 => Some(Self::gx_decode_rgb565(u16::from_be_bytes([
+                bytes[0], bytes[1],
+            ]))),
+            2 => Some(Self::gx_decode_rgb5a3(u16::from_be_bytes([
+                bytes[0], bytes[1],
+            ]))),
+            _ => None,
+        }
+    }
+
     fn gx_texture0_texel(&self, s: usize, t: usize) -> Option<[u8; 4]> {
         let image = self.gx.bp_regs[0x88];
         let width = (image & 0x3ff) as usize + 1;
@@ -1568,6 +1590,9 @@ impl GameCubeBoard {
             1 | 2 => (8, 4, 32),
             3..=5 => (4, 4, 32),
             6 => (4, 4, 64),
+            8 => (8, 8, 32),
+            9 => (8, 4, 32),
+            10 => (4, 4, 32),
             14 => (8, 8, 32),
             _ => return None,
         };
@@ -1631,6 +1656,31 @@ impl GameCubeBoard {
                 let ar = self.gx_texture_bytes(address, block_base + texel, 2)?;
                 let gb = self.gx_texture_bytes(address, block_base + 32 + texel, 2)?;
                 Some([ar[1], gb[0], gb[1], ar[0]])
+            }
+            8 => {
+                let texel = local_y * 8 + local_x;
+                let byte = *self
+                    .gx_texture_bytes(address, block_base + texel / 2, 1)?
+                    .first()?;
+                let index = if texel & 1 == 0 {
+                    byte >> 4
+                } else {
+                    byte & 0xf
+                };
+                self.gx_tlut_texel(usize::from(index))
+            }
+            9 => {
+                let index = *self
+                    .gx_texture_bytes(address, block_base + local_y * 8 + local_x, 1)?
+                    .first()?;
+                self.gx_tlut_texel(usize::from(index))
+            }
+            10 => {
+                let offset = block_base + (local_y * 4 + local_x) * 2;
+                let index =
+                    u16::from_be_bytes(self.gx_texture_bytes(address, offset, 2)?.try_into().ok()?)
+                        & 0x3fff;
+                self.gx_tlut_texel(usize::from(index))
             }
             14 => {
                 let sub_block = (local_y / 4) * 2 + local_x / 4;
@@ -2283,6 +2333,28 @@ impl GameCubeBoard {
         };
     }
 
+    fn gx_load_tlut(&mut self) {
+        let source = (self.gx.bp_regs[0x64] << 5) & 0x01ff_ffff;
+        let destination = ((self.gx.bp_regs[0x65] & 0x3ff) as usize) << 9;
+        let line_count = ((self.gx.bp_regs[0x65] >> 10) & 0x7ff) as usize;
+        let Some(length) = line_count.checked_mul(GX_TMEM_LINE_SIZE) else {
+            return;
+        };
+        if length == 0 {
+            return;
+        }
+        let Some(destination_end) = destination.checked_add(length) else {
+            return;
+        };
+        if destination_end > self.gx.tmem.len() {
+            return;
+        }
+        let Ok(source_range) = memory_range(source, length) else {
+            return;
+        };
+        self.gx.tmem[destination..destination_end].copy_from_slice(&self.mem1[source_range]);
+    }
+
     fn gx_load_indexed_xf(&mut self, opcode: u8, value: u32) {
         let array = match opcode {
             0x20 => 12usize,
@@ -2353,6 +2425,8 @@ impl GameCubeBoard {
                 self.gx.bp_regs[register as usize] = value;
                 if register == 0x52 {
                     self.gx_copy_efb(value);
+                } else if register == 0x65 {
+                    self.gx_load_tlut();
                 }
             }
             0x80..=0xbf => {
@@ -3298,6 +3372,7 @@ impl GameCubeBoard {
             out.u32(value);
         }
         out.blob(&self.gx.depth);
+        out.blob(&self.gx.tmem);
         out.blob(&self.gx.fifo);
         out.u64(self.gx.commands_processed);
         out.u64(self.gx.primitives_processed);
@@ -3354,6 +3429,7 @@ impl GameCubeBoard {
             *value = input.u32()?;
         }
         Self::load_blob(input, &mut self.gx.depth, "GX EFB depth")?;
+        Self::load_blob(input, &mut self.gx.tmem, "GX TMEM")?;
         let fifo = input.blob()?;
         if fifo.len() > GX_FIFO_BUFFER_LIMIT {
             return Err(format!(
@@ -3988,6 +4064,47 @@ mod tests {
     }
 
     #[test]
+    fn gx_tlut_load_and_paletted_formats_use_tmem_state() {
+        let mut board = idle_board();
+        let palette_source = 0x7000usize;
+        let palette_tmem = 1u32;
+        board.mem1[palette_source + 2..palette_source + 4]
+            .copy_from_slice(&0xf800u16.to_be_bytes());
+        write_gx_bytes(
+            &mut board,
+            &gx_bp_command(0x64, (palette_source as u32) >> 5),
+        );
+        write_gx_bytes(&mut board, &gx_bp_command(0x65, palette_tmem | (1 << 10)));
+        assert_eq!(
+            &board.gx.tmem[0x200..0x220],
+            &board.mem1[palette_source..palette_source + 32]
+        );
+
+        board.gx.bp_regs[0x98] = palette_tmem | (1 << 10);
+        let texture_base = 0x7200u32;
+        board.mem1[texture_base as usize] = 0x10;
+        configure_texture0(&mut board, texture_base, 8, 8, 8, 0);
+        assert_eq!(board.gx_texture0_texel(0, 0), Some([0xff, 0, 0, 0xff]));
+
+        board.mem1[texture_base as usize] = 1;
+        configure_texture0(&mut board, texture_base, 8, 4, 9, 0);
+        assert_eq!(board.gx_texture0_texel(0, 0), Some([0xff, 0, 0, 0xff]));
+
+        board.mem1[texture_base as usize..texture_base as usize + 2]
+            .copy_from_slice(&1u16.to_be_bytes());
+        configure_texture0(&mut board, texture_base, 4, 4, 10, 0);
+        assert_eq!(board.gx_texture0_texel(0, 0), Some([0xff, 0, 0, 0xff]));
+
+        board.gx.tmem[0x200..0x202].copy_from_slice(&[0x40, 0x80]);
+        board.gx.bp_regs[0x98] = palette_tmem;
+        assert_eq!(board.gx_tlut_texel(0), Some([0x80, 0x80, 0x80, 0x40]));
+
+        board.gx.tmem[0x200..0x202].copy_from_slice(&0x801fu16.to_be_bytes());
+        board.gx.bp_regs[0x98] = palette_tmem | (2 << 10);
+        assert_eq!(board.gx_tlut_texel(0), Some([0, 0, 0xff, 0xff]));
+    }
+
+    #[test]
     fn gx_textured_triangle_modulates_vertex_color_into_efb() {
         let mut board = idle_board();
         let vcd = (1 << 9) | (1 << 13);
@@ -4245,6 +4362,7 @@ mod tests {
         machine.board.gx.xf_regs[0x234] = 0xfeed_beef;
         machine.board.gx.xf_regs[0x1026] = 1;
         machine.board.gx.depth[..3].copy_from_slice(&[0x12, 0x34, 0x56]);
+        machine.board.gx.tmem[0x200..0x204].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
         machine.board.gx.fifo = vec![0x08, 0x50, 0x12];
         machine.board.gx.commands_processed = 41;
         machine.board.gx.primitives_processed = 7;
@@ -4258,6 +4376,10 @@ mod tests {
         assert_eq!(restored.board.gx.xf_regs[0x234], 0xfeed_beef);
         assert_eq!(restored.board.gx.xf_regs[0x1026], 1);
         assert_eq!(&restored.board.gx.depth[..3], &[0x12, 0x34, 0x56]);
+        assert_eq!(
+            &restored.board.gx.tmem[0x200..0x204],
+            &[0xde, 0xad, 0xbe, 0xef]
+        );
         assert_eq!(restored.board.gx.fifo, vec![0x08, 0x50, 0x12]);
         assert_eq!(restored.board.gx.commands_processed, 41);
         assert_eq!(restored.board.gx.primitives_processed, 7);
