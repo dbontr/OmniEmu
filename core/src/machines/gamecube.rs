@@ -100,6 +100,10 @@ const EXI_IPL_ENCRYPTED_START: usize = 0x100;
 const EXI_IPL_ENCRYPTED_END: usize = 0x1aff00;
 const EXI_IPL_SRAM_BASE: u32 = 0x0080_0000;
 const EXI_IPL_SRAM_SIZE: usize = 0x44;
+const EXI_IPL_UART_BASE: u32 = 0x0080_0400;
+const EXI_IPL_UART_SIZE: u32 = 0x50;
+const EXI_IPL_EUART_BASE: u32 = 0x00c0_0000;
+const EXI_IPL_EUART_SIZE: u32 = 8;
 
 const VI_CONTROL: usize = 0x2002;
 const VI_FB_LEFT_TOP_HI: usize = 0x201c;
@@ -680,6 +684,36 @@ impl GameCubeBoard {
                 0xff
             } else {
                 self.exi.ipl.sram[offset]
+            }
+        } else if (EXI_IPL_UART_BASE..EXI_IPL_UART_BASE + EXI_IPL_UART_SIZE).contains(&address) {
+            match address - EXI_IPL_UART_BASE {
+                0 => {
+                    if write {
+                        0xff
+                    } else {
+                        0
+                    }
+                }
+                0x0c | 0x4c => {
+                    if write {
+                        0xff
+                    } else {
+                        0
+                    }
+                }
+                _ => 0xff,
+            }
+        } else if (EXI_IPL_EUART_BASE..EXI_IPL_EUART_BASE + EXI_IPL_EUART_SIZE).contains(&address) {
+            match address - EXI_IPL_EUART_BASE {
+                0 => 0xff,
+                4 => {
+                    if write {
+                        0xff
+                    } else {
+                        0
+                    }
+                }
+                _ => 0xff,
             }
         } else {
             0xff
@@ -2441,6 +2475,60 @@ mod tests {
         board.write_mmio32(EXI_DMA_LENGTH, 12);
         board.write_mmio32(EXI_DMA_CONTROL, 1 | 2);
         assert_eq!(&board.mem1[0x1000..0x100c], b"DOLPHINSLOTA");
+    }
+
+    #[test]
+    fn exi_ipl_uart_accepts_debug_writes_and_reports_empty_fifo() {
+        let mut board = idle_board();
+
+        exi_select_ipl(&mut board);
+        exi_imm_write(&mut board, exi_ipl_command(EXI_IPL_UART_BASE, false), 4);
+        assert_eq!(exi_imm_read(&mut board, 1), 0);
+
+        board.write_mmio32(EXI_STATUS, 0);
+        exi_select_ipl(&mut board);
+        exi_imm_write(&mut board, exi_ipl_command(EXI_IPL_UART_BASE, true), 4);
+        exi_imm_write(&mut board, u32::from(b'X') << 24, 1);
+        exi_imm_write(&mut board, u32::from(b'\r') << 24, 1);
+
+        board.write_mmio32(EXI_STATUS, 0);
+        exi_select_ipl(&mut board);
+        exi_imm_write(
+            &mut board,
+            exi_ipl_command(EXI_IPL_UART_BASE + 0x0c, false),
+            4,
+        );
+        assert_eq!(exi_imm_read(&mut board, 1), 0);
+
+        board.write_mmio32(EXI_STATUS, 0);
+        exi_select_ipl(&mut board);
+        exi_imm_write(
+            &mut board,
+            exi_ipl_command(EXI_IPL_UART_BASE + 0x4c, true),
+            4,
+        );
+        exi_imm_write(&mut board, 0x5a00_0000, 1);
+        assert_ne!(board.read_mmio32(EXI_STATUS) & EXI_STATUS_TCINT, 0);
+
+        board.write_mmio32(EXI_STATUS, 0);
+        exi_select_ipl(&mut board);
+        exi_imm_write(&mut board, exi_ipl_command(EXI_IPL_EUART_BASE, false), 4);
+        assert_eq!(exi_imm_read(&mut board, 1), 0xff00_0000);
+
+        board.write_mmio32(EXI_STATUS, 0);
+        exi_select_ipl(&mut board);
+        exi_imm_write(
+            &mut board,
+            exi_ipl_command(EXI_IPL_EUART_BASE + 4, false),
+            4,
+        );
+        assert_eq!(exi_imm_read(&mut board, 1), 0);
+
+        board.write_mmio32(EXI_STATUS, 0);
+        exi_select_ipl(&mut board);
+        exi_imm_write(&mut board, exi_ipl_command(EXI_IPL_EUART_BASE + 4, true), 4);
+        exi_imm_write(&mut board, u32::from(b'Y') << 24, 1);
+        assert_ne!(board.read_mmio32(EXI_STATUS) & EXI_STATUS_TCINT, 0);
     }
 
     #[test]
