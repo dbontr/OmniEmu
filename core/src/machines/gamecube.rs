@@ -9,7 +9,7 @@ use crate::platform::PlatformId;
 use crate::resources::{ResourceBlob, ResourceKind};
 use crate::state::{StateReader, StateWriter};
 
-const STATE_VERSION: u32 = 8;
+const STATE_VERSION: u32 = 9;
 const MEM1_SIZE: usize = 24 * 1024 * 1024;
 const ARAM_SIZE: usize = 16 * 1024 * 1024;
 const EFB_SIZE: usize = 2 * 1024 * 1024;
@@ -27,6 +27,10 @@ const VIDEO_HEIGHT: u32 = 480;
 const DISC_MAGIC: u32 = 0xc233_9f3d;
 const MMIO_BASE: u32 = 0xcc00_0000;
 const EFB_BASE: u32 = 0xc800_0000;
+const GX_FIFO_START: usize = 0x8000;
+const GX_FIFO_END: usize = 0x8020;
+const GX_FIFO_BUFFER_LIMIT: usize = 16 * 1024 * 1024;
+const GX_XF_REGISTER_COUNT: usize = 0x1000;
 const PI_CAUSE: usize = 0x3000;
 const PI_MASK: usize = 0x3004;
 const PI_INT_DI: u32 = 0x0004;
@@ -411,6 +415,31 @@ struct ExiState {
     ad16: ExiAd16State,
 }
 
+#[derive(Clone)]
+struct GxState {
+    cp_regs: [u32; 0x100],
+    bp_regs: [u32; 0x100],
+    xf_regs: Box<[u32]>,
+    fifo: Vec<u8>,
+    commands_processed: u64,
+    primitives_processed: u64,
+    vertices_processed: u64,
+}
+
+impl Default for GxState {
+    fn default() -> Self {
+        Self {
+            cp_regs: [0; 0x100],
+            bp_regs: [0; 0x100],
+            xf_regs: vec![0; GX_XF_REGISTER_COUNT].into_boxed_slice(),
+            fifo: Vec::new(),
+            commands_processed: 0,
+            primitives_processed: 0,
+            vertices_processed: 0,
+        }
+    }
+}
+
 struct GameCubeBoard {
     mem1: Box<[u8]>,
     aram: Box<[u8]>,
@@ -423,6 +452,7 @@ struct GameCubeBoard {
     audio_dma: AudioDma,
     di: DiState,
     exi: ExiState,
+    gx: GxState,
     video: VideoBuffer,
     frame_counter: u64,
 }
@@ -454,6 +484,7 @@ impl GameCubeBoard {
             audio_dma: AudioDma::default(),
             di: DiState::default(),
             exi: ExiState::default(),
+            gx: GxState::default(),
             video: VideoBuffer::new(VIDEO_WIDTH, VIDEO_HEIGHT),
             frame_counter: 0,
         };
@@ -502,6 +533,7 @@ impl GameCubeBoard {
         self.mmio_write_u16_raw(VI_CONTROL, 1);
         self.audio_dma = AudioDma::default();
         self.di = DiState::default();
+        self.gx = GxState::default();
         let ipl = self.exi.ipl.clone();
         self.exi = ExiState::default();
         self.exi.ipl = ipl;
@@ -996,6 +1028,236 @@ impl GameCubeBoard {
         state.control &= !1;
         state.status |= EXI_STATUS_TCINT;
         self.refresh_exi_interrupt();
+    }
+
+    fn gx_direct_component_size(format: u32, components: usize) -> usize {
+        let bytes = match format & 7 {
+            0 | 1 => 1,
+            2 | 3 => 2,
+            _ => 4,
+        };
+        bytes * components
+    }
+
+    fn gx_stream_component_size(descriptor: u32, direct_size: usize) -> usize {
+        match descriptor & 3 {
+            0 => 0,
+            1 => direct_size,
+            2 => 1,
+            3 => 2,
+            _ => unreachable!(),
+        }
+    }
+
+    fn gx_vertex_size(&self, vat: usize) -> usize {
+        let vcd_lo = self.gx.cp_regs[0x50];
+        let vcd_hi = self.gx.cp_regs[0x60];
+        let vat_a = self.gx.cp_regs[0x70 + (vat & 7)];
+        let vat_b = self.gx.cp_regs[0x80 + (vat & 7)];
+        let vat_c = self.gx.cp_regs[0x90 + (vat & 7)];
+
+        let mut size = (vcd_lo & 0x1ff).count_ones() as usize;
+
+        let position_components = if vat_a & 1 != 0 { 3 } else { 2 };
+        let position_direct = Self::gx_direct_component_size((vat_a >> 1) & 7, position_components);
+        size += Self::gx_stream_component_size((vcd_lo >> 9) & 3, position_direct);
+
+        let normal_descriptor = (vcd_lo >> 11) & 3;
+        let normal_components = if vat_a & (1 << 9) != 0 { 9 } else { 3 };
+        let normal_direct = Self::gx_direct_component_size((vat_a >> 10) & 7, normal_components);
+        size += match normal_descriptor {
+            0 => 0,
+            1 => normal_direct,
+            2 | 3 => {
+                let index_size = if normal_descriptor == 2 { 1 } else { 2 };
+                if normal_components == 9 && vat_a & (1 << 31) != 0 {
+                    index_size * 3
+                } else {
+                    index_size
+                }
+            }
+            _ => unreachable!(),
+        };
+
+        for color in 0..2 {
+            let descriptor = (vcd_lo >> (13 + color * 2)) & 3;
+            let format = (vat_a >> (14 + color * 4)) & 7;
+            let direct = match format {
+                0 | 3 => 2,
+                1 | 4 => 3,
+                _ => 4,
+            };
+            size += Self::gx_stream_component_size(descriptor, direct);
+        }
+
+        for tex in 0..8 {
+            let descriptor = (vcd_hi >> (tex * 2)) & 3;
+            let (two_components, format) = match tex {
+                0 => (vat_a & (1 << 21) != 0, (vat_a >> 22) & 7),
+                1 => (vat_b & 1 != 0, (vat_b >> 1) & 7),
+                2 => (vat_b & (1 << 9) != 0, (vat_b >> 10) & 7),
+                3 => (vat_b & (1 << 18) != 0, (vat_b >> 19) & 7),
+                4 => (vat_b & (1 << 27) != 0, (vat_b >> 28) & 7),
+                5 => (vat_c & (1 << 5) != 0, (vat_c >> 6) & 7),
+                6 => (vat_c & (1 << 14) != 0, (vat_c >> 15) & 7),
+                _ => (vat_c & (1 << 23) != 0, (vat_c >> 24) & 7),
+            };
+            let direct = Self::gx_direct_component_size(format, if two_components { 2 } else { 1 });
+            size += Self::gx_stream_component_size(descriptor, direct);
+        }
+        size
+    }
+
+    fn gx_command_size(&self, data: &[u8]) -> Option<usize> {
+        let opcode = *data.first()?;
+        let fixed = match opcode {
+            0x00 | 0x44 | 0x48 => Some(1usize),
+            0x08 => Some(6),
+            0x10 => {
+                if data.len() < 5 {
+                    return None;
+                }
+                let header = u32::from_be_bytes(data[1..5].try_into().unwrap());
+                let words = ((header >> 16) & 0xf) as usize + 1;
+                Some(5 + words * 4)
+            }
+            0x20 | 0x28 | 0x30 | 0x38 | 0x61 => Some(5),
+            0x40 => Some(9),
+            0x80..=0xbf => {
+                if data.len() < 3 {
+                    return None;
+                }
+                let vertices = u16::from_be_bytes([data[1], data[2]]) as usize;
+                let vertex_size = self.gx_vertex_size((opcode & 7) as usize);
+                3usize.checked_add(vertices.checked_mul(vertex_size)?)
+            }
+            _ => Some(1),
+        }?;
+        (data.len() >= fixed).then_some(fixed)
+    }
+
+    fn gx_load_cp_reg(&mut self, register: u8, value: u32) {
+        let target = match register & 0xf0 {
+            0x30 => 0x30,
+            0x40 => 0x40,
+            0x50 => 0x50,
+            0x60 => 0x60,
+            0x70 | 0x80 | 0x90 => register & 0xf7,
+            0xa0 | 0xb0 => register,
+            _ => register,
+        } as usize;
+        self.gx.cp_regs[target] = match register & 0xf0 {
+            0xa0 => value & 0x01ff_ffff,
+            0xb0 => value & 0xff,
+            _ => value,
+        };
+    }
+
+    fn gx_load_indexed_xf(&mut self, opcode: u8, value: u32) {
+        let array = match opcode {
+            0x20 => 12usize,
+            0x28 => 13,
+            0x30 => 14,
+            0x38 => 15,
+            _ => return,
+        };
+        let index = value >> 16;
+        let destination = (value & 0xfff) as usize;
+        let words = ((value >> 12) & 0xf) as usize + 1;
+        let base = self.gx.cp_regs[0xa0 + array];
+        let stride = self.gx.cp_regs[0xb0 + array];
+        let source = base.wrapping_add(index.wrapping_mul(stride));
+        for word in 0..words {
+            let Some(target) = destination
+                .checked_add(word)
+                .filter(|target| *target < GX_XF_REGISTER_COUNT)
+            else {
+                break;
+            };
+            let address = source.wrapping_add((word * 4) as u32);
+            let Ok(range) = memory_range(address, 4) else {
+                break;
+            };
+            self.gx.xf_regs[target] = u32::from_be_bytes(self.mem1[range].try_into().unwrap());
+        }
+    }
+
+    fn gx_execute_command(&mut self, command: &[u8], depth: u8) {
+        let opcode = command[0];
+        match opcode {
+            0x08 => {
+                let value = u32::from_be_bytes(command[2..6].try_into().unwrap());
+                self.gx_load_cp_reg(command[1], value);
+            }
+            0x10 => {
+                let header = u32::from_be_bytes(command[1..5].try_into().unwrap());
+                let address = (header & 0xffff) as usize;
+                let words = ((header >> 16) & 0xf) as usize + 1;
+                for word in 0..words {
+                    let target = address + word;
+                    if target >= GX_XF_REGISTER_COUNT {
+                        break;
+                    }
+                    let start = 5 + word * 4;
+                    self.gx.xf_regs[target] =
+                        u32::from_be_bytes(command[start..start + 4].try_into().unwrap());
+                }
+            }
+            0x20 | 0x28 | 0x30 | 0x38 => {
+                let value = u32::from_be_bytes(command[1..5].try_into().unwrap());
+                self.gx_load_indexed_xf(opcode, value);
+            }
+            0x40 if depth < 16 => {
+                let address = u32::from_be_bytes(command[1..5].try_into().unwrap()) & !31;
+                let size = u32::from_be_bytes(command[5..9].try_into().unwrap()) & !31;
+                if size != 0 && size as usize <= GX_FIFO_BUFFER_LIMIT {
+                    if let Ok(range) = memory_range(address, size as usize) {
+                        let display_list = self.mem1[range].to_vec();
+                        self.gx_execute_stream(&display_list, depth + 1);
+                    }
+                }
+            }
+            0x61 => {
+                let value = u32::from_be_bytes([0, command[2], command[3], command[4]]);
+                self.gx.bp_regs[command[1] as usize] = value;
+            }
+            0x80..=0xbf => {
+                let vertices = u16::from_be_bytes([command[1], command[2]]) as u64;
+                self.gx.primitives_processed = self.gx.primitives_processed.wrapping_add(1);
+                self.gx.vertices_processed = self.gx.vertices_processed.wrapping_add(vertices);
+            }
+            _ => {}
+        }
+        self.gx.commands_processed = self.gx.commands_processed.wrapping_add(1);
+    }
+
+    fn gx_execute_stream(&mut self, data: &[u8], depth: u8) {
+        let mut offset = 0usize;
+        while offset < data.len() {
+            let Some(size) = self.gx_command_size(&data[offset..]) else {
+                break;
+            };
+            let end = offset + size;
+            self.gx_execute_command(&data[offset..end], depth);
+            offset = end;
+        }
+    }
+
+    fn gx_push_fifo(&mut self, bytes: &[u8]) {
+        let Some(next_len) = self.gx.fifo.len().checked_add(bytes.len()) else {
+            self.gx.fifo.clear();
+            return;
+        };
+        if next_len > GX_FIFO_BUFFER_LIMIT {
+            self.gx.fifo.clear();
+            return;
+        }
+        self.gx.fifo.extend_from_slice(bytes);
+        while let Some(size) = self.gx_command_size(&self.gx.fifo) {
+            let command = self.gx.fifo[..size].to_vec();
+            self.gx.fifo.drain(..size);
+            self.gx_execute_command(&command, 0);
+        }
     }
 
     fn interrupt_pending(&self) -> bool {
@@ -1688,12 +1950,20 @@ impl GameCubeBoard {
     }
 
     fn write_mmio8(&mut self, offset: usize, value: u8) {
+        if (GX_FIFO_START..GX_FIFO_END).contains(&offset) {
+            self.gx_push_fifo(&[value]);
+            return;
+        }
         if let Some(byte) = self.mmio.get_mut(offset) {
             *byte = value;
         }
     }
 
     fn write_mmio16(&mut self, offset: usize, value: u16) {
+        if (GX_FIFO_START..GX_FIFO_END).contains(&offset) {
+            self.gx_push_fifo(&value.to_be_bytes());
+            return;
+        }
         self.mmio_write_u16_raw(offset, value);
         match offset {
             DSP_CONTROL => self.refresh_dsp_interrupt(),
@@ -1755,6 +2025,10 @@ impl GameCubeBoard {
     }
 
     fn write_mmio32(&mut self, offset: usize, value: u32) {
+        if (GX_FIFO_START..GX_FIFO_END).contains(&offset) {
+            self.gx_push_fifo(&value.to_be_bytes());
+            return;
+        }
         if let Some((channel, register)) = Self::decode_exi_register(offset) {
             match register {
                 EXI_STATUS => self.write_exi_status(channel, value),
@@ -1878,6 +2152,19 @@ impl GameCubeBoard {
         out.u32(self.exi.ipl.cursor);
         out.u8(self.exi.ipl.rtc_phase);
         out.blob(&self.exi.ipl.sram);
+        for value in self.gx.cp_regs {
+            out.u32(value);
+        }
+        for value in self.gx.bp_regs {
+            out.u32(value);
+        }
+        for &value in &self.gx.xf_regs {
+            out.u32(value);
+        }
+        out.blob(&self.gx.fifo);
+        out.u64(self.gx.commands_processed);
+        out.u64(self.gx.primitives_processed);
+        out.u64(self.gx.vertices_processed);
         out.u64(self.frame_counter);
     }
 
@@ -1920,6 +2207,28 @@ impl GameCubeBoard {
         self.exi.ipl.cursor = input.u32()?;
         self.exi.ipl.rtc_phase = input.u8()? % FRAME_RATE as u8;
         Self::load_blob(input, &mut self.exi.ipl.sram, "EXI IPL SRAM")?;
+        for value in &mut self.gx.cp_regs {
+            *value = input.u32()?;
+        }
+        for value in &mut self.gx.bp_regs {
+            *value = input.u32()?;
+        }
+        for value in &mut self.gx.xf_regs {
+            *value = input.u32()?;
+        }
+        let fifo = input.blob()?;
+        if fifo.len() > GX_FIFO_BUFFER_LIMIT {
+            return Err(format!(
+                "GameCube GX FIFO state has {} bytes; limit is {}",
+                fifo.len(),
+                GX_FIFO_BUFFER_LIMIT
+            ));
+        }
+        self.gx.fifo.clear();
+        self.gx.fifo.extend_from_slice(fifo);
+        self.gx.commands_processed = input.u64()?;
+        self.gx.primitives_processed = input.u64()?;
+        self.gx.vertices_processed = input.u64()?;
         self.frame_counter = input.u64()?;
         self.input = InputState::default();
         self.refresh_exi_interrupt();
@@ -2283,6 +2592,20 @@ mod tests {
         GameCubeBoard::new(image).unwrap().0
     }
 
+    fn write_gx_bytes(board: &mut GameCubeBoard, bytes: &[u8]) {
+        for &byte in bytes {
+            board.write_mmio8(GX_FIFO_START, byte);
+        }
+    }
+
+    fn gx_cp_command(register: u8, value: u32) -> [u8; 6] {
+        let mut command = [0u8; 6];
+        command[0] = 0x08;
+        command[1] = register;
+        command[2..].copy_from_slice(&value.to_be_bytes());
+        command
+    }
+
     #[test]
     fn raw_dol_boots_powerpc_and_writes_mem1() {
         let image = ResourceBlob::from_bytes(&dol_bytes(&[
@@ -2297,6 +2620,96 @@ mod tests {
             cpu.step(&mut board);
         }
         assert_eq!(board.read32(0x8000_0200), 0x0000_1234);
+    }
+
+    #[test]
+    fn gx_write_gather_fifo_decodes_cp_vertex_state_and_primitive_payloads() {
+        let mut board = idle_board();
+        let vcd = (1 << 9) | (1 << 13);
+        let vcd_command = gx_cp_command(0x50, vcd);
+        board.write_mmio32(
+            GX_FIFO_START,
+            u32::from_be_bytes(vcd_command[..4].try_into().unwrap()),
+        );
+        board.write_mmio16(
+            GX_FIFO_START,
+            u16::from_be_bytes(vcd_command[4..].try_into().unwrap()),
+        );
+
+        let vat_a = 1 | (4 << 1) | (1 << 13) | (5 << 14);
+        write_gx_bytes(&mut board, &gx_cp_command(0x70, vat_a));
+        assert_eq!(board.gx_vertex_size(0), 16);
+
+        let mut primitive = vec![0x90, 0, 3];
+        primitive.resize(3 + 3 * 16, 0);
+        write_gx_bytes(&mut board, &primitive);
+
+        assert!(board.gx.fifo.is_empty());
+        assert_eq!(board.gx.cp_regs[0x50], vcd);
+        assert_eq!(board.gx.cp_regs[0x70], vat_a);
+        assert_eq!(board.gx.commands_processed, 3);
+        assert_eq!(board.gx.primitives_processed, 1);
+        assert_eq!(board.gx.vertices_processed, 3);
+    }
+
+    #[test]
+    fn gx_fifo_loads_xf_bp_indexed_state_and_nested_display_lists() {
+        let mut board = idle_board();
+        board.mem1[0x5008..0x500c].copy_from_slice(&0x1122_3344u32.to_be_bytes());
+        board.mem1[0x500c..0x5010].copy_from_slice(&0x5566_7788u32.to_be_bytes());
+        write_gx_bytes(&mut board, &gx_cp_command(0xac, 0x5000));
+        write_gx_bytes(&mut board, &gx_cp_command(0xbc, 8));
+
+        let mut indexed = vec![0x20];
+        indexed.extend_from_slice(&0x0001_1120u32.to_be_bytes());
+        write_gx_bytes(&mut board, &indexed);
+        assert_eq!(board.gx.xf_regs[0x120], 0x1122_3344);
+        assert_eq!(board.gx.xf_regs[0x121], 0x5566_7788);
+
+        let mut xf = vec![0x10];
+        xf.extend_from_slice(&0x0001_0100u32.to_be_bytes());
+        xf.extend_from_slice(&0xaabb_ccddu32.to_be_bytes());
+        xf.extend_from_slice(&0x0102_0304u32.to_be_bytes());
+        write_gx_bytes(&mut board, &xf);
+        assert_eq!(board.gx.xf_regs[0x100], 0xaabb_ccdd);
+        assert_eq!(board.gx.xf_regs[0x101], 0x0102_0304);
+
+        write_gx_bytes(&mut board, &[0x61, 0x42, 0x11, 0x22, 0x33]);
+        assert_eq!(board.gx.bp_regs[0x42], 0x0011_2233);
+
+        let mut display_list = [0u8; 32];
+        display_list[..5].copy_from_slice(&[0x61, 0x43, 0x44, 0x55, 0x66]);
+        board.mem1[0x6000..0x6020].copy_from_slice(&display_list);
+        let mut call = vec![0x40];
+        call.extend_from_slice(&0x0000_6000u32.to_be_bytes());
+        call.extend_from_slice(&0x0000_0020u32.to_be_bytes());
+        write_gx_bytes(&mut board, &call);
+        assert_eq!(board.gx.bp_regs[0x43], 0x0044_5566);
+        assert!(board.gx.commands_processed >= 9);
+    }
+
+    #[test]
+    fn gx_partial_fifo_and_register_state_round_trip_deterministically() {
+        let image = dol_bytes(&[0x4800_0000]);
+        let mut machine = GameCubeMachine::from_image(ResourceBlob::from_bytes(&image)).unwrap();
+        machine.board.gx.cp_regs[0x50] = 0x1234_5678;
+        machine.board.gx.bp_regs[0x61] = 0x00ab_cdef;
+        machine.board.gx.xf_regs[0x234] = 0xfeed_beef;
+        machine.board.gx.fifo = vec![0x08, 0x50, 0x12];
+        machine.board.gx.commands_processed = 41;
+        machine.board.gx.primitives_processed = 7;
+        machine.board.gx.vertices_processed = 29;
+        let state = machine.save_state().unwrap();
+
+        let mut restored = GameCubeMachine::from_image(ResourceBlob::from_bytes(&image)).unwrap();
+        restored.load_state(&state).unwrap();
+        assert_eq!(restored.board.gx.cp_regs[0x50], 0x1234_5678);
+        assert_eq!(restored.board.gx.bp_regs[0x61], 0x00ab_cdef);
+        assert_eq!(restored.board.gx.xf_regs[0x234], 0xfeed_beef);
+        assert_eq!(restored.board.gx.fifo, vec![0x08, 0x50, 0x12]);
+        assert_eq!(restored.board.gx.commands_processed, 41);
+        assert_eq!(restored.board.gx.primitives_processed, 7);
+        assert_eq!(restored.board.gx.vertices_processed, 29);
     }
 
     #[test]
