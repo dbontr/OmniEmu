@@ -9,7 +9,7 @@ use crate::platform::PlatformId;
 use crate::resources::{ResourceBlob, ResourceKind};
 use crate::state::{StateReader, StateWriter};
 
-const STATE_VERSION: u32 = 6;
+const STATE_VERSION: u32 = 7;
 const MEM1_SIZE: usize = 24 * 1024 * 1024;
 const ARAM_SIZE: usize = 16 * 1024 * 1024;
 const EFB_SIZE: usize = 2 * 1024 * 1024;
@@ -257,6 +257,10 @@ struct DiState {
     enable_dtk: bool,
     dtk_buffer_length: u8,
     dtk_sample_remainder: u8,
+    dtk_left_recent: i32,
+    dtk_left_older: i32,
+    dtk_right_recent: i32,
+    dtk_right_older: i32,
     stream: bool,
     stop_at_track_end: bool,
     audio_position: u64,
@@ -1213,6 +1217,7 @@ impl GameCubeBoard {
                         self.di.current_length = length;
                         self.di.audio_position = start;
                         self.di.dtk_sample_remainder = 0;
+                        self.reset_dtk_filter();
                         self.di.stream = true;
                     }
                 }
@@ -1281,29 +1286,108 @@ impl GameCubeBoard {
         self.finish_di(true);
     }
 
-    fn advance_dtk_stream(&mut self, samples: u32) {
+    fn reset_dtk_filter(&mut self) {
+        self.di.dtk_left_recent = 0;
+        self.di.dtk_left_older = 0;
+        self.di.dtk_right_recent = 0;
+        self.di.dtk_right_older = 0;
+    }
+
+    fn decode_dtk_nibble(header: u8, nibble: u8, recent: &mut i32, older: &mut i32) -> i16 {
+        let predicted = match header >> 4 {
+            1 => *recent * 0x3c,
+            2 => *recent * 0x73 - *older * 0x34,
+            3 => *recent * 0x62 - *older * 0x37,
+            _ => 0,
+        };
+        let predicted = ((predicted + 0x20) >> 6).clamp(-0x20_0000, 0x1f_ffff);
+        let signed_nibble = if nibble & 0x08 != 0 {
+            i32::from(nibble) - 16
+        } else {
+            i32::from(nibble)
+        };
+        let exponent = u32::from(header & 0x0f);
+        let residual = ((signed_nibble * 4096) >> exponent) * 64;
+        let current = predicted + residual;
+        *older = *recent;
+        *recent = current;
+        (current >> 6).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+    }
+
+    fn prepare_dtk_sample(&mut self) -> bool {
         if !self.di.stream {
-            return;
+            return false;
+        }
+        let end = self
+            .di
+            .current_start
+            .saturating_add(u64::from(self.di.current_length));
+        if self.di.audio_position < end {
+            return true;
         }
 
-        let total_samples = u32::from(self.di.dtk_sample_remainder).saturating_add(samples);
-        let blocks = total_samples / DTK_SAMPLES_PER_BLOCK;
-        self.di.dtk_sample_remainder = (total_samples % DTK_SAMPLES_PER_BLOCK) as u8;
+        self.di.audio_position = self.di.next_start;
+        self.di.current_start = self.di.next_start;
+        self.di.current_length = self.di.next_length;
+        self.di.dtk_sample_remainder = 0;
 
-        for _ in 0..blocks {
-            if self.di.audio_position >= self.di.current_start + u64::from(self.di.current_length) {
-                self.di.audio_position = self.di.next_start;
-                self.di.current_start = self.di.next_start;
-                self.di.current_length = self.di.next_length;
-                if self.di.stop_at_track_end {
-                    self.di.stop_at_track_end = false;
-                    self.di.stream = false;
-                    self.di.dtk_sample_remainder = 0;
-                    break;
-                }
+        if self.di.stop_at_track_end {
+            self.di.stop_at_track_end = false;
+            self.di.stream = false;
+            return false;
+        }
+        self.reset_dtk_filter();
+        if self.di.current_length == 0 {
+            self.di.stream = false;
+            return false;
+        }
+        true
+    }
+
+    fn render_dtk_samples(&mut self, sample_count: usize) -> Vec<(f32, f32)> {
+        let mut output = vec![(0.0, 0.0); sample_count];
+        let mut block = [0u8; DTK_BLOCK_BYTES as usize];
+        let mut cached_position = None;
+        let mut block_available = false;
+
+        for sample in &mut output {
+            if !self.prepare_dtk_sample() {
+                continue;
             }
-            self.di.audio_position = self.di.audio_position.saturating_add(DTK_BLOCK_BYTES);
+
+            if cached_position != Some(self.di.audio_position) {
+                block_available = self.disc.read(self.di.audio_position, &mut block).is_ok();
+                cached_position = Some(self.di.audio_position);
+            }
+            if !block_available {
+                continue;
+            }
+
+            let index = usize::from(self.di.dtk_sample_remainder);
+            let packed = block[4 + index];
+            let left = Self::decode_dtk_nibble(
+                block[0],
+                packed & 0x0f,
+                &mut self.di.dtk_left_recent,
+                &mut self.di.dtk_left_older,
+            );
+            let right = Self::decode_dtk_nibble(
+                block[1],
+                packed >> 4,
+                &mut self.di.dtk_right_recent,
+                &mut self.di.dtk_right_older,
+            );
+            *sample = (f32::from(left) / 32768.0, f32::from(right) / 32768.0);
+
+            self.di.dtk_sample_remainder += 1;
+            if u32::from(self.di.dtk_sample_remainder) == DTK_SAMPLES_PER_BLOCK {
+                self.di.dtk_sample_remainder = 0;
+                self.di.audio_position = self.di.audio_position.saturating_add(DTK_BLOCK_BYTES);
+                cached_position = None;
+            }
         }
+
+        output
     }
 
     fn service_aram_dma(&mut self) {
@@ -1374,7 +1458,9 @@ impl GameCubeBoard {
         self.mmio_write_u16_raw(AUDIO_DMA_BLOCKS_LEFT, self.audio_dma.remaining);
     }
     fn render_audio(&mut self, audio: &mut AudioBuffer) {
+        let dtk = self.render_dtk_samples(AUDIO_SAMPLES_PER_FRAME as usize);
         audio.begin_frame();
+        let mut sample_index = 0usize;
         for _ in 0..100 {
             let mut block = [0u8; 32];
             if self.audio_dma.enabled {
@@ -1383,9 +1469,14 @@ impl GameCubeBoard {
                 }
             }
             for frame in block.as_chunks::<4>().0 {
-                let left = i16::from_be_bytes([frame[0], frame[1]]) as f32 / 32768.0;
-                let right = i16::from_be_bytes([frame[2], frame[3]]) as f32 / 32768.0;
-                audio.push_stereo(left, right);
+                let dma_left = i16::from_be_bytes([frame[0], frame[1]]) as f32 / 32768.0;
+                let dma_right = i16::from_be_bytes([frame[2], frame[3]]) as f32 / 32768.0;
+                let (dtk_left, dtk_right) = dtk[sample_index];
+                sample_index += 1;
+                audio.push_stereo(
+                    (dma_left + dtk_left).clamp(-1.0, 1.0),
+                    (dma_right + dtk_right).clamp(-1.0, 1.0),
+                );
             }
             if self.audio_dma.enabled {
                 self.complete_audio_block();
@@ -1462,7 +1553,6 @@ impl GameCubeBoard {
 
     fn end_frame(&mut self, audio: &mut AudioBuffer) {
         self.service_di();
-        self.advance_dtk_stream(AUDIO_SAMPLES_PER_FRAME);
         self.present_video();
         self.render_audio(audio);
         self.raise_vi_retrace();
@@ -1681,6 +1771,10 @@ impl GameCubeBoard {
         out.u8(u8::from(self.di.enable_dtk));
         out.u8(self.di.dtk_buffer_length);
         out.u8(self.di.dtk_sample_remainder);
+        out.u32(self.di.dtk_left_recent as u32);
+        out.u32(self.di.dtk_left_older as u32);
+        out.u32(self.di.dtk_right_recent as u32);
+        out.u32(self.di.dtk_right_older as u32);
         out.u8(u8::from(self.di.stream));
         out.u8(u8::from(self.di.stop_at_track_end));
         out.u64(self.di.audio_position);
@@ -1715,6 +1809,10 @@ impl GameCubeBoard {
         self.di.enable_dtk = input.u8()? != 0;
         self.di.dtk_buffer_length = input.u8()? & 0x0f;
         self.di.dtk_sample_remainder = input.u8()? % DTK_SAMPLES_PER_BLOCK as u8;
+        self.di.dtk_left_recent = input.u32()? as i32;
+        self.di.dtk_left_older = input.u32()? as i32;
+        self.di.dtk_right_recent = input.u32()? as i32;
+        self.di.dtk_right_older = input.u32()? as i32;
         self.di.stream = input.u8()? != 0;
         self.di.stop_at_track_end = input.u8()? != 0;
         self.di.audio_position = input.u64()?;
@@ -2425,7 +2523,8 @@ mod tests {
 
     #[test]
     fn dvd_dtk_position_advances_in_adpcm_blocks_and_promotes_queued_track() {
-        let full = disc_bytes(&[0x4800_0000]);
+        let mut full = disc_bytes(&[0x4800_0000]);
+        full.resize(0x3000, 0);
         let (mut board, _) = GameCubeBoard::new(ResourceBlob::from_bytes(&full)).unwrap();
         board.di.enable_dtk = true;
         board.di.stream = true;
@@ -2435,22 +2534,22 @@ mod tests {
         board.di.next_length = 0x40;
         board.di.audio_position = 0x1000;
 
-        board.advance_dtk_stream(DTK_SAMPLES_PER_BLOCK - 1);
+        board.render_dtk_samples((DTK_SAMPLES_PER_BLOCK - 1) as usize);
         assert_eq!(board.di.audio_position, 0x1000);
         assert_eq!(board.di.dtk_sample_remainder, 27);
-        board.advance_dtk_stream(1);
+        board.render_dtk_samples(1);
         assert_eq!(board.di.audio_position, 0x1020);
         assert_eq!(board.di.dtk_sample_remainder, 0);
 
-        board.advance_dtk_stream(DTK_SAMPLES_PER_BLOCK);
+        board.render_dtk_samples(DTK_SAMPLES_PER_BLOCK as usize);
         assert_eq!(board.di.audio_position, 0x1040);
-        board.advance_dtk_stream(DTK_SAMPLES_PER_BLOCK);
+        board.render_dtk_samples(DTK_SAMPLES_PER_BLOCK as usize);
         assert_eq!(board.di.current_start, 0x2000);
         assert_eq!(board.di.audio_position, 0x2020);
 
         board.di.audio_position = 0x2040;
         board.di.stop_at_track_end = true;
-        board.advance_dtk_stream(DTK_SAMPLES_PER_BLOCK);
+        board.render_dtk_samples(1);
         assert!(!board.di.stream);
         assert!(!board.di.stop_at_track_end);
         assert_eq!(board.di.audio_position, 0x2000);
@@ -2570,6 +2669,69 @@ mod tests {
     }
 
     #[test]
+    fn dvd_dtk_streaming_requests_missing_block_before_decoding() {
+        let mut full = disc_bytes(&[0x4800_0000]);
+        full[0x1000] = 0x0c;
+        full[0x1001] = 0x0c;
+        full[0x1004..0x1020].fill(0x1f);
+        let mut sparse = ResourceBlob::streaming(full.len() as u64, 2).unwrap();
+        sparse.write(0, &full[..0x700]).unwrap();
+        let (mut board, _) = GameCubeBoard::new(sparse).unwrap();
+        board.di.enable_dtk = true;
+        board.di.stream = true;
+        board.di.current_start = 0x1000;
+        board.di.current_length = 0x20;
+        board.di.audio_position = 0x1000;
+
+        let missing = board.render_dtk_samples(1);
+        assert_eq!(missing, vec![(0.0, 0.0)]);
+        assert_eq!(board.disc.pending_range(), Some((0x1000, 0x1020)));
+        assert_eq!(board.di.audio_position, 0x1000);
+        assert_eq!(board.di.dtk_sample_remainder, 0);
+
+        let mut staged = board.disc.clone();
+        staged.write(0x1000, &full[0x1000..0x1020]).unwrap();
+        let decoded = board.render_dtk_samples(1);
+        assert_eq!(decoded[0].0, -(1.0 / 32768.0));
+        assert_eq!(decoded[0].1, 1.0 / 32768.0);
+        assert_eq!(board.di.dtk_sample_remainder, 1);
+        assert_eq!(board.di.dtk_left_recent, -64);
+        assert_eq!(board.di.dtk_right_recent, 64);
+    }
+
+    #[test]
+    fn dvd_dtk_adpcm_decodes_stereo_and_mixes_with_audio_dma() {
+        let mut full = disc_bytes(&[0x4800_0000]);
+        full[0x1000] = 0x0c;
+        full[0x1001] = 0x0c;
+        full[0x1004..0x1020].fill(0x1f);
+        let (mut board, _) = GameCubeBoard::new(ResourceBlob::from_bytes(&full)).unwrap();
+        board.di.enable_dtk = true;
+        board.di.stream = true;
+        board.di.current_start = 0x1000;
+        board.di.current_length = 0x20;
+        board.di.audio_position = 0x1000;
+
+        for frame in board.mem1[0x3000..0x3020].as_chunks_mut::<4>().0 {
+            frame[..2].copy_from_slice(&0x4000i16.to_be_bytes());
+            frame[2..].copy_from_slice(&(-0x4000i16).to_be_bytes());
+        }
+        board.write_mmio16(AUDIO_DMA_START_HI, 0);
+        board.write_mmio16(AUDIO_DMA_START_LO, 0x3000);
+        board.write_mmio16(AUDIO_DMA_CONTROL_LEN, 0x8001);
+
+        let mut audio = AudioBuffer::new(AUDIO_RATE, 2);
+        board.render_audio(&mut audio);
+        assert_eq!(audio.samples().len(), 1600);
+        assert_eq!(audio.samples()[0], 0.5 - (1.0 / 32768.0));
+        assert_eq!(audio.samples()[1], -0.5 + (1.0 / 32768.0));
+        assert!(!board.di.stream);
+        assert_eq!(board.di.dtk_sample_remainder, 0);
+        assert_eq!(board.di.dtk_left_recent, 0);
+        assert_eq!(board.di.dtk_right_recent, 0);
+    }
+
+    #[test]
     fn audio_dma_and_yuyv_xfb_reach_public_outputs() {
         let mut board = idle_board();
         for frame in board.mem1[0x3000..0x3020].as_chunks_mut::<4>().0 {
@@ -2629,6 +2791,10 @@ mod tests {
         machine.board.di.enable_dtk = true;
         machine.board.di.dtk_buffer_length = 10;
         machine.board.di.dtk_sample_remainder = 17;
+        machine.board.di.dtk_left_recent = -12345;
+        machine.board.di.dtk_left_older = 6789;
+        machine.board.di.dtk_right_recent = 23456;
+        machine.board.di.dtk_right_older = -7890;
         machine.board.di.stream = true;
         machine.board.di.audio_position = 0x1234_8000;
         machine.board.di.current_start = 0x1234_0000;
@@ -2660,6 +2826,10 @@ mod tests {
         assert!(restored.board.di.enable_dtk);
         assert_eq!(restored.board.di.dtk_buffer_length, 10);
         assert_eq!(restored.board.di.dtk_sample_remainder, 17);
+        assert_eq!(restored.board.di.dtk_left_recent, -12345);
+        assert_eq!(restored.board.di.dtk_left_older, 6789);
+        assert_eq!(restored.board.di.dtk_right_recent, 23456);
+        assert_eq!(restored.board.di.dtk_right_older, -7890);
         assert!(restored.board.di.stream);
         assert_eq!(restored.board.di.audio_position, 0x1234_8000);
         assert_eq!(restored.board.di.current_start, 0x1234_0000);
